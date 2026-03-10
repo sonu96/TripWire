@@ -3,13 +3,13 @@
 import os
 from datetime import datetime, timezone
 
-import pytest
-
 os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
 os.environ.setdefault("SUPABASE_ANON_KEY", "test-anon-key")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key")
 os.environ.setdefault("SVIX_API_KEY", "test-svix-key")
 os.environ.setdefault("APP_ENV", "development")
+
+import pytest
 
 from tripwire.types.models import (
     AgentIdentity,
