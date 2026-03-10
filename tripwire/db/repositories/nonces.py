@@ -19,35 +19,31 @@ class NonceRepository:
     def record_nonce(self, chain_id: int, nonce: str, authorizer: str) -> bool:
         """Record a nonce. Returns True if this was a new (non-duplicate) nonce.
 
-        Uses upsert with on_conflict so duplicate nonces are silently ignored.
-        The caller can compare the returned flag to decide whether to process
-        the associated transfer.
+        Uses a single upsert with ignore_duplicates=True so duplicate nonces
+        are silently ignored at the DB level — no extra SELECT round-trip and
+        no race condition between check-then-insert.
         """
-        # First check if it already exists
-        existing = (
+        result = (
             self._sb.table("nonces")
-            .select("nonce")
-            .eq("chain_id", chain_id)
-            .eq("nonce", nonce)
-            .eq("authorizer", authorizer.lower())
+            .upsert(
+                {
+                    "chain_id": chain_id,
+                    "nonce": nonce,
+                    "authorizer": authorizer.lower(),
+                },
+                on_conflict="chain_id,nonce,authorizer",
+                ignore_duplicates=True,
+            )
             .execute()
         )
-        if existing.data:
+
+        # When ignore_duplicates=True, a duplicate row returns empty data
+        is_new = bool(result.data)
+        if is_new:
+            logger.info("nonce_recorded", chain_id=chain_id, nonce=nonce)
+        else:
             logger.debug("nonce_duplicate", chain_id=chain_id, nonce=nonce)
-            return False
-
-        # Upsert to handle race conditions gracefully
-        self._sb.table("nonces").upsert(
-            {
-                "chain_id": chain_id,
-                "nonce": nonce,
-                "authorizer": authorizer.lower(),
-            },
-            on_conflict="chain_id,nonce,authorizer",
-        ).execute()
-
-        logger.info("nonce_recorded", chain_id=chain_id, nonce=nonce)
-        return True
+        return is_new
 
     def exists(self, chain_id: int, nonce: str, authorizer: str) -> bool:
         """Check whether a nonce has already been recorded."""

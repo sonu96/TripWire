@@ -39,6 +39,11 @@ def _raw_log() -> dict:
             "authorizer": SENDER,
             "nonce": NONCE_HEX,
         },
+        "transfer": {
+            "from_address": SENDER,
+            "to_address": RECIPIENT,
+            "value": 5_000_000,
+        },
     }
 
 
@@ -56,60 +61,42 @@ def _endpoint_row() -> dict:
     }
 
 
-class _MockResult:
-    def __init__(self, data: list):
-        self.data = data
-
-
-class _MockQuery:
-    def __init__(self, data: list):
-        self._data = data
-
-    def select(self, *a, **kw) -> "_MockQuery":
-        return self
-
-    def eq(self, *a, **kw) -> "_MockQuery":
-        return self
-
-    def execute(self) -> _MockResult:
-        return _MockResult(self._data)
-
-    def insert(self, *a, **kw) -> "_MockQuery":
-        return self
-
-    def order(self, *a, **kw) -> "_MockQuery":
-        return self
-
-    def limit(self, *a, **kw) -> "_MockQuery":
-        return self
-
-
-class MockSupabase:
-    def __init__(self, endpoint_rows: list | None = None):
-        self._endpoint_rows = endpoint_rows or []
-
-    def table(self, name: str) -> _MockQuery:
-        if name == "endpoints":
-            return _MockQuery(self._endpoint_rows)
-        return _MockQuery([])
-
-
 def _make_processor(
     endpoint_rows: list | None = None,
     nonce_is_new: bool = True,
 ) -> EventProcessor:
-    sb = MockSupabase(endpoint_rows=endpoint_rows)
+    # Build Endpoint objects from raw rows so list_by_recipient returns them
+    endpoints = [Endpoint(**row) for row in (endpoint_rows or [])]
+
+    endpoint_repo = MagicMock()
+    endpoint_repo.list_by_recipient = MagicMock(return_value=endpoints)
+
+    event_repo = MagicMock()
+    event_repo.insert = MagicMock(return_value={})
+
+    delivery_repo = MagicMock()
+    delivery_repo.create = MagicMock(return_value={})
+
     resolver = AsyncMock()
     resolver.resolve = AsyncMock(return_value=None)
+
     nonce_repo = MagicMock()
     nonce_repo.record_nonce = MagicMock(return_value=nonce_is_new)
+
     realtime_notifier = AsyncMock()
     realtime_notifier.notify_batch = AsyncMock(return_value=[])
+
+    webhook_provider = AsyncMock()
+    webhook_provider.send = AsyncMock(return_value="msg_001")
+
     return EventProcessor(
-        supabase=sb,
-        identity_resolver=resolver,
+        endpoint_repo=endpoint_repo,
+        event_repo=event_repo,
         nonce_repo=nonce_repo,
+        delivery_repo=delivery_repo,
+        identity_resolver=resolver,
         realtime_notifier=realtime_notifier,
+        webhook_provider=webhook_provider,
     )
 
 

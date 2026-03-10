@@ -93,3 +93,26 @@ def sample_raw_log() -> dict:
             "nonce": NONCE_HEX,
         },
     }
+
+
+@pytest.fixture
+def sample_raw_log_enriched() -> dict:
+    """Raw log with joined Transfer data (as produced by the updated pipeline)."""
+    return {
+        "transaction_hash": TX_HASH,
+        "block_number": 100,
+        "block_hash": BLOCK_HASH,
+        "log_index": 3,
+        "block_timestamp": 1700000000,
+        "address": USDC_BASE.lower(),
+        "chain_id": 8453,
+        "decoded": {
+            "authorizer": AUTHORIZER,
+            "nonce": NONCE_HEX,
+        },
+        "transfer": {
+            "from_address": SENDER,
+            "to_address": RECIPIENT,
+            "value": 5_000_000,
+        },
+    }

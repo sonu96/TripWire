@@ -149,11 +149,16 @@ def decode_erc3009_from_logs(
 
 
 def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
-    """Decode a Goldsky-decoded AuthorizationUsed row into an ERC3009Transfer.
+    """Decode a Goldsky-decoded row into an ERC3009Transfer.
 
-    This handles rows that have already been decoded by Goldsky's
-    _gs_log_decode() SQL transform. The decoded column contains the
-    extracted authorizer and nonce fields.
+    This handles rows produced by the Goldsky pipeline SQL transform, which
+    JOINs Transfer and AuthorizationUsed events from the same transaction.
+    The row includes:
+      - decoded: dict with authorizer, nonce (from AuthorizationUsed)
+      - transfer: dict with from_address, to_address, value (from Transfer)
+
+    If the ``transfer`` key is missing (legacy rows or AuthorizationUsed-only
+    pipelines), falls back to empty to_address/value with a warning.
 
     For raw undecoded logs, use decode_erc3009_from_logs() instead.
 
@@ -164,10 +169,12 @@ def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
         - log_index: int
         - block_timestamp: int
         - decoded: dict with authorizer, nonce
+        - transfer: dict with from_address, to_address, value (optional)
         - address: USDC contract (if present)
         - chain_id: chain id (int)
     """
     decoded = raw_log.get("decoded", {})
+    transfer = raw_log.get("transfer", {})
     contract = raw_log.get("address", "").lower()
     chain_id = _resolve_chain_id(raw_log, contract)
 
@@ -181,15 +188,27 @@ def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
     authorizer = decoded.get("authorizer", "")
     nonce = decoded.get("nonce", "0x" + "00" * 32)
 
+    # Extract Transfer fields from the joined row when available
+    from_address = transfer.get("from_address", "") or authorizer
+    to_address = transfer.get("to_address", "")
+    value = str(transfer.get("value", "0"))
+
+    if not to_address:
+        logger.warning(
+            "transfer_missing_to_address",
+            tx_hash=raw_log.get("transaction_hash", ""),
+            msg="No Transfer data in row; endpoint matching will fail",
+        )
+
     return ERC3009Transfer(
         chain_id=chain_id,
         tx_hash=raw_log.get("transaction_hash", ""),
         block_number=block_number,
         block_hash=raw_log.get("block_hash", ""),
         log_index=log_index,
-        from_address=authorizer,
-        to_address="",  # not in AuthorizationUsed; enriched downstream
-        value="0",  # not in AuthorizationUsed; enriched downstream
+        from_address=from_address,
+        to_address=to_address,
+        value=value,
         authorizer=authorizer,
         valid_after=0,
         valid_before=0,

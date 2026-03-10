@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     supabase_service_role_key: str
 
     # Svix (Webhook Delivery)
-    svix_api_key: str
+    svix_api_key: str = ""
 
     # Goldsky
     goldsky_api_key: str = ""
@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     base_rpc_url: str = "https://mainnet.base.org"
     ethereum_rpc_url: str = "https://eth.llamarpc.com"
     arbitrum_rpc_url: str = "https://arb1.arbitrum.io/rpc"
+
+    # Identity resolver
+    identity_cache_ttl: int = 300
 
     # ERC-8004 (CREATE2 — same address on all chains)
     erc8004_identity_registry: str = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"

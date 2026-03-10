@@ -90,7 +90,8 @@ def test_decode_transfer_log():
     assert result["value"] == 10_000_000
 
 
-def test_decode_transfer_event(sample_raw_log):
+def test_decode_transfer_event_without_transfer_data(sample_raw_log):
+    """Fallback: raw_log has no 'transfer' key (legacy AuthorizationUsed-only row)."""
     transfer = decode_transfer_event(sample_raw_log)
 
     assert transfer.chain_id == ChainId.BASE
@@ -102,6 +103,29 @@ def test_decode_transfer_event(sample_raw_log):
     assert transfer.nonce == NONCE_BYTES32
     assert transfer.token == USDC_BASE.lower()
     assert transfer.timestamp == 1700000000
+    # Without transfer data, from_address falls back to authorizer, to_address is empty
+    assert transfer.from_address == AUTHORIZER
+    assert transfer.to_address == ""
+    assert transfer.value == "0"
+
+
+def test_decode_transfer_event_with_transfer_data(sample_raw_log):
+    """Enriched row: raw_log includes joined Transfer data."""
+    sample_raw_log["transfer"] = {
+        "from_address": SENDER,
+        "to_address": RECIPIENT,
+        "value": 5_000_000,
+    }
+    transfer = decode_transfer_event(sample_raw_log)
+
+    assert transfer.chain_id == ChainId.BASE
+    assert transfer.tx_hash == sample_raw_log["transaction_hash"]
+    assert transfer.block_number == 100
+    assert transfer.authorizer == AUTHORIZER
+    assert transfer.nonce == NONCE_BYTES32
+    assert transfer.from_address == SENDER
+    assert transfer.to_address == RECIPIENT
+    assert transfer.value == "5000000"
 
 
 def test_decode_erc3009_from_logs():

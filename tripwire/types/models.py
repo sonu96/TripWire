@@ -110,6 +110,9 @@ class Endpoint(BaseModel):
     recipient: str
     policies: EndpointPolicies
     active: bool = True
+    api_key: str | None = None  # Only populated on creation response
+    svix_app_id: str | None = None
+    svix_endpoint_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -140,12 +143,18 @@ class FinalityData(BaseModel):
     is_finalized: bool
 
 
+class WebhookData(BaseModel):
+    transfer: TransferData
+    finality: FinalityData | None = None
+    identity: AgentIdentity | None = None
+
+
 class WebhookPayload(BaseModel):
     id: str
     type: WebhookEventType
     mode: EndpointMode
     timestamp: int
-    data: dict  # contains transfer, finality, identity
+    data: WebhookData
 
 
 # ── Subscription (Notify Mode) ────────────────────────────────

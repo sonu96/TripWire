@@ -108,18 +108,55 @@ class RealtimeNotifier:
         finality: FinalityStatus | None = None,
         identity: AgentIdentity | None = None,
     ) -> list[str]:
-        """Insert realtime event rows for multiple endpoints.
+        """Insert realtime event rows for multiple endpoints in a single bulk insert.
 
         Returns a list of generated event ids.
         """
-        event_ids: list[str] = []
+        if not endpoints:
+            return []
+
+        # Build the shared payload once (same for all endpoints)
+        transfer_data: TransferData = build_transfer_data(transfer)
+        finality_data = _build_finality_data(finality)
+
+        data: dict = {
+            "transfer": transfer_data.model_dump(),
+            "timestamp": int(time.time()),
+        }
+        if finality_data is not None:
+            data["finality"] = finality_data.model_dump()
+        if identity is not None:
+            data["identity"] = identity.model_dump()
+
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        event_ids = []
         for endpoint in endpoints:
-            event_id = await self.notify(
-                endpoint=endpoint,
-                transfer=transfer,
-                event_type=event_type,
-                finality=finality,
-                identity=identity,
-            )
+            event_id = str(uuid.uuid4())
             event_ids.append(event_id)
+            rows.append({
+                "id": event_id,
+                "endpoint_id": endpoint.id,
+                "type": event_type.value,
+                "data": data,
+                "chain_id": transfer.chain_id.value,
+                "recipient": transfer.to_address.lower(),
+                "created_at": now,
+            })
+
+        try:
+            self._sb.table("realtime_events").insert(rows).execute()
+            logger.info(
+                "realtime_events_batch_inserted",
+                count=len(rows),
+                tx_hash=transfer.tx_hash,
+                event_type=event_type.value,
+            )
+        except Exception:
+            logger.exception(
+                "realtime_events_batch_insert_failed",
+                count=len(rows),
+                tx_hash=transfer.tx_hash,
+            )
+
         return event_ids

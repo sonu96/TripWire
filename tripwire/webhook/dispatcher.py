@@ -16,10 +16,11 @@ from tripwire.types.models import (
     FinalityStatus,
     Subscription,
     TransferData,
+    WebhookData,
     WebhookEventType,
     WebhookPayload,
 )
-from tripwire.webhook.svix_client import send_webhook
+from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -57,21 +58,16 @@ def _build_payload(
     identity: AgentIdentity | None = None,
 ) -> WebhookPayload:
     """Build a WebhookPayload from transfer, finality, and identity data."""
-    transfer_data = build_transfer_data(transfer)
-    finality_data = _build_finality_data(finality)
-
-    data: dict = {"transfer": transfer_data.model_dump()}
-    if finality_data is not None:
-        data["finality"] = finality_data.model_dump()
-    if identity is not None:
-        data["identity"] = identity.model_dump()
-
     return WebhookPayload(
         id=str(uuid.uuid4()),
         type=event_type,
         mode=mode,
         timestamp=int(time.time()),
-        data=data,
+        data=WebhookData(
+            transfer=build_transfer_data(transfer),
+            finality=_build_finality_data(finality),
+            identity=identity,
+        ),
     )
 
 
@@ -141,17 +137,29 @@ def match_subscriptions(
 async def dispatch_event(
     transfer: ERC3009Transfer,
     matched_endpoints: list[Endpoint],
+    provider: WebhookProvider,
     event_type: WebhookEventType = WebhookEventType.PAYMENT_CONFIRMED,
     finality: FinalityStatus | None = None,
     identity: AgentIdentity | None = None,
 ) -> list[str]:
-    """Build a WebhookPayload and send via Svix for each matched endpoint.
+    """Build a WebhookPayload and send via the webhook provider for each matched endpoint.
 
-    Returns a list of Svix message IDs for successful deliveries.
+    Returns a list of message IDs for successful deliveries.
     """
     message_ids: list[str] = []
 
     for endpoint in matched_endpoints:
+        # Use stored svix_app_id — skip dispatch if webhook provider setup failed
+        app_id = endpoint.svix_app_id
+        if not app_id:
+            logger.error(
+                "webhook_dispatch_skipped_no_svix_app",
+                endpoint_id=endpoint.id,
+                tx_hash=transfer.tx_hash,
+                reason="svix_app_id not set — webhook provider setup may have failed",
+            )
+            continue
+
         payload = _build_payload(
             transfer=transfer,
             event_type=event_type,
@@ -161,8 +169,8 @@ async def dispatch_event(
         )
 
         try:
-            msg_id = await send_webhook(
-                app_id=endpoint.id,
+            msg_id = await provider.send(
+                app_id=app_id,
                 event_type=event_type.value,
                 payload=payload.model_dump(),
             )
@@ -170,6 +178,7 @@ async def dispatch_event(
             logger.info(
                 "webhook_dispatched",
                 endpoint_id=endpoint.id,
+                svix_app_id=app_id,
                 tx_hash=transfer.tx_hash,
                 event_type=event_type.value,
                 message_id=msg_id,

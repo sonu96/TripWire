@@ -29,9 +29,10 @@ class _MockQuery:
 
 
 class _MockUpsertQuery:
-    def __init__(self, rows: list, new_row: dict):
+    def __init__(self, rows: list, new_row: dict, ignore_duplicates: bool = False):
         self._rows = rows
         self._new_row = new_row
+        self._ignore_duplicates = ignore_duplicates
 
     def execute(self) -> _MockResult:
         for existing in self._rows:
@@ -40,6 +41,9 @@ class _MockUpsertQuery:
                 and existing.get("nonce") == self._new_row.get("nonce")
                 and existing.get("authorizer") == self._new_row.get("authorizer")
             ):
+                # With ignore_duplicates=True, Supabase returns empty data
+                if self._ignore_duplicates:
+                    return _MockResult([])
                 return _MockResult([existing])
         self._rows.append(self._new_row)
         return _MockResult([self._new_row])
@@ -53,7 +57,7 @@ class MockSupabaseTable:
         return _MockQuery(self._rows)
 
     def upsert(self, row: dict, **kwargs) -> _MockUpsertQuery:
-        return _MockUpsertQuery(self._rows, row)
+        return _MockUpsertQuery(self._rows, row, ignore_duplicates=kwargs.get("ignore_duplicates", False))
 
 
 class MockSupabase:

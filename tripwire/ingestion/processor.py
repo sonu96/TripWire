@@ -11,12 +11,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 import structlog
-from supabase import Client
-
-from tripwire.config.logging import chain_id_var, tx_hash_var
 
 from tripwire.api.policies.engine import evaluate_policy
+from tripwire.db.repositories.endpoints import EndpointRepository
+from tripwire.db.repositories.events import EventRepository
 from tripwire.db.repositories.nonces import NonceRepository
+from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.identity.resolver import IdentityResolver
 from tripwire.ingestion.decoder import decode_transfer_event
 from tripwire.ingestion.finality import check_finality
@@ -32,6 +32,7 @@ from tripwire.webhook.dispatcher import (
     dispatch_event,
     match_endpoints,
 )
+from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -41,15 +42,21 @@ class EventProcessor:
 
     def __init__(
         self,
-        supabase: Client,
-        identity_resolver: IdentityResolver,
+        endpoint_repo: EndpointRepository,
+        event_repo: EventRepository,
         nonce_repo: NonceRepository,
+        delivery_repo: WebhookDeliveryRepository,
+        identity_resolver: IdentityResolver,
         realtime_notifier: RealtimeNotifier,
+        webhook_provider: WebhookProvider,
     ) -> None:
-        self._sb = supabase
-        self._resolver = identity_resolver
+        self._endpoint_repo = endpoint_repo
+        self._event_repo = event_repo
         self._nonce_repo = nonce_repo
+        self._delivery_repo = delivery_repo
+        self._resolver = identity_resolver
         self._realtime_notifier = realtime_notifier
+        self._webhook_provider = webhook_provider
 
     async def process_event(self, raw_log: dict[str, Any]) -> dict[str, Any]:
         """Process a single Goldsky-decoded event through the full pipeline.
@@ -66,9 +73,10 @@ class EventProcessor:
         tx_hash = transfer.tx_hash
         chain_id = transfer.chain_id
 
-        # Bind context vars so all downstream loggers include these
-        tx_hash_var.set(tx_hash)
-        chain_id_var.set(chain_id.value)
+        # Bind to structlog contextvars so all downstream loggers include these
+        structlog.contextvars.bind_contextvars(
+            tx_hash=tx_hash, chain_id=chain_id.value
+        )
 
         logger.info(
             "processing_event",
@@ -152,8 +160,9 @@ class EventProcessor:
         else:
             event_type = WebhookEventType.PAYMENT_CONFIRMED
 
-        # 7. Record the event
-        event_id = self._record_event(transfer, finality, identity, event_type)
+        # 7. Record the event (link to the first matched endpoint)
+        first_endpoint_id = matched[0].id if matched else None
+        event_id = self._record_event(transfer, finality, identity, event_type, endpoint_id=first_endpoint_id)
 
         # 8. Split approved endpoints by delivery mode
         execute_endpoints = [
@@ -170,6 +179,7 @@ class EventProcessor:
                 message_ids = await dispatch_event(
                     transfer=transfer,
                     matched_endpoints=execute_endpoints,
+                    provider=self._webhook_provider,
                     event_type=event_type,
                     finality=finality,
                     identity=identity,
@@ -236,17 +246,10 @@ class EventProcessor:
 
     def _fetch_matching_endpoints(self, transfer) -> list[Endpoint]:
         """Fetch active endpoints whose recipient matches the transfer."""
-        result = (
-            self._sb.table("endpoints")
-            .select("*")
-            .eq("recipient", transfer.to_address.lower())
-            .eq("active", True)
-            .execute()
-        )
-        return [Endpoint(**row) for row in result.data]
+        return self._endpoint_repo.list_by_recipient(transfer.to_address)
 
-    def _record_event(self, transfer, finality, identity, event_type) -> str:
-        """Insert an event row into the events table."""
+    def _record_event(self, transfer, finality, identity, event_type, endpoint_id: str | None = None) -> str:
+        """Insert an event row into the events table via EventRepository."""
         event_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
@@ -290,6 +293,9 @@ class EventProcessor:
             "finality_depth": finality.confirmations if finality else 0,
         }
 
+        if endpoint_id:
+            row["endpoint_id"] = endpoint_id
+
         if identity:
             row["identity_data"] = identity.model_dump()
 
@@ -297,7 +303,7 @@ class EventProcessor:
             row["confirmed_at"] = now
 
         try:
-            self._sb.table("events").insert(row).execute()
+            self._event_repo.insert(row)
         except Exception:
             logger.exception("event_record_failed", event_id=event_id)
 
@@ -306,20 +312,14 @@ class EventProcessor:
     def _record_delivery(
         self, endpoint_id: str, event_id: str, svix_message_id: str | None
     ) -> None:
-        """Record a webhook delivery attempt."""
-        from nanoid import generate as nanoid
-
-        row = {
-            "id": nanoid(size=21),
-            "endpoint_id": endpoint_id,
-            "event_id": event_id,
-            "svix_message_id": svix_message_id,
-            "status": "sent" if svix_message_id else "failed",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-
+        """Record a webhook delivery attempt via WebhookDeliveryRepository."""
         try:
-            self._sb.table("webhook_deliveries").insert(row).execute()
+            self._delivery_repo.create(
+                endpoint_id=endpoint_id,
+                event_id=event_id,
+                svix_message_id=svix_message_id,
+                status="sent" if svix_message_id else "failed",
+            )
         except Exception:
             logger.exception(
                 "delivery_record_failed",

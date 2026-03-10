@@ -10,8 +10,6 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
-from tripwire.config.logging import request_id_var
-
 logger = structlog.get_logger(__name__)
 
 
@@ -28,9 +26,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         # Use client-supplied request ID if present, otherwise generate one
         rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
-        request_id_var.set(rid)
 
-        # Bind to structlog context so child loggers inherit it
+        # Bind to structlog contextvars so all downstream loggers include it
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(request_id=rid)
 

@@ -1,19 +1,21 @@
 """Event history routes."""
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
+from tripwire.api import get_supabase
+from tripwire.api.auth import require_api_key
 from tripwire.types.models import WebhookEventType
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["events"])
+router = APIRouter(tags=["events"], dependencies=[Depends(require_api_key)])
 
 
 class EventResponse(BaseModel):
     id: str
-    endpoint_id: str
+    endpoint_id: str | None = None
     type: WebhookEventType
     data: dict
     created_at: str
@@ -25,20 +27,15 @@ class EventListResponse(BaseModel):
     has_more: bool = False
 
 
-def _supabase(request: Request):
-    return request.app.state.supabase
-
-
 @router.get("/events", response_model=EventListResponse)
 async def list_events(
-    request: Request,
     cursor: str | None = Query(None, description="Cursor for pagination (event id)"),
     limit: int = Query(50, ge=1, le=200),
     event_type: WebhookEventType | None = Query(None),
     chain_id: int | None = Query(None),
+    sb=Depends(get_supabase),
 ):
     """List events with cursor pagination and optional filters."""
-    sb = _supabase(request)
 
     query = sb.table("events").select("*").order("created_at", desc=True).limit(limit + 1)
 
@@ -66,9 +63,8 @@ async def list_events(
 
 
 @router.get("/events/{event_id}", response_model=EventResponse)
-async def get_event(event_id: str, request: Request):
+async def get_event(event_id: str, sb=Depends(get_supabase)):
     """Get event details."""
-    sb = _supabase(request)
     result = sb.table("events").select("*").eq("id", event_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -78,12 +74,11 @@ async def get_event(event_id: str, request: Request):
 @router.get("/endpoints/{endpoint_id}/events", response_model=EventListResponse)
 async def list_endpoint_events(
     endpoint_id: str,
-    request: Request,
     cursor: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    sb=Depends(get_supabase),
 ):
     """List events for a specific endpoint."""
-    sb = _supabase(request)
 
     # Verify endpoint exists
     ep = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()

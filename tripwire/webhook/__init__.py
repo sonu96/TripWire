@@ -1,9 +1,15 @@
-"""TripWire webhook delivery — Svix integration."""
+"""TripWire webhook delivery — provider abstraction + Svix integration."""
 
 from tripwire.webhook.dispatcher import (
     dispatch_event,
     match_endpoints,
     match_subscriptions,
+)
+from tripwire.webhook.provider import (
+    LogOnlyProvider,
+    SvixProvider,
+    WebhookProvider,
+    create_webhook_provider,
 )
 from tripwire.webhook.svix_client import (
     create_application,
@@ -16,7 +22,12 @@ from tripwire.webhook.svix_client import (
 from tripwire.webhook.verify import verify_webhook
 
 __all__ = [
-    # Svix client
+    # Provider abstraction
+    "WebhookProvider",
+    "SvixProvider",
+    "LogOnlyProvider",
+    "create_webhook_provider",
+    # Svix client (low-level)
     "init_svix",
     "create_application",
     "create_endpoint",

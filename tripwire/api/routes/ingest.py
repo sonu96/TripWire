@@ -10,7 +10,7 @@ import hmac
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from tripwire.config.settings import settings
@@ -31,6 +31,11 @@ async def _verify_goldsky_request(request: Request) -> None:
     """
     secret = settings.goldsky_webhook_secret
     if not secret:
+        if settings.app_env != "development":
+            raise HTTPException(
+                status_code=500,
+                detail="GOLDSKY_WEBHOOK_SECRET must be set in production",
+            )
         logger.debug("goldsky_auth_skipped", reason="no secret configured")
         return
 
@@ -69,7 +74,10 @@ class IngestSingleResponse(BaseModel):
     response_model=IngestResponse,
     dependencies=[Depends(_verify_goldsky_request)],
 )
-async def ingest_goldsky_batch(request: Request):
+async def ingest_goldsky_batch(
+    request: Request,
+    body: list[dict[str, Any]] | dict[str, Any] = Body(),
+):
     """Receive a batch of Goldsky-decoded events.
 
     Goldsky webhook sink sends an array of decoded log rows.
@@ -79,15 +87,9 @@ async def ingest_goldsky_batch(request: Request):
       - decoded: {authorizer, nonce}
     """
     processor = request.app.state.processor
-    body = await request.json()
 
     # Goldsky sends either a single object or an array
-    if isinstance(body, dict):
-        raw_logs = [body]
-    elif isinstance(body, list):
-        raw_logs = body
-    else:
-        return IngestResponse(processed=0, results=[])
+    raw_logs = [body] if isinstance(body, dict) else body
 
     logger.info("goldsky_ingest_received", count=len(raw_logs))
     results = await processor.process_batch(raw_logs)
@@ -100,10 +102,12 @@ async def ingest_goldsky_batch(request: Request):
     response_model=IngestSingleResponse,
     dependencies=[Depends(_verify_goldsky_request)],
 )
-async def ingest_single_event(request: Request):
+async def ingest_single_event(
+    request: Request,
+    body: dict[str, Any] = Body(),
+):
     """Process a single raw event (for testing or manual submission)."""
     processor = request.app.state.processor
-    body = await request.json()
 
     result = await processor.process_event(body)
     return IngestSingleResponse(**result)

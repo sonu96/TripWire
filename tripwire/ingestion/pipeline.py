@@ -62,20 +62,28 @@ def build_pipeline_config(chain_id: ChainId) -> dict:
     usdc_address = USDC_CONTRACTS[chain_id].lower()
     dataset = _DATASET_NAMES[chain_id]
 
-    # SQL transform: filter by USDC contract + AuthorizationUsed topic,
-    # then decode the log using Goldsky's built-in ABI decoder.
+    # SQL transform: JOIN AuthorizationUsed and Transfer events from the same
+    # transaction on the same USDC contract. This gives us both the
+    # authorizer/nonce (from AuthorizationUsed) and from/to/value (from
+    # Transfer) in a single row, enabling endpoint matching by to_address.
     transform_sql = (
         f"SELECT "
-        f"id, "
-        f"block_number, "
-        f"block_hash, "
-        f"transaction_hash, "
-        f"log_index, "
-        f"block_timestamp, "
-        f"_gs_log_decode('{_AUTHORIZATION_USED_ABI}', topics, data) AS decoded "
-        f"FROM {chain_name}_logs "
-        f"WHERE address = '{usdc_address}' "
-        f"AND topic0 = '{AUTHORIZATION_USED_TOPIC}'"
+        f"auth.id, "
+        f"auth.block_number, "
+        f"auth.block_hash, "
+        f"auth.transaction_hash, "
+        f"auth.log_index, "
+        f"auth.block_timestamp, "
+        f"auth.address, "
+        f"_gs_log_decode('{_AUTHORIZATION_USED_ABI}', auth.topics, auth.data) AS decoded, "
+        f"_gs_log_decode('{_TRANSFER_ABI}', xfer.topics, xfer.data) AS transfer "
+        f"FROM {chain_name}_logs AS auth "
+        f"INNER JOIN {chain_name}_logs AS xfer "
+        f"ON auth.transaction_hash = xfer.transaction_hash "
+        f"AND auth.address = xfer.address "
+        f"WHERE auth.address = '{usdc_address}' "
+        f"AND auth.topic0 = '{AUTHORIZATION_USED_TOPIC}' "
+        f"AND xfer.topic0 = '{TRANSFER_TOPIC}'"
     )
 
     return {

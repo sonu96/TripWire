@@ -94,6 +94,9 @@ def _create_test_app(supabase_data: list | None = None) -> FastAPI:
         return {"status": "ok", "service": "tripwire", "version": __version__}
 
     app.state.supabase = MockSupabase(data=supabase_data)
+    app.state.webhook_provider = AsyncMock()
+    app.state.webhook_provider.create_app = AsyncMock(return_value="app_test")
+    app.state.webhook_provider.create_endpoint = AsyncMock(return_value="ep_test")
     return app
 
 
@@ -122,10 +125,8 @@ async def test_register_endpoint():
         "recipient": RECIPIENT,
     }
 
-    with patch("tripwire.api.routes.endpoints.create_application", new_callable=AsyncMock), \
-         patch("tripwire.api.routes.endpoints.create_svix_endpoint", new_callable=AsyncMock):
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.post("/api/v1/endpoints", json=payload)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post("/api/v1/endpoints", json=payload)
 
     assert resp.status_code == 201
     body = resp.json()

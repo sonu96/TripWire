@@ -3,11 +3,10 @@
 Resolution flow (ERC-721 based IdentityRegistry):
 1. balanceOf(senderAddress) — check if sender has an ERC-8004 identity
 2. tokenOfOwnerByIndex(senderAddress, 0) — get agentId
-3. tokenURI(agentId) — get agent URI
-4. getMetadata(agentId, "agentClass") — get agent class
-5. getSummary(agentId, []) on ReputationRegistry — get reputation
+3. tokenURI, getMetadata, ownerOf, getSummary — all in parallel (only need agent_id)
 """
 
+import asyncio
 import time
 from typing import Protocol, runtime_checkable
 
@@ -39,13 +38,11 @@ GET_SUMMARY_SELECTOR = "0x8ee8febc"
 
 # ── Cache ────────────────────────────────────────────────────────
 
-_CACHE_TTL = 300  # 5 minutes
-
 
 class _CacheEntry:
     __slots__ = ("value", "expires_at")
 
-    def __init__(self, value: AgentIdentity | None, ttl: int = _CACHE_TTL) -> None:
+    def __init__(self, value: AgentIdentity | None, ttl: int) -> None:
         self.value = value
         self.expires_at = time.monotonic() + ttl
 
@@ -92,7 +89,13 @@ class ERC8004Resolver:
         self._identity_registry = settings.erc8004_identity_registry
         self._reputation_registry = settings.erc8004_reputation_registry
         self._settings = settings
-        self._client = httpx.AsyncClient(timeout=10)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0),
+            limits=httpx.Limits(
+                max_keepalive_connections=5,
+                max_connections=10,
+            ),
+        )
         self._cache: dict[str, _CacheEntry] = {}
 
     async def _eth_call(self, rpc_url: str, to: str, data: str) -> str | None:
@@ -125,13 +128,13 @@ class ERC8004Resolver:
 
         rpc_url = _rpc_url_for(self._settings, chain_id)
         identity = await self._resolve_onchain(address, rpc_url)
-        self._cache[key] = _CacheEntry(identity)
+        self._cache[key] = _CacheEntry(identity, ttl=self._settings.identity_cache_ttl)
         return identity
 
     async def _resolve_onchain(self, address: str, rpc_url: str) -> AgentIdentity | None:
         registry = self._identity_registry
 
-        # 1) balanceOf(address) — check if sender owns an ERC-8004 NFT
+        # Step 1: balanceOf(address) — check if sender owns an ERC-8004 NFT
         balance_data = BALANCE_OF_SELECTOR + encode(["address"], [address]).hex()
         balance_result = await self._eth_call(rpc_url, registry, balance_data)
         if balance_result is None:
@@ -146,7 +149,7 @@ class ERC8004Resolver:
         if balance == 0:
             return None
 
-        # 2) tokenOfOwnerByIndex(address, 0) — get first agentId
+        # Step 2: tokenOfOwnerByIndex(address, 0) — get first agentId
         token_data = TOKEN_OF_OWNER_SELECTOR + encode(
             ["address", "uint256"], [address, 0]
         ).hex()
@@ -160,9 +163,30 @@ class ERC8004Resolver:
             logger.warning("decode_agent_id_failed", address=address)
             return None
 
-        # 3) tokenURI(agentId) — get agent URI
+        # Step 3: Parallel RPC calls — all only depend on agent_id
         uri_data = TOKEN_URI_SELECTOR + encode(["uint256"], [agent_id]).hex()
-        uri_result = await self._eth_call(rpc_url, registry, uri_data)
+        meta_data = GET_METADATA_SELECTOR + encode(
+            ["uint256", "string"], [agent_id, "agentClass"]
+        ).hex()
+        cap_data = GET_METADATA_SELECTOR + encode(
+            ["uint256", "string"], [agent_id, "capabilities"]
+        ).hex()
+        owner_data = OWNER_OF_SELECTOR + encode(["uint256"], [agent_id]).hex()
+        summary_data = GET_SUMMARY_SELECTOR + encode(
+            ["uint256", "address[]"], [agent_id, []]
+        ).hex()
+
+        uri_result, meta_result, cap_result, owner_result, summary_result = (
+            await asyncio.gather(
+                self._eth_call(rpc_url, registry, uri_data),
+                self._eth_call(rpc_url, registry, meta_data),
+                self._eth_call(rpc_url, registry, cap_data),
+                self._eth_call(rpc_url, registry, owner_data),
+                self._eth_call(rpc_url, self._reputation_registry, summary_data),
+            )
+        )
+
+        # Decode tokenURI
         agent_uri = ""
         if uri_result:
             try:
@@ -170,11 +194,7 @@ class ERC8004Resolver:
             except Exception:
                 logger.warning("decode_token_uri_failed", agent_id=agent_id)
 
-        # 4) getMetadata(agentId, "agentClass") — get agent class
-        meta_data = GET_METADATA_SELECTOR + encode(
-            ["uint256", "string"], [agent_id, "agentClass"]
-        ).hex()
-        meta_result = await self._eth_call(rpc_url, registry, meta_data)
+        # Decode agentClass
         agent_class = "unknown"
         if meta_result:
             try:
@@ -183,11 +203,7 @@ class ERC8004Resolver:
             except Exception:
                 logger.warning("decode_agent_class_failed", agent_id=agent_id)
 
-        # 4b) getMetadata(agentId, "capabilities") — get capabilities
-        cap_data = GET_METADATA_SELECTOR + encode(
-            ["uint256", "string"], [agent_id, "capabilities"]
-        ).hex()
-        cap_result = await self._eth_call(rpc_url, registry, cap_data)
+        # Decode capabilities
         capabilities: list[str] = []
         if cap_result:
             try:
@@ -198,9 +214,7 @@ class ERC8004Resolver:
             except Exception:
                 logger.warning("decode_capabilities_failed", agent_id=agent_id)
 
-        # 5) ownerOf(agentId) — get deployer (token minter/owner)
-        owner_data = OWNER_OF_SELECTOR + encode(["uint256"], [agent_id]).hex()
-        owner_result = await self._eth_call(rpc_url, registry, owner_data)
+        # Decode ownerOf
         deployer = address
         if owner_result:
             try:
@@ -208,17 +222,10 @@ class ERC8004Resolver:
             except Exception:
                 logger.warning("decode_owner_failed", agent_id=agent_id)
 
-        # 6) getSummary(agentId, []) on ReputationRegistry — get reputation
+        # Decode getSummary (reputation)
         reputation_score = 50.0
-        summary_data = GET_SUMMARY_SELECTOR + encode(
-            ["uint256", "address[]"], [agent_id, []]
-        ).hex()
-        summary_result = await self._eth_call(
-            rpc_url, self._reputation_registry, summary_data
-        )
         if summary_result:
             try:
-                # getSummary returns aggregate data; extract the first uint256 as raw score
                 # Score is in basis points (0-10000) → convert to 0-100
                 decoded = decode(["uint256"], bytes.fromhex(summary_result[2:66]))
                 raw_score = decoded[0]
@@ -227,7 +234,6 @@ class ERC8004Resolver:
                 logger.warning("decode_reputation_failed", agent_id=agent_id)
 
         # registered_at: use agentId as a proxy (sequential token ID ~ registration order)
-        # In production, this would come from the Transfer event block timestamp
         registered_at = agent_id
 
         return AgentIdentity(
