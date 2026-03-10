@@ -1,0 +1,16 @@
+[project]
+name = "tripwire-sdk"
+version = "0.1.0"
+description = "Python SDK for TripWire x402 execution middleware"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+]
+
+[project.optional-dependencies]
+webhook = ["svix>=1.86.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
