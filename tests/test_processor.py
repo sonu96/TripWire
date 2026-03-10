@@ -103,15 +103,25 @@ def _make_processor(
     resolver.resolve = AsyncMock(return_value=None)
     nonce_repo = MagicMock()
     nonce_repo.record_nonce = MagicMock(return_value=nonce_is_new)
-    return EventProcessor(supabase=sb, identity_resolver=resolver, nonce_repo=nonce_repo)
+    realtime_notifier = AsyncMock()
+    realtime_notifier.notify_batch = AsyncMock(return_value=[])
+    return EventProcessor(
+        supabase=sb,
+        identity_resolver=resolver,
+        nonce_repo=nonce_repo,
+        realtime_notifier=realtime_notifier,
+    )
 
 
 @pytest.mark.asyncio
 async def test_process_event_success():
-    processor = _make_processor(endpoint_rows=[_endpoint_row()])
+    ep_row = _endpoint_row()
+    processor = _make_processor(endpoint_rows=[ep_row])
+    ep = Endpoint(**ep_row)
 
     with patch("tripwire.ingestion.processor.check_finality", new_callable=AsyncMock) as mock_fin, \
-         patch("tripwire.ingestion.processor.dispatch_event", new_callable=AsyncMock) as mock_disp:
+         patch("tripwire.ingestion.processor.dispatch_event", new_callable=AsyncMock) as mock_disp, \
+         patch("tripwire.ingestion.processor.match_endpoints", return_value=[ep]):
 
         mock_fin.return_value = MagicMock(
             is_finalized=True,
@@ -124,6 +134,8 @@ async def test_process_event_success():
 
     assert result["status"] == "processed"
     assert result["tx_hash"] == TX_HASH
+    assert result["endpoints_matched"] == 1
+    assert result["webhooks_sent"] == 1
 
 
 @pytest.mark.asyncio
@@ -145,10 +157,13 @@ async def test_process_event_decode_failure():
 
 @pytest.mark.asyncio
 async def test_process_batch():
-    processor = _make_processor(endpoint_rows=[_endpoint_row()])
+    ep_row = _endpoint_row()
+    processor = _make_processor(endpoint_rows=[ep_row])
+    ep = Endpoint(**ep_row)
 
     with patch("tripwire.ingestion.processor.check_finality", new_callable=AsyncMock) as mock_fin, \
-         patch("tripwire.ingestion.processor.dispatch_event", new_callable=AsyncMock) as mock_disp:
+         patch("tripwire.ingestion.processor.dispatch_event", new_callable=AsyncMock) as mock_disp, \
+         patch("tripwire.ingestion.processor.match_endpoints", return_value=[ep]):
 
         mock_fin.return_value = MagicMock(
             is_finalized=True,
