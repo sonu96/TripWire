@@ -6,7 +6,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python 3.11+" />
-  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License MIT" />
+  <img src="https://img.shields.io/badge/license-Proprietary-red?style=flat-square" alt="Proprietary License" />
   <img src="https://img.shields.io/badge/x402-native-blueviolet?style=flat-square" alt="x402 Native" />
   <img src="https://img.shields.io/badge/ERC--8004-ready-orange?style=flat-square" alt="ERC-8004 Ready" />
   <img src="https://img.shields.io/badge/version-0.1.0-blue?style=flat-square" alt="Version 0.1.0" />
@@ -380,7 +380,7 @@ TripWire/
 
 ## 📄 License
 
-MIT License. See [LICENSE](LICENSE) for details.
+Proprietary. All Rights Reserved. See [LICENSE](LICENSE) for details.
 
 ---
 
