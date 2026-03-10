@@ -12,7 +12,7 @@ from tripwire.types.models import (
     RegisterEndpointRequest,
 )
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 
 class EndpointRepository:

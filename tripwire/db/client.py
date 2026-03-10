@@ -5,7 +5,7 @@ from supabase import Client, create_client
 
 from tripwire.config.settings import settings
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 _client: Client | None = None
 

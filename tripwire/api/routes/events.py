@@ -1,9 +1,12 @@
 """Event history routes."""
 
+import structlog
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from tripwire.types.models import WebhookEventType
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["events"])
 

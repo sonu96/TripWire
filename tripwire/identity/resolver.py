@@ -19,7 +19,7 @@ import structlog
 from tripwire.config.settings import Settings
 from tripwire.types.models import AgentIdentity
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 # ── IdentityRegistry function selectors (ERC-721 based) ─────────
 # balanceOf(address) → uint256

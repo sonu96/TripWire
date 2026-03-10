@@ -11,7 +11,7 @@ from tripwire.types.models import (
     FinalityStatus,
 )
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 _RPC_URLS: dict[ChainId, str] = {
     ChainId.ETHEREUM: settings.ethereum_rpc_url,

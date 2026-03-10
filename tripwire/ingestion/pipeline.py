@@ -20,7 +20,7 @@ import yaml
 from tripwire.config.settings import settings
 from tripwire.types.models import CHAIN_NAMES, USDC_CONTRACTS, ChainId
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 # keccak256("AuthorizationUsed(address,bytes32)")
 AUTHORIZATION_USED_TOPIC = (

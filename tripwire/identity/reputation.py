@@ -13,7 +13,7 @@ import structlog
 
 from tripwire.config.settings import Settings
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 # getSummary(uint256 agentId, address[] clientAddresses) → aggregate feedback
 _GET_SUMMARY_SELECTOR = "0x8ee8febc"

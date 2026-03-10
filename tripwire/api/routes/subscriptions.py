@@ -2,10 +2,13 @@
 
 from datetime import datetime, timezone
 
+import structlog
 from fastapi import APIRouter, HTTPException, Request
 from nanoid import generate as nanoid
 
 from tripwire.types.models import CreateSubscriptionRequest, Subscription
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["subscriptions"])
 
@@ -44,6 +47,7 @@ async def create_subscription(
     }
 
     result = sb.table("subscriptions").insert(row).execute()
+    logger.info("subscription_created", subscription_id=sub_id, endpoint_id=endpoint_id)
     return Subscription(**result.data[0])
 
 
@@ -81,3 +85,4 @@ async def remove_subscription(subscription_id: str, request: Request):
     sb.table("subscriptions").update({
         "active": False,
     }).eq("id", subscription_id).execute()
+    logger.info("subscription_deactivated", subscription_id=subscription_id)

@@ -3,7 +3,7 @@
 import structlog
 from supabase import Client
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 
 class NonceRepository:

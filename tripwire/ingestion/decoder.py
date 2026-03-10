@@ -18,7 +18,7 @@ from eth_abi import decode
 
 from tripwire.types.models import USDC_CONTRACTS, ChainId, ERC3009Transfer
 
-logger = structlog.get_logger()
+logger = structlog.get_logger(__name__)
 
 # keccak256("AuthorizationUsed(address,bytes32)")
 AUTHORIZATION_USED_TOPIC = (

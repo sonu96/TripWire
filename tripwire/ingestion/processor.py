@@ -13,6 +13,8 @@ from typing import Any
 import structlog
 from supabase import Client
 
+from tripwire.config.logging import chain_id_var, tx_hash_var
+
 from tripwire.api.policies.engine import evaluate_policy
 from tripwire.db.repositories.nonces import NonceRepository
 from tripwire.identity.resolver import IdentityResolver
@@ -60,10 +62,12 @@ class EventProcessor:
         tx_hash = transfer.tx_hash
         chain_id = transfer.chain_id
 
+        # Bind context vars so all downstream loggers include these
+        tx_hash_var.set(tx_hash)
+        chain_id_var.set(chain_id.value)
+
         logger.info(
             "processing_event",
-            tx_hash=tx_hash,
-            chain_id=chain_id.value,
             authorizer=transfer.authorizer,
         )
 

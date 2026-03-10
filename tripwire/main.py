@@ -1,6 +1,6 @@
 """TripWire application entry point.
 
-Initialises Supabase, Svix, identity resolver, nonce repository,
+Initialises logging, Supabase, Svix, identity resolver, nonce repository,
 and the event processor, then wires the full ingestion → policy → dispatch
 pipeline together.
 """
@@ -16,10 +16,13 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from tripwire import __version__
+from tripwire.api.middleware import RequestLoggingMiddleware
 from tripwire.api.routes.endpoints import router as endpoints_router
 from tripwire.api.routes.events import router as events_router
 from tripwire.api.routes.ingest import router as ingest_router
 from tripwire.api.routes.subscriptions import router as subscriptions_router
+from tripwire.config.logging import setup_logging
 from tripwire.config.settings import settings
 from tripwire.db.client import get_supabase_client
 from tripwire.db.repositories.nonces import NonceRepository
@@ -27,7 +30,10 @@ from tripwire.identity.resolver import create_resolver
 from tripwire.ingestion.processor import EventProcessor
 from tripwire.webhook.svix_client import init_svix
 
-logger = structlog.get_logger()
+# Configure structlog BEFORE any logger is created
+setup_logging(log_level=settings.log_level, app_env=settings.app_env)
+
+logger = structlog.get_logger(__name__)
 
 
 # ── Lifespan ──────────────────────────────────────────────────
@@ -38,7 +44,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Startup / shutdown lifecycle for the FastAPI application."""
 
     # -- Startup -------------------------------------------------
-    logger.info("tripwire_starting", env=settings.app_env, port=settings.app_port)
+    logger.info(
+        "tripwire_starting",
+        version=__version__,
+        env=settings.app_env,
+        port=settings.app_port,
+    )
 
     # Supabase client
     supabase = get_supabase_client()
@@ -86,11 +97,12 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="TripWire",
         description="x402 Execution Middleware — Stripe Webhooks for x402",
-        version="0.1.0",
+        version=__version__,
         lifespan=lifespan,
     )
 
-    # CORS
+    # Middleware (order matters — outermost first)
+    app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -102,7 +114,13 @@ def create_app() -> FastAPI:
     # Global error handler
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
-        logger.error("unhandled_exception", path=request.url.path, error=str(exc))
+        logger.error(
+            "unhandled_exception",
+            path=request.url.path,
+            method=request.method,
+            error=str(exc),
+            exc_info=True,
+        )
         return JSONResponse(
             status_code=500,
             content={"detail": "Internal server error"},
@@ -116,7 +134,7 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok", "service": "tripwire"}
+        return {"status": "ok", "service": "tripwire", "version": __version__}
 
     return app
 

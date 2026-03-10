@@ -1,6 +1,6 @@
 [project]
 name = "tripwire"
-version = "0.1.0"
+dynamic = ["version"]
 description = "x402 Execution Middleware — Stripe Webhooks for x402"
 requires-python = ">=3.11"
 dependencies = [
@@ -36,6 +36,9 @@ select = ["E", "F", "I", "N", "W"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.hatch.version]
+path = "tripwire/__init__.py"
 
 [build-system]
 requires = ["hatchling"]
