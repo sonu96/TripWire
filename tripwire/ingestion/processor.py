@@ -20,8 +20,10 @@ from tripwire.db.repositories.nonces import NonceRepository
 from tripwire.identity.resolver import IdentityResolver
 from tripwire.ingestion.decoder import decode_transfer_event
 from tripwire.ingestion.finality import check_finality
+from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.types.models import (
     Endpoint,
+    EndpointMode,
     EndpointPolicies,
     WebhookEventType,
 )
@@ -42,10 +44,12 @@ class EventProcessor:
         supabase: Client,
         identity_resolver: IdentityResolver,
         nonce_repo: NonceRepository,
+        realtime_notifier: RealtimeNotifier,
     ) -> None:
         self._sb = supabase
         self._resolver = identity_resolver
         self._nonce_repo = nonce_repo
+        self._realtime_notifier = realtime_notifier
 
     async def process_event(self, raw_log: dict[str, Any]) -> dict[str, Any]:
         """Process a single Goldsky-decoded event through the full pipeline.
@@ -151,13 +155,21 @@ class EventProcessor:
         # 7. Record the event
         event_id = self._record_event(transfer, finality, identity, event_type)
 
-        # 8. Dispatch webhooks via Svix
+        # 8. Split approved endpoints by delivery mode
+        execute_endpoints = [
+            ep for ep in approved_endpoints if ep.mode == EndpointMode.EXECUTE
+        ]
+        notify_endpoints = [
+            ep for ep in approved_endpoints if ep.mode == EndpointMode.NOTIFY
+        ]
+
+        # 8a. Dispatch webhooks via Svix for Execute-mode endpoints
         message_ids: list[str] = []
-        if approved_endpoints:
+        if execute_endpoints:
             try:
                 message_ids = await dispatch_event(
                     transfer=transfer,
-                    matched_endpoints=approved_endpoints,
+                    matched_endpoints=execute_endpoints,
                     event_type=event_type,
                     finality=finality,
                     identity=identity,
@@ -166,13 +178,27 @@ class EventProcessor:
                 logger.exception("dispatch_failed", tx_hash=tx_hash)
 
             # Record webhook deliveries
-            for i, ep in enumerate(approved_endpoints):
+            for i, ep in enumerate(execute_endpoints):
                 msg_id = message_ids[i] if i < len(message_ids) else None
                 self._record_delivery(
                     endpoint_id=ep.id,
                     event_id=event_id,
                     svix_message_id=msg_id,
                 )
+
+        # 8b. Push via Supabase Realtime for Notify-mode endpoints
+        notify_event_ids: list[str] = []
+        if notify_endpoints:
+            try:
+                notify_event_ids = await self._realtime_notifier.notify_batch(
+                    endpoints=notify_endpoints,
+                    transfer=transfer,
+                    event_type=event_type,
+                    finality=finality,
+                    identity=identity,
+                )
+            except Exception:
+                logger.exception("notify_dispatch_failed", tx_hash=tx_hash)
 
         logger.info(
             "event_processed",
@@ -181,6 +207,7 @@ class EventProcessor:
             endpoints_matched=len(matched),
             endpoints_approved=len(approved_endpoints),
             webhooks_sent=len(message_ids),
+            notify_sent=len(notify_event_ids),
             finalized=finality.is_finalized if finality else None,
         )
 
@@ -191,6 +218,7 @@ class EventProcessor:
             "endpoints_matched": len(matched),
             "endpoints_approved": len(approved_endpoints),
             "webhooks_sent": len(message_ids),
+            "notify_sent": len(notify_event_ids),
             "message_ids": message_ids,
         }
 

@@ -28,6 +28,7 @@ from tripwire.db.client import get_supabase_client
 from tripwire.db.repositories.nonces import NonceRepository
 from tripwire.identity.resolver import create_resolver
 from tripwire.ingestion.processor import EventProcessor
+from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.webhook.svix_client import init_svix
 
 # Configure structlog BEFORE any logger is created
@@ -70,11 +71,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.nonce_repo = nonce_repo
     logger.info("nonce_repo_ready")
 
+    # Realtime notifier (Notify-mode delivery via Supabase Realtime)
+    realtime_notifier = RealtimeNotifier(supabase)
+    app.state.realtime_notifier = realtime_notifier
+    logger.info("realtime_notifier_ready")
+
     # Event processor — the end-to-end pipeline orchestrator
     processor = EventProcessor(
         supabase=supabase,
         identity_resolver=resolver,
         nonce_repo=nonce_repo,
+        realtime_notifier=realtime_notifier,
     )
     app.state.processor = processor
     logger.info("event_processor_ready")

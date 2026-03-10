@@ -75,10 +75,40 @@ class Subscription(BaseModel):
 
 class Event(BaseModel):
     id: str
-    endpoint_id: str
     type: WebhookEventType
     data: dict[str, Any]
     created_at: str
+
+
+# ── Webhook Payload ───────────────────────────────────────────
+
+class WebhookPayload(BaseModel):
+    id: str
+    type: WebhookEventType
+    mode: EndpointMode
+    timestamp: int
+    data: dict[str, Any]
+
+
+# ── Transfer Data ────────────────────────────────────────────
+
+class TransferData(BaseModel):
+    chain_id: int
+    tx_hash: str
+    block_number: int
+    from_address: str
+    to_address: str
+    amount: str
+    nonce: str
+    token: str
+
+
+# ── Finality Data ────────────────────────────────────────────
+
+class FinalityData(BaseModel):
+    confirmations: int
+    required_confirmations: int
+    is_finalized: bool
 
 
 # ── Paginated Response ────────────────────────────────────────

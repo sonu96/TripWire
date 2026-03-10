@@ -126,17 +126,17 @@ class TripwireClient:
             body["policies"] = (
                 policies.model_dump() if isinstance(policies, EndpointPolicies) else policies
             )
-        data = await self._request("POST", "/endpoints", json=body)
+        data = await self._request("POST", "/api/v1/endpoints", json=body)
         return Endpoint(**data)
 
     async def list_endpoints(self) -> list[Endpoint]:
         """List all active endpoints."""
-        data = await self._request("GET", "/endpoints")
+        data = await self._request("GET", "/api/v1/endpoints")
         return [Endpoint(**ep) for ep in data["data"]]
 
     async def get_endpoint(self, endpoint_id: str) -> Endpoint:
         """Get endpoint details by ID."""
-        data = await self._request("GET", f"/endpoints/{endpoint_id}")
+        data = await self._request("GET", f"/api/v1/endpoints/{endpoint_id}")
         return Endpoint(**data)
 
     async def update_endpoint(self, endpoint_id: str, **kwargs: Any) -> Endpoint:
@@ -145,12 +145,12 @@ class TripwireClient:
             kwargs["mode"] = kwargs["mode"].value
         if "policies" in kwargs and isinstance(kwargs["policies"], EndpointPolicies):
             kwargs["policies"] = kwargs["policies"].model_dump()
-        data = await self._request("PATCH", f"/endpoints/{endpoint_id}", json=kwargs)
+        data = await self._request("PATCH", f"/api/v1/endpoints/{endpoint_id}", json=kwargs)
         return Endpoint(**data)
 
     async def delete_endpoint(self, endpoint_id: str) -> None:
         """Deactivate (soft-delete) an endpoint."""
-        await self._request("DELETE", f"/endpoints/{endpoint_id}")
+        await self._request("DELETE", f"/api/v1/endpoints/{endpoint_id}")
 
     # ── Subscriptions ─────────────────────────────────────────
 
@@ -166,18 +166,18 @@ class TripwireClient:
             ),
         }
         data = await self._request(
-            "POST", f"/endpoints/{endpoint_id}/subscriptions", json=body
+            "POST", f"/api/v1/endpoints/{endpoint_id}/subscriptions", json=body
         )
         return Subscription(**data)
 
     async def list_subscriptions(self, endpoint_id: str) -> list[Subscription]:
         """List active subscriptions for an endpoint."""
-        data = await self._request("GET", f"/endpoints/{endpoint_id}/subscriptions")
+        data = await self._request("GET", f"/api/v1/endpoints/{endpoint_id}/subscriptions")
         return [Subscription(**sub) for sub in data]
 
     async def delete_subscription(self, subscription_id: str) -> None:
         """Deactivate a subscription."""
-        await self._request("DELETE", f"/subscriptions/{subscription_id}")
+        await self._request("DELETE", f"/api/v1/subscriptions/{subscription_id}")
 
     # ── Events ────────────────────────────────────────────────
 
@@ -194,10 +194,30 @@ class TripwireClient:
         for key, val in filters.items():
             if val is not None:
                 params[key] = val
-        data = await self._request("GET", "/events", params=params)
+        data = await self._request("GET", "/api/v1/events", params=params)
         return PaginatedResponse(**data)
 
     async def get_event(self, event_id: str) -> Event:
         """Get a single event by ID."""
-        data = await self._request("GET", f"/events/{event_id}")
+        data = await self._request("GET", f"/api/v1/events/{event_id}")
         return Event(**data)
+
+    async def ingest_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        """POST a single event to the ingestion endpoint (for testing)."""
+        data = await self._request("POST", "/api/v1/ingest/event", json=event)
+        return data
+
+    async def get_endpoint_events(
+        self,
+        endpoint_id: str,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> PaginatedResponse:
+        """List events for a specific endpoint."""
+        params: dict[str, Any] = {"limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        data = await self._request(
+            "GET", f"/api/v1/endpoints/{endpoint_id}/events", params=params
+        )
+        return PaginatedResponse(**data)

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     # Goldsky
     goldsky_api_key: str = ""
     goldsky_project_id: str = ""
+    goldsky_webhook_secret: str = ""
 
     # Blockchain RPC
     base_rpc_url: str = "https://mainnet.base.org"
