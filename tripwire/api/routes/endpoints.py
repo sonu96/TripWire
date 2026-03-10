@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 
+import structlog
 from fastapi import APIRouter, HTTPException, Request
 from nanoid import generate as nanoid
 from pydantic import BaseModel
@@ -12,6 +13,9 @@ from tripwire.types.models import (
     EndpointPolicies,
     RegisterEndpointRequest,
 )
+from tripwire.webhook.svix_client import create_application, create_endpoint as create_svix_endpoint
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/endpoints", tags=["endpoints"])
 
@@ -35,7 +39,11 @@ def _supabase(request: Request):
 
 @router.post("", response_model=Endpoint, status_code=201)
 async def register_endpoint(body: RegisterEndpointRequest, request: Request):
-    """Register a new webhook endpoint."""
+    """Register a new webhook endpoint.
+
+    Also creates a corresponding Svix application and endpoint so that
+    webhook delivery is ready as soon as the endpoint is registered.
+    """
     sb = _supabase(request)
     now = datetime.now(timezone.utc).isoformat()
     endpoint_id = nanoid(size=21)
@@ -53,7 +61,25 @@ async def register_endpoint(body: RegisterEndpointRequest, request: Request):
     }
 
     result = sb.table("endpoints").insert(row).execute()
-    return Endpoint(**result.data[0])
+    endpoint = Endpoint(**result.data[0])
+
+    # Create Svix application + endpoint for webhook delivery
+    if body.mode == EndpointMode.EXECUTE:
+        try:
+            await create_application(
+                developer_id=endpoint_id,
+                name=f"tripwire-{endpoint_id}",
+            )
+            await create_svix_endpoint(
+                app_id=endpoint_id,
+                url=body.url,
+                description=f"TripWire endpoint for {body.recipient}",
+            )
+            logger.info("svix_wired", endpoint_id=endpoint_id)
+        except Exception:
+            logger.exception("svix_setup_failed", endpoint_id=endpoint_id)
+
+    return endpoint
 
 
 @router.get("", response_model=EndpointListResponse)

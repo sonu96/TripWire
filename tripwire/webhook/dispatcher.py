@@ -24,7 +24,7 @@ from tripwire.webhook.svix_client import send_webhook
 logger = structlog.get_logger(__name__)
 
 
-def _build_transfer_data(transfer: ERC3009Transfer) -> TransferData:
+def build_transfer_data(transfer: ERC3009Transfer) -> TransferData:
     """Extract TransferData from a raw ERC-3009 transfer event."""
     return TransferData(
         chain_id=transfer.chain_id,
@@ -57,7 +57,7 @@ def _build_payload(
     identity: AgentIdentity | None = None,
 ) -> WebhookPayload:
     """Build a WebhookPayload from transfer, finality, and identity data."""
-    transfer_data = _build_transfer_data(transfer)
+    transfer_data = build_transfer_data(transfer)
     finality_data = _build_finality_data(finality)
 
     data: dict = {"transfer": transfer_data.model_dump()}
