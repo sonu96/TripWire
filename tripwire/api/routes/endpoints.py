@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from tripwire.api import get_supabase
 from tripwire.api.auth import generate_api_key, hash_api_key, require_api_key
+from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.types.models import (
     Endpoint,
     EndpointMode,
@@ -27,6 +28,12 @@ class EndpointListResponse(BaseModel):
     count: int
 
 
+class RotateKeyResponse(BaseModel):
+    endpoint_id: str
+    api_key: str  # New plaintext key (shown once)
+    rotated_at: str
+
+
 class UpdateEndpointRequest(BaseModel):
     url: str | None = None
     mode: EndpointMode | None = None
@@ -36,7 +43,8 @@ class UpdateEndpointRequest(BaseModel):
 
 
 @router.post("", response_model=Endpoint, status_code=201)
-async def register_endpoint(body: RegisterEndpointRequest, request: Request, sb=Depends(get_supabase)):
+@limiter.limit(CRUD_LIMIT)
+async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=Depends(get_supabase)):
     """Register a new webhook endpoint.
 
     Also creates a corresponding Svix application and endpoint so that
@@ -99,15 +107,54 @@ async def register_endpoint(body: RegisterEndpointRequest, request: Request, sb=
     return endpoint
 
 
+@router.post("/{endpoint_id}/rotate-key", response_model=RotateKeyResponse)
+@limiter.limit(CRUD_LIMIT)
+async def rotate_key(request: Request, endpoint_id: str, sb=Depends(get_supabase)):
+    """Rotate the API key for an endpoint.
+
+    Generates a new API key and moves the current hash to old_api_key_hash
+    so both keys work during the grace period (default 24h).
+    Returns the new plaintext key (shown once).
+    """
+    # Verify endpoint exists and is active
+    existing = sb.table("endpoints").select("id, api_key_hash").eq("id", endpoint_id).eq("active", True).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    old_hash = existing.data[0]["api_key_hash"]
+    now = datetime.now(timezone.utc)
+
+    # Generate new key
+    new_key = generate_api_key()
+    new_hash = hash_api_key(new_key)
+
+    sb.table("endpoints").update({
+        "api_key_hash": new_hash,
+        "old_api_key_hash": old_hash,
+        "key_rotated_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+    }).eq("id", endpoint_id).execute()
+
+    logger.info("api_key_rotated", endpoint_id=endpoint_id)
+
+    return RotateKeyResponse(
+        endpoint_id=endpoint_id,
+        api_key=new_key,
+        rotated_at=now.isoformat(),
+    )
+
+
 @router.get("", response_model=EndpointListResponse)
-async def list_endpoints(sb=Depends(get_supabase)):
+@limiter.limit(CRUD_LIMIT)
+async def list_endpoints(request: Request, sb=Depends(get_supabase)):
     """List all registered endpoints."""
     result = sb.table("endpoints").select("*").eq("active", True).execute()
     return EndpointListResponse(data=result.data, count=len(result.data))
 
 
 @router.get("/{endpoint_id}", response_model=Endpoint)
-async def get_endpoint(endpoint_id: str, sb=Depends(get_supabase)):
+@limiter.limit(CRUD_LIMIT)
+async def get_endpoint(request: Request, endpoint_id: str, sb=Depends(get_supabase)):
     """Get endpoint details."""
     result = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not result.data:
@@ -116,7 +163,8 @@ async def get_endpoint(endpoint_id: str, sb=Depends(get_supabase)):
 
 
 @router.patch("/{endpoint_id}", response_model=Endpoint)
-async def update_endpoint(endpoint_id: str, body: UpdateEndpointRequest, sb=Depends(get_supabase)):
+@limiter.limit(CRUD_LIMIT)
+async def update_endpoint(request: Request, endpoint_id: str, body: UpdateEndpointRequest, sb=Depends(get_supabase)):
     """Update an endpoint."""
 
     # Verify exists
@@ -141,7 +189,8 @@ async def update_endpoint(endpoint_id: str, body: UpdateEndpointRequest, sb=Depe
 
 
 @router.delete("/{endpoint_id}", status_code=204)
-async def deactivate_endpoint(endpoint_id: str, sb=Depends(get_supabase)):
+@limiter.limit(CRUD_LIMIT)
+async def deactivate_endpoint(request: Request, endpoint_id: str, sb=Depends(get_supabase)):
     """Deactivate (soft-delete) an endpoint."""
 
     existing = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()

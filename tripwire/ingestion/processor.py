@@ -6,6 +6,7 @@ Receives a raw Goldsky-decoded event and runs the full pipeline:
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -63,12 +64,17 @@ class EventProcessor:
 
         Returns a summary dict with processing results.
         """
+        pipeline_start = time.perf_counter()
+        timings: dict[str, float] = {}
+
         # 1. Decode the raw event into an ERC3009Transfer
+        t0 = time.perf_counter()
         try:
             transfer = decode_transfer_event(raw_log)
         except Exception:
             logger.exception("decode_failed", raw_log=raw_log)
             return {"status": "error", "reason": "decode_failed"}
+        timings["decode_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         tx_hash = transfer.tx_hash
         chain_id = transfer.chain_id
@@ -84,23 +90,29 @@ class EventProcessor:
         )
 
         # 2. Nonce deduplication
+        t0 = time.perf_counter()
         is_new = self._nonce_repo.record_nonce(
             chain_id=chain_id.value,
             nonce=transfer.nonce,
             authorizer=transfer.authorizer,
         )
+        timings["dedup_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
         if not is_new:
             logger.info("duplicate_nonce", tx_hash=tx_hash, nonce=transfer.nonce)
             return {"status": "duplicate", "tx_hash": tx_hash}
 
         # 3. Finality check
+        t0 = time.perf_counter()
         try:
             finality = await check_finality(transfer)
         except Exception:
             logger.exception("finality_check_failed", tx_hash=tx_hash)
             finality = None
+        timings["finality_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # 4. Identity resolution
+        t0 = time.perf_counter()
         identity = None
         try:
             identity = await self._resolver.resolve(
@@ -108,6 +120,7 @@ class EventProcessor:
             )
         except Exception:
             logger.warning("identity_resolve_failed", authorizer=transfer.authorizer)
+        timings["identity_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # 5. Match endpoints for this transfer's recipient + chain
         endpoints = self._fetch_matching_endpoints(transfer)
@@ -136,6 +149,7 @@ class EventProcessor:
             }
 
         # 6. Policy evaluation — filter out endpoints that fail policy
+        t0 = time.perf_counter()
         transfer_data = build_transfer_data(transfer)
         approved_endpoints: list[Endpoint] = []
 
@@ -151,6 +165,7 @@ class EventProcessor:
                     tx_hash=tx_hash,
                     reason=reason,
                 )
+        timings["policy_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # Determine event type based on finality
         if finality and finality.is_finalized:
@@ -173,6 +188,7 @@ class EventProcessor:
         ]
 
         # 8a. Dispatch webhooks via Svix for Execute-mode endpoints
+        t0 = time.perf_counter()
         message_ids: list[str] = []
         if execute_endpoints:
             try:
@@ -209,6 +225,9 @@ class EventProcessor:
                 )
             except Exception:
                 logger.exception("notify_dispatch_failed", tx_hash=tx_hash)
+        timings["dispatch_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        timings["total_ms"] = round((time.perf_counter() - pipeline_start) * 1000, 2)
 
         logger.info(
             "event_processed",
@@ -219,6 +238,7 @@ class EventProcessor:
             webhooks_sent=len(message_ids),
             notify_sent=len(notify_event_ids),
             finalized=finality.is_finalized if finality else None,
+            **timings,
         )
 
         return {

@@ -1,11 +1,12 @@
 """Event history routes."""
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from tripwire.api import get_supabase
 from tripwire.api.auth import require_api_key
+from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.types.models import WebhookEventType
 
 logger = structlog.get_logger(__name__)
@@ -28,7 +29,9 @@ class EventListResponse(BaseModel):
 
 
 @router.get("/events", response_model=EventListResponse)
+@limiter.limit(CRUD_LIMIT)
 async def list_events(
+    request: Request,
     cursor: str | None = Query(None, description="Cursor for pagination (event id)"),
     limit: int = Query(50, ge=1, le=200),
     event_type: WebhookEventType | None = Query(None),
@@ -63,7 +66,8 @@ async def list_events(
 
 
 @router.get("/events/{event_id}", response_model=EventResponse)
-async def get_event(event_id: str, sb=Depends(get_supabase)):
+@limiter.limit(CRUD_LIMIT)
+async def get_event(request: Request, event_id: str, sb=Depends(get_supabase)):
     """Get event details."""
     result = sb.table("events").select("*").eq("id", event_id).execute()
     if not result.data:
@@ -72,7 +76,9 @@ async def get_event(event_id: str, sb=Depends(get_supabase)):
 
 
 @router.get("/endpoints/{endpoint_id}/events", response_model=EventListResponse)
+@limiter.limit(CRUD_LIMIT)
 async def list_endpoint_events(
+    request: Request,
     endpoint_id: str,
     cursor: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),

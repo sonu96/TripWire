@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     ethereum_rpc_url: str = "https://eth.llamarpc.com"
     arbitrum_rpc_url: str = "https://arb1.arbitrum.io/rpc"
 
+    # API key rotation
+    key_rotation_grace_hours: int = 24
+
     # Identity resolver
     identity_cache_ttl: int = 300
 

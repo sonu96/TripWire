@@ -7,6 +7,7 @@ pipeline together.
 
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
@@ -15,12 +16,16 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from tripwire import __version__
 from tripwire.api.middleware import RequestLoggingMiddleware
+from tripwire.api.ratelimit import limiter, rate_limit_exceeded_handler
 from tripwire.api.routes.endpoints import router as endpoints_router
 from tripwire.api.routes.events import router as events_router
 from tripwire.api.routes.ingest import router as ingest_router
+from tripwire.api.routes.stats import router as stats_router
 from tripwire.api.routes.subscriptions import router as subscriptions_router
 from tripwire.config.logging import setup_logging
 from tripwire.config.settings import settings
@@ -106,6 +111,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.processor = processor
     logger.info("event_processor_ready")
 
+    # Mark application as ready for traffic
+    app.state.ready = True
+    app.state.started_at = time.time()
+    logger.info("tripwire_ready")
+
     yield
 
     # -- Shutdown ------------------------------------------------
@@ -128,8 +138,13 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Rate limiter (must be set on app.state before adding middleware)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
     # Middleware (order matters — outermost first)
     app.add_middleware(RequestLoggingMiddleware)
+    app.add_middleware(SlowAPIMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -158,10 +173,74 @@ def create_app() -> FastAPI:
     app.include_router(subscriptions_router, prefix="/api/v1")
     app.include_router(events_router, prefix="/api/v1")
     app.include_router(ingest_router, prefix="/api/v1")
+    app.include_router(stats_router, prefix="/api/v1")
+
+    # ── Operational endpoints (not business logic) ─────────────
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "service": "tripwire", "version": __version__}
+
+    @app.get("/health/detailed")
+    async def health_detailed(request: Request):
+        """Deep health check — probes Supabase and webhook provider."""
+        components: dict[str, dict] = {}
+
+        # Check Supabase connectivity
+        try:
+            sb = request.app.state.supabase
+            sb.table("events").select("id").limit(1).execute()
+            components["supabase"] = {"status": "healthy"}
+        except Exception as exc:
+            components["supabase"] = {"status": "unhealthy", "error": str(exc)}
+
+        # Check webhook provider availability
+        try:
+            wp = request.app.state.webhook_provider
+            # LogOnlyProvider is always healthy; SvixProvider has a _client attr
+            if hasattr(wp, "_client"):
+                components["webhook_provider"] = {"status": "healthy", "type": "svix"}
+            else:
+                components["webhook_provider"] = {"status": "healthy", "type": "log_only"}
+        except Exception as exc:
+            components["webhook_provider"] = {"status": "unhealthy", "error": str(exc)}
+
+        # Check identity resolver status
+        try:
+            resolver = request.app.state.identity_resolver
+            resolver_type = type(resolver).__name__
+            components["identity_resolver"] = {"status": "healthy", "type": resolver_type}
+        except Exception as exc:
+            components["identity_resolver"] = {"status": "unhealthy", "error": str(exc)}
+
+        # Determine overall status
+        statuses = [c["status"] for c in components.values()]
+        if all(s == "healthy" for s in statuses):
+            overall = "healthy"
+        elif any(s == "unhealthy" for s in statuses):
+            overall = "unhealthy"
+        else:
+            overall = "degraded"
+
+        status_code = 200 if overall == "healthy" else 503
+        uptime = time.time() - getattr(request.app.state, "started_at", time.time())
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "status": overall,
+                "version": __version__,
+                "uptime_seconds": round(uptime, 1),
+                "components": components,
+            },
+        )
+
+    @app.get("/ready")
+    async def readiness(request: Request):
+        """Readiness probe — returns 200 only after lifespan startup completes."""
+        if getattr(request.app.state, "ready", False):
+            return {"ready": True}
+        return JSONResponse(status_code=503, content={"ready": False})
 
     return app
 

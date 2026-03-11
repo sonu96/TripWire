@@ -110,9 +110,10 @@ class Endpoint(BaseModel):
     recipient: str
     policies: EndpointPolicies
     active: bool = True
-    api_key: str | None = None  # Only populated on creation response
+    api_key: str | None = None  # Only populated on creation/rotation response
     svix_app_id: str | None = None
     svix_endpoint_id: str | None = None
+    key_rotated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

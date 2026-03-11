@@ -13,6 +13,7 @@ import structlog
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from tripwire.api.ratelimit import INGEST_LIMIT, limiter
 from tripwire.config.settings import settings
 
 logger = structlog.get_logger(__name__)
@@ -74,6 +75,7 @@ class IngestSingleResponse(BaseModel):
     response_model=IngestResponse,
     dependencies=[Depends(_verify_goldsky_request)],
 )
+@limiter.limit(INGEST_LIMIT)
 async def ingest_goldsky_batch(
     request: Request,
     body: list[dict[str, Any]] | dict[str, Any] = Body(),
@@ -102,6 +104,7 @@ async def ingest_goldsky_batch(
     response_model=IngestSingleResponse,
     dependencies=[Depends(_verify_goldsky_request)],
 )
+@limiter.limit(INGEST_LIMIT)
 async def ingest_single_event(
     request: Request,
     body: dict[str, Any] = Body(),
