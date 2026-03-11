@@ -1,14 +1,14 @@
 # TripWire — x402 Execution Middleware
 
 ## What This Is
-TripWire is "Stripe Webhooks for x402" — the infrastructure layer between x402 micropayments settling onchain and applications executing in response. Two modes: Notify (Supabase Realtime push) and Execute (Svix webhook delivery).
+TripWire is "Stripe Webhooks for x402" — the infrastructure layer between x402 micropayments settling onchain and applications executing in response. Two modes: Notify (Supabase Realtime push) and Execute (Convoy webhook delivery).
 
 ## Final Architecture Stack
 - **Runtime**: Python 3.11+
 - **API**: FastAPI + Uvicorn
 - **Database**: Supabase (managed PostgreSQL)
 - **Notify Mode**: Supabase Realtime (clients subscribe to DB changes)
-- **Webhook Delivery**: Svix (hosted, free tier 50k msgs/mo — handles retries, HMAC, DLQ)
+- **Webhook Delivery**: Convoy self-hosted + direct httpx fast path
 - **Blockchain Indexing**: Goldsky Mirror/Turbo → pipes directly into Supabase
 - **Blockchain RPC**: httpx (raw JSON-RPC calls, no web3.py)
 - **ABI Decoding**: eth-abi (lightweight, only if needed for raw data)
@@ -20,13 +20,13 @@ TripWire is "Stripe Webhooks for x402" — the infrastructure layer between x402
 - L0 Chain: Base / Ethereum / Arbitrum (ERC-3009 transfers)
 - L1 Indexing: Goldsky Mirror/Turbo → streams events directly into Supabase tables
 - L2 Middleware: TripWire FastAPI (verification, deduplication, identity, policy engine)
-- L3 Delivery: Svix (webhook delivery with retries, HMAC signing, DLQ)
+- L3 Delivery: Convoy + direct POST (webhook delivery with retries, HMAC signing, DLQ)
 - L4 Application: Developer's API (executes business logic on verified webhook)
 
 ## Key Directories
 - `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking
 - `tripwire/api/` — FastAPI routes, endpoint registration, subscription management
-- `tripwire/webhook/` — Svix integration, webhook dispatch
+- `tripwire/webhook/` — Convoy integration, webhook dispatch
 - `tripwire/identity/` — ERC-8004 identity resolution (mock for MVP), reputation scoring
 - `tripwire/db/` — Supabase client, repositories, SQL migrations
 - `tripwire/types/` — Shared Pydantic models
@@ -39,10 +39,13 @@ TripWire is "Stripe Webhooks for x402" — the infrastructure layer between x402
 - **ERC-3009**: transferWithAuthorization standard for gasless USDC transfers
 - **ERC-8004**: Onchain AI agent identity registry (went mainnet Jan 29 2026)
 
-## Webhook Delivery (Svix)
-- One API call to Svix = delivery + retries + HMAC + DLQ
-- Svix handles: exponential backoff retries, signature signing, delivery logs, endpoint management
-- TripWire wraps Svix to add: policy evaluation, identity enrichment, event deduplication
+## Webhook Delivery (Convoy + direct httpx fast path)
+- Dual-path architecture: direct httpx POST for low-latency fast path; Convoy for managed delivery with retries, HMAC signing, and DLQ
+- Convoy self-hosted via docker-compose (convoy-server + convoy-worker + convoy-postgres + convoy-redis)
+- Convoy handles: exponential backoff retries, signature signing, delivery logs, endpoint management
+- Direct httpx path: used when latency is critical and at-least-once delivery can be handled by the caller
+- TripWire wraps both paths to add: policy evaluation, identity enrichment, event deduplication
+- docker-compose services: `convoy-server` (port 5005), `convoy-worker`, `convoy-postgres` (port 5433), `convoy-redis` (port 6380)
 
 ## Database (Supabase)
 - Tables: endpoints, subscriptions, events, nonces, webhook_deliveries, audit_log

@@ -1,5 +1,6 @@
 """Endpoint registration routes."""
 
+import secrets
 from datetime import datetime, timezone
 
 import structlog
@@ -47,7 +48,7 @@ class UpdateEndpointRequest(BaseModel):
 async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=Depends(get_supabase)):
     """Register a new webhook endpoint.
 
-    Also creates a corresponding Svix application and endpoint so that
+    Also creates a corresponding Convoy application and endpoint so that
     webhook delivery is ready as soon as the endpoint is registered.
     """
     now = datetime.now(timezone.utc).isoformat()
@@ -79,27 +80,32 @@ async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=
     if body.mode == EndpointMode.EXECUTE:
         provider: WebhookProvider = request.app.state.webhook_provider
         try:
-            svix_app_id = await provider.create_app(
+            convoy_project_id = await provider.create_app(
                 developer_id=endpoint_id,
                 name=f"tripwire-{endpoint_id}",
             )
-            svix_endpoint_id = await provider.create_endpoint(
-                app_id=svix_app_id,
+            webhook_secret = secrets.token_hex(32)
+            convoy_endpoint_id = await provider.create_endpoint(
+                app_id=convoy_project_id,
                 url=body.url,
                 description=f"TripWire endpoint for {body.recipient}",
+                secret=webhook_secret,
             )
-            # Persist the provider IDs back to the endpoint row
+            # Persist the provider IDs and webhook secret back to the endpoint row
             sb.table("endpoints").update({
-                "svix_app_id": svix_app_id,
-                "svix_endpoint_id": svix_endpoint_id,
+                "convoy_project_id": convoy_project_id,
+                "convoy_endpoint_id": convoy_endpoint_id,
+                "webhook_secret": webhook_secret,
             }).eq("id", endpoint_id).execute()
-            endpoint.svix_app_id = svix_app_id
-            endpoint.svix_endpoint_id = svix_endpoint_id
+            endpoint.convoy_project_id = convoy_project_id
+            endpoint.convoy_endpoint_id = convoy_endpoint_id
+            # Return the webhook secret once — caller must store it securely
+            endpoint.webhook_secret = webhook_secret
             logger.info(
                 "webhook_provider_wired",
                 endpoint_id=endpoint_id,
-                svix_app_id=svix_app_id,
-                svix_endpoint_id=svix_endpoint_id,
+                convoy_project_id=convoy_project_id,
+                convoy_endpoint_id=convoy_endpoint_id,
             )
         except Exception:
             logger.exception("webhook_provider_setup_failed", endpoint_id=endpoint_id)

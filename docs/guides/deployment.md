@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This guide covers deploying TripWire to production. TripWire depends on three external services -- Supabase (database), Svix (webhook delivery), and Goldsky (blockchain indexing) -- all of which offer free tiers sufficient to get started at zero cost.
+This guide covers deploying TripWire to production. TripWire depends on three external services -- Supabase (database), Convoy self-hosted (webhook delivery), and Goldsky (blockchain indexing) -- all of which are available at zero cost to get started.
 
 ## External Service Setup
 
@@ -21,13 +21,13 @@ This creates the `endpoints`, `subscriptions`, `events`, `nonces`, `webhook_deli
 
 **Free tier includes**: 500 MB database, 50k monthly active users, unlimited API requests.
 
-### 2. Svix Account
+### 2. Convoy Self-Hosted
 
-1. Sign up at [svix.com](https://www.svix.com).
-2. Create an application in the dashboard.
-3. Copy your **API Key** (`SVIX_API_KEY`).
+1. Deploy Convoy from [getconvoy.io](https://getconvoy.io).
+2. Create a project in the dashboard.
+3. Copy your **API Key** (`CONVOY_API_KEY`).
 
-**Free tier includes**: 50,000 messages/month, retry logic, HMAC signing, delivery logs, dead letter queue.
+**Self-hosted includes**: Unlimited messages, retry logic, HMAC signing, delivery logs, dead letter queue.
 
 ### 3. Goldsky Pipelines
 
@@ -50,7 +50,7 @@ Required variables:
 | `SUPABASE_URL` | Your Supabase project URL |
 | `SUPABASE_ANON_KEY` | Supabase anon/public key |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key |
-| `SVIX_API_KEY` | Svix API key |
+| `CONVOY_API_KEY` | Convoy API key |
 | `GOLDSKY_API_KEY` | Goldsky API key |
 | `GOLDSKY_PROJECT_ID` | Goldsky project ID |
 | `APP_ENV` | `production` for deployed environments |
@@ -102,7 +102,7 @@ fly secrets set \
   SUPABASE_URL="https://your-project.supabase.co" \
   SUPABASE_ANON_KEY="your_anon_key" \
   SUPABASE_SERVICE_ROLE_KEY="your_service_role_key" \
-  SVIX_API_KEY="your_svix_api_key" \
+  CONVOY_API_KEY="your_convoy_api_key" \
   GOLDSKY_API_KEY="your_goldsky_api_key" \
   GOLDSKY_PROJECT_ID="your_project_id" \
   APP_ENV="production"
@@ -204,7 +204,7 @@ TripWire is stateless -- all state lives in Supabase. This means you can scale h
 - **Multiple workers**: Add `--workers N` to the uvicorn command for CPU-bound workloads. Adjust the Dockerfile CMD or set the `WEB_CONCURRENCY` environment variable.
 - **Horizontal scaling**: Run multiple containers behind a load balancer. No session affinity required since there is no local state.
 - **Database**: Supabase free tier supports 500 MB and 60 connections. Upgrade to Pro ($25/mo) for 8 GB and 200 connections.
-- **Webhooks**: Svix free tier covers 50k messages/month. The Starter plan ($75/mo) covers 250k messages.
+- **Webhooks**: Convoy self-hosted has no message limits. Scale by adding more Convoy instances as needed.
 
 ## Cost Breakdown
 
@@ -213,7 +213,7 @@ Starting from zero:
 | Service | Free Tier | Paid Tier |
 |---|---|---|
 | **Supabase** | 500 MB database, 50k MAU | Pro: $25/mo (8 GB, 200 connections) |
-| **Svix** | 50,000 messages/month | Starter: $75/mo (250k messages) |
+| **Convoy** | Self-hosted (no limits) | Infrastructure cost only |
 | **Goldsky** | Mirror pipelines | Growth: usage-based |
 | **Hosting** | Railway free trial / Fly free tier | ~$5-10/mo for a small instance |
 | **Total** | **$0 to start** | **~$30-110/mo at scale** |

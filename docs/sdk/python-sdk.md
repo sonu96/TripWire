@@ -15,7 +15,7 @@ pip install tripwire-sdk[webhook]
 Dependencies:
 - `httpx >= 0.28.0` -- async HTTP client
 - `pydantic >= 2.10.0` -- data validation
-- `svix >= 1.86.0` -- webhook verification (optional, installed with `[webhook]`)
+- `httpx >= 0.28.0` -- used for Convoy REST API webhook verification (optional, installed with `[webhook]`)
 
 ## Initialization
 
@@ -271,11 +271,11 @@ from tripwire_sdk import verify_webhook_signature
 is_valid = verify_webhook_signature(
     payload=request_body,
     headers={
-        "svix-id": headers["svix-id"],
-        "svix-timestamp": headers["svix-timestamp"],
-        "svix-signature": headers["svix-signature"],
+        "X-TripWire-ID": headers["X-TripWire-ID"],
+        "X-TripWire-Timestamp": headers["X-TripWire-Timestamp"],
+        "X-TripWire-Signature": headers["X-TripWire-Signature"],
     },
-    secret="whsec_your_signing_secret",
+    secret="your_hex_signing_secret",
 )
 ```
 

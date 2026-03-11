@@ -505,7 +505,7 @@ async def test_notify_mode_with_subscription():
             assert result["status"] == "processed"
             assert result["tx_hash"] == TX_HASH
 
-    # Verify no webhook deliveries (notify mode doesn't use Svix)
+    # Verify no webhook deliveries (notify mode doesn't use Convoy)
     deliveries = mock_sb.get_table_data("webhook_deliveries")
     assert len(deliveries) == 0
 

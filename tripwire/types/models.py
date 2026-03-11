@@ -111,8 +111,9 @@ class Endpoint(BaseModel):
     policies: EndpointPolicies
     active: bool = True
     api_key: str | None = None  # Only populated on creation/rotation response
-    svix_app_id: str | None = None
-    svix_endpoint_id: str | None = None
+    convoy_project_id: str | None = None
+    convoy_endpoint_id: str | None = None
+    webhook_secret: str | None = None  # Per-endpoint HMAC signing secret
     key_rotated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime

@@ -20,12 +20,12 @@ TripWire is configured via environment variables, loaded from a `.env` file by [
 | `SUPABASE_ANON_KEY` | **Yes** | -- | Supabase anon/public key. Used for client-side operations and Realtime subscriptions. |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Yes** | -- | Supabase service role key. Used for server-side database operations. **Keep this secret.** |
 
-### Svix (Webhook Delivery)
+### Convoy (Webhook Delivery)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `SVIX_API_KEY` | **Yes** | -- | Svix API key for webhook delivery. Get it from your [Svix dashboard](https://dashboard.svix.com). |
-| `SVIX_SIGNING_SECRET` | No | -- | Signing secret for webhook signature verification (format: `whsec_...`). Consumers use this to verify incoming webhooks. |
+| `CONVOY_API_KEY` | **Yes** | -- | Convoy API key for webhook delivery. Get it from your [Convoy dashboard](https://getconvoy.io). |
+| `CONVOY_SIGNING_SECRET` | No | -- | Signing secret for webhook signature verification (hex string). Consumers use this to verify incoming webhooks. |
 
 ### Goldsky (Blockchain Indexing)
 
@@ -65,7 +65,7 @@ For local development, you need at minimum these four variables:
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=eyJ...
 SUPABASE_SERVICE_ROLE_KEY=eyJ...
-SVIX_API_KEY=sk_...
+CONVOY_API_KEY=your_convoy_api_key
 ```
 
 Everything else has sensible defaults. Goldsky credentials are only needed when you want to index live blockchain events in production.
@@ -83,9 +83,9 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
-# Svix
-SVIX_API_KEY=sk_your_svix_api_key
-SVIX_SIGNING_SECRET=whsec_your_signing_secret
+# Convoy
+CONVOY_API_KEY=your_convoy_api_key
+CONVOY_SIGNING_SECRET=your_hex_signing_secret
 
 # Goldsky (production only)
 GOLDSKY_API_KEY=
@@ -102,5 +102,5 @@ ARBITRUM_RPC_URL=https://arb1.arbitrum.io/rpc
 - Set `APP_ENV=production` to disable Uvicorn auto-reload.
 - Use dedicated RPC endpoints (e.g. Alchemy, Infura) instead of public defaults for reliable finality checks.
 - Configure `GOLDSKY_API_KEY` and `GOLDSKY_PROJECT_ID` to enable live blockchain event indexing.
-- Store secrets (`SUPABASE_SERVICE_ROLE_KEY`, `SVIX_API_KEY`) in a secrets manager rather than `.env` files.
+- Store secrets (`SUPABASE_SERVICE_ROLE_KEY`, `CONVOY_API_KEY`) in a secrets manager rather than `.env` files.
 - Set `LOG_LEVEL=warning` or `error` to reduce log volume.

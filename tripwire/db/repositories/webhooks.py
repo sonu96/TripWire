@@ -10,7 +10,7 @@ logger = structlog.get_logger(__name__)
 
 
 class WebhookDeliveryRepository:
-    """Tracks webhook delivery attempts and their Svix message IDs."""
+    """Tracks webhook delivery attempts and their provider message IDs."""
 
     def __init__(self, client: Client) -> None:
         self._sb = client
@@ -19,8 +19,9 @@ class WebhookDeliveryRepository:
         self,
         endpoint_id: str,
         event_id: str,
-        svix_message_id: str | None = None,
+        provider_message_id: str | None = None,
         status: str = "pending",
+        delivery_method: str = "convoy",
     ) -> dict:
         """Record a new webhook delivery attempt."""
         delivery_id = nanoid(size=21)
@@ -28,7 +29,7 @@ class WebhookDeliveryRepository:
             "id": delivery_id,
             "endpoint_id": endpoint_id,
             "event_id": event_id,
-            "svix_message_id": svix_message_id,
+            "provider_message_id": provider_message_id,
             "status": status,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -54,11 +55,11 @@ class WebhookDeliveryRepository:
             return result.data[0]
         return None
 
-    def set_svix_message_id(self, delivery_id: str, svix_message_id: str) -> dict | None:
-        """Set the Svix message ID after a successful send."""
+    def set_provider_message_id(self, delivery_id: str, provider_message_id: str) -> dict | None:
+        """Set the provider message ID after a successful send."""
         result = (
             self._sb.table("webhook_deliveries")
-            .update({"svix_message_id": svix_message_id, "status": "sent"})
+            .update({"provider_message_id": provider_message_id, "status": "sent"})
             .eq("id", delivery_id)
             .execute()
         )

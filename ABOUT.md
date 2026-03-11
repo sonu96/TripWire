@@ -57,7 +57,7 @@ async with TripwireClient(api_key="tw_...") as client:
 
 Register an endpoint. Define a policy. Receive verified, enriched payloads. Execute your business logic. That's it.
 
-TripWire handles the chain watching (Goldsky), the finality tracking (per-chain confirmation depths), the replay protection (nonce deduplication), the identity resolution (ERC-8004), the webhook delivery (Svix), and the audit logging (Supabase) -- so you never have to.
+TripWire handles the chain watching (Goldsky), the finality tracking (per-chain confirmation depths), the replay protection (nonce deduplication), the identity resolution (ERC-8004), the webhook delivery (Convoy self-hosted + direct httpx fast path), and the audit logging (Supabase) -- so you never have to.
 
 ---
 
@@ -78,14 +78,14 @@ Subscriptions support granular filters -- by chain, sender, recipient, minimum a
 
 ### Execute Mode -- Stripe Webhooks for x402
 
-Execute mode uses **Svix** to deliver HMAC-signed webhook payloads to your HTTPS endpoint with guaranteed delivery. This is the Stripe model: TripWire sends a POST to your URL, you verify the signature, parse the payload, and execute.
+Execute mode uses **Convoy self-hosted + a direct httpx fast path** to deliver HMAC-signed webhook payloads to your HTTPS endpoint with guaranteed delivery. This is the Stripe model: TripWire sends a POST to your URL, you verify the signature, parse the payload, and execute.
 
 Best for:
 - API backends that need to fulfill requests on payment confirmation
 - Automated pipelines triggered by agent payments
 - Any workflow where a payment should cause an action
 
-Svix handles retries with exponential backoff, dead letter queues for failed deliveries, and delivery logging -- the same infrastructure Stripe uses internally.
+Convoy handles retries with exponential backoff, dead letter queues for failed deliveries, and delivery logging. The direct httpx fast path fires simultaneously for lowest-latency delivery.
 
 ### The Payload
 
@@ -163,8 +163,8 @@ If you have used Stripe Webhooks, TripWire will feel familiar. The core model is
 | **Settlement** | 2-7 business days | Seconds to minutes (block finality) |
 | **Payer identity** | Email + billing address | Onchain wallet + ERC-8004 agent identity |
 | **Event source** | Stripe's internal ledger | Onchain ERC-3009 `TransferWithAuthorization` events |
-| **Delivery** | Stripe infrastructure | Svix (same engine, open ecosystem) |
-| **Signing** | Stripe HMAC | Svix HMAC (same verification flow) |
+| **Delivery** | Stripe infrastructure | Convoy self-hosted + direct POST (dual-path delivery) |
+| **Signing** | Stripe HMAC | HMAC-SHA256 (X-TripWire-Signature header) |
 | **Retries** | Exponential backoff, 72h | Exponential backoff, configurable |
 | **Payer type** | Humans with credit cards | Humans and autonomous AI agents |
 | **Policies** | Radar fraud rules | Policy engine (amount, sender, agent class, reputation) |
@@ -207,7 +207,7 @@ TripWire's cost structure scales linearly with event volume:
 
 - **Goldsky indexing**: ~$0.0005/event (chain data pipeline)
 - **Supabase**: ~$0.0002/event (storage + realtime)
-- **Svix delivery**: ~$0.0003/event (webhook dispatch)
+- **Convoy**: self-hosted (near zero marginal cost)
 - **Compute**: ~$0.0002/event (verification, policy, identity)
 
 **Total cost per event: ~$0.0012**
@@ -226,7 +226,7 @@ Core infrastructure for x402 payment event processing:
 - Goldsky-powered chain indexing for ERC-3009 events on Base, Ethereum, and Arbitrum
 - Finality tracking with per-chain confirmation depths
 - Nonce-based replay protection
-- Notify mode (Supabase Realtime) and Execute mode (Svix webhook delivery)
+- Notify mode (Supabase Realtime) and Execute mode (Convoy webhook delivery with direct httpx fast path)
 - Policy engine with amount, sender, agent class, and reputation filters
 - ERC-8004 identity resolution
 - Python SDK (`tripwire-sdk`)
@@ -263,7 +263,7 @@ L1  Indexing       Goldsky Mirror/Turbo --> Supabase
                           |
 L2  Middleware     TripWire (verify, deduplicate, identify, evaluate)
                           |
-L3  Delivery       Svix (Execute) | Supabase Realtime (Notify)
+L3  Delivery       Convoy + direct POST (Execute) | Supabase Realtime (Notify)
                           |
 L4  Application    Your API (execute business logic)
 ```

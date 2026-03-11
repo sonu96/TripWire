@@ -89,8 +89,8 @@ def _create_monitoring_app(
 
         try:
             wp = request.app.state.webhook_provider
-            if hasattr(wp, "_client"):
-                components["webhook_provider"] = {"status": "healthy", "type": "svix"}
+            if hasattr(wp, "_api_key"):
+                components["webhook_provider"] = {"status": "healthy", "type": "convoy"}
             else:
                 components["webhook_provider"] = {"status": "healthy", "type": "log_only"}
         except Exception as exc:

@@ -17,12 +17,18 @@ from tripwire_sdk.types import (
     WebhookEventType,
     WebhookPayload,
 )
-from tripwire_sdk.verify import verify_webhook_signature
+from tripwire_sdk.verify import (
+    WebhookVerificationError,
+    verify_webhook_signature,
+    verify_webhook_signature_safe,
+)
 
 __all__ = [
     "TripwireClient",
     "TripwireAPIError",
+    "WebhookVerificationError",
     "verify_webhook_signature",
+    "verify_webhook_signature_safe",
     "ChainId",
     "Endpoint",
     "EndpointMode",
