@@ -1,6 +1,6 @@
 # Webhook Verification
 
-When TripWire delivers a webhook to your endpoint (execute mode), the payload is signed using HMAC via [Svix](https://svix.com). You should always verify the signature before processing the payload to ensure it was sent by TripWire and has not been tampered with.
+When TripWire delivers a webhook to your endpoint (execute mode), the payload is signed using HMAC via [Convoy self-hosted](https://getconvoy.io). You should always verify the signature before processing the payload to ensure it was sent by TripWire and has not been tampered with.
 
 ## Why Verification Matters
 
@@ -10,9 +10,9 @@ Every webhook from TripWire includes three headers:
 
 | Header | Description |
 |--------|-------------|
-| `svix-id` | Unique message identifier |
-| `svix-timestamp` | Unix timestamp (seconds) when the message was sent |
-| `svix-signature` | HMAC-SHA256 signature of the payload |
+| `X-TripWire-ID` | Unique message identifier |
+| `X-TripWire-Timestamp` | Unix timestamp (seconds) when the message was sent |
+| `X-TripWire-Signature` | HMAC-SHA256 signature of the payload |
 
 ## Using the TripWire SDK
 
@@ -30,11 +30,11 @@ from tripwire_sdk import verify_webhook_signature
 is_valid = verify_webhook_signature(
     payload=raw_body,       # Raw request body (str or bytes)
     headers={
-        "svix-id": "msg_abc123...",
-        "svix-timestamp": "1700000000",
-        "svix-signature": "v1,base64signature...",
+        "X-TripWire-ID": "msg_abc123...",
+        "X-TripWire-Timestamp": "1700000000",
+        "X-TripWire-Signature": "v1,base64signature...",
     },
-    secret="whsec_your_signing_secret",
+    secret="your_hex_signing_secret",
 )
 
 if not is_valid:
@@ -52,7 +52,7 @@ from tripwire_sdk import verify_webhook_signature
 
 app = FastAPI()
 
-WEBHOOK_SECRET = "whsec_your_signing_secret"
+WEBHOOK_SECRET = "your_hex_signing_secret"
 
 
 @app.post("/webhook")
@@ -60,11 +60,11 @@ async def handle_webhook(request: Request):
     # 1. Read the raw body
     body = await request.body()
 
-    # 2. Extract Svix headers
+    # 2. Extract Convoy headers
     headers = {
-        "svix-id": request.headers.get("svix-id", ""),
-        "svix-timestamp": request.headers.get("svix-timestamp", ""),
-        "svix-signature": request.headers.get("svix-signature", ""),
+        "X-TripWire-ID": request.headers.get("X-TripWire-ID", ""),
+        "X-TripWire-Timestamp": request.headers.get("X-TripWire-Timestamp", ""),
+        "X-TripWire-Signature": request.headers.get("X-TripWire-Signature", ""),
     }
 
     # 3. Verify signature
@@ -105,7 +105,7 @@ from tripwire_sdk import verify_webhook_signature
 
 app = Flask(__name__)
 
-WEBHOOK_SECRET = "whsec_your_signing_secret"
+WEBHOOK_SECRET = "your_hex_signing_secret"
 
 
 @app.route("/webhook", methods=["POST"])
@@ -113,11 +113,11 @@ def handle_webhook():
     # 1. Read the raw body
     body = request.get_data(as_text=True)
 
-    # 2. Extract Svix headers
+    # 2. Extract Convoy headers
     headers = {
-        "svix-id": request.headers.get("svix-id", ""),
-        "svix-timestamp": request.headers.get("svix-timestamp", ""),
-        "svix-signature": request.headers.get("svix-signature", ""),
+        "X-TripWire-ID": request.headers.get("X-TripWire-ID", ""),
+        "X-TripWire-Timestamp": request.headers.get("X-TripWire-Timestamp", ""),
+        "X-TripWire-Signature": request.headers.get("X-TripWire-Signature", ""),
     }
 
     # 3. Verify signature
@@ -142,7 +142,7 @@ def handle_webhook():
 
 ## Manual Verification (Without SDK)
 
-If you cannot use the `tripwire-sdk` package, you can verify the signature manually. TripWire uses the [Svix standard webhook signing scheme](https://docs.svix.com/receiving/verifying-payloads/how):
+If you cannot use the `tripwire-sdk` package, you can verify the signature manually. TripWire uses the [Convoy standard webhook signing scheme](https://docs.getconvoy.io/product-manual/signatures):
 
 ```python
 import base64
@@ -157,20 +157,20 @@ def verify_webhook_manual(
     secret: str,
     tolerance_seconds: int = 300,
 ) -> bool:
-    """Verify a TripWire/Svix webhook signature manually.
+    """Verify a TripWire/Convoy webhook signature manually.
 
     Args:
         payload: Raw request body as string.
-        headers: Dict with svix-id, svix-timestamp, svix-signature.
-        secret: Signing secret (whsec_...).
+        headers: Dict with X-TripWire-ID, X-TripWire-Timestamp, X-TripWire-Signature.
+        secret: Signing secret (hex string).
         tolerance_seconds: Max age of the timestamp (default 5 minutes).
 
     Returns:
         True if valid, False otherwise.
     """
-    msg_id = headers.get("svix-id", "")
-    timestamp = headers.get("svix-timestamp", "")
-    signature = headers.get("svix-signature", "")
+    msg_id = headers.get("X-TripWire-ID", "")
+    timestamp = headers.get("X-TripWire-Timestamp", "")
+    signature = headers.get("X-TripWire-Signature", "")
 
     if not msg_id or not timestamp or not signature:
         return False
@@ -185,8 +185,8 @@ def verify_webhook_manual(
     if abs(now - ts) > tolerance_seconds:
         return False
 
-    # Decode the secret (strip "whsec_" prefix, base64-decode)
-    secret_bytes = base64.b64decode(secret.removeprefix("whsec_"))
+    # Decode the secret (hex-encoded)
+    secret_bytes = bytes.fromhex(secret)
 
     # Build the signed content: "{msg_id}.{timestamp}.{payload}"
     to_sign = f"{msg_id}.{timestamp}.{payload}"
@@ -211,11 +211,11 @@ def verify_webhook_manual(
 
 ## Timestamp Tolerance and Replay Protection
 
-The `svix-timestamp` header contains the Unix timestamp (in seconds) when the webhook was sent. You should reject webhooks with timestamps that are too old or too far in the future.
+The `X-TripWire-Timestamp` header contains the Unix timestamp (in seconds) when the webhook was sent. You should reject webhooks with timestamps that are too old or too far in the future.
 
 **Default tolerance**: 5 minutes (300 seconds)
 
-The SDK's `verify_webhook_signature` function handles this automatically via the Svix library. If you verify manually, enforce the tolerance yourself as shown in the manual verification example above.
+The SDK's `verify_webhook_signature` function handles this automatically via the Convoy REST API via httpx. If you verify manually, enforce the tolerance yourself as shown in the manual verification example above.
 
 ### Why Replay Protection Matters
 
@@ -226,7 +226,7 @@ Without timestamp checking, an attacker who captures a valid webhook payload cou
 - Always verify the timestamp is within tolerance before accepting a webhook
 - Use a tolerance no larger than 5 minutes
 - Log and alert on rejected webhooks for monitoring
-- Store processed event IDs (the `svix-id` header) to detect exact duplicates
+- Store processed event IDs (the `X-TripWire-ID` header) to detect exact duplicates
 
 ## Webhook Payload Format
 

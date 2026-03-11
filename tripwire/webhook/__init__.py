@@ -1,37 +1,39 @@
-"""TripWire webhook delivery — provider abstraction + Svix integration."""
+"""TripWire webhook delivery — provider abstraction + Convoy integration."""
 
+from tripwire.webhook.convoy_client import (
+    create_application,
+    create_endpoint,
+    direct_deliver,
+    init_convoy,
+    list_messages,
+    retry_message,
+    send_webhook,
+)
 from tripwire.webhook.dispatcher import (
     dispatch_event,
     match_endpoints,
     match_subscriptions,
 )
 from tripwire.webhook.provider import (
+    ConvoyProvider,
     LogOnlyProvider,
-    SvixProvider,
     WebhookProvider,
     create_webhook_provider,
-)
-from tripwire.webhook.svix_client import (
-    create_application,
-    create_endpoint,
-    init_svix,
-    list_messages,
-    retry_message,
-    send_webhook,
 )
 from tripwire.webhook.verify import verify_webhook
 
 __all__ = [
     # Provider abstraction
     "WebhookProvider",
-    "SvixProvider",
+    "ConvoyProvider",
     "LogOnlyProvider",
     "create_webhook_provider",
-    # Svix client (low-level)
-    "init_svix",
+    # Convoy client (low-level)
+    "init_convoy",
     "create_application",
     "create_endpoint",
     "send_webhook",
+    "direct_deliver",
     "list_messages",
     "retry_message",
     # Dispatcher

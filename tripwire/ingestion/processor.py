@@ -187,7 +187,7 @@ class EventProcessor:
             ep for ep in approved_endpoints if ep.mode == EndpointMode.NOTIFY
         ]
 
-        # 8a. Dispatch webhooks via Svix for Execute-mode endpoints
+        # 8a. Dispatch webhooks via Convoy + direct fast path for Execute-mode endpoints
         t0 = time.perf_counter()
         message_ids: list[str] = []
         if execute_endpoints:
@@ -209,7 +209,7 @@ class EventProcessor:
                 self._record_delivery(
                     endpoint_id=ep.id,
                     event_id=event_id,
-                    svix_message_id=msg_id,
+                    provider_message_id=msg_id,
                 )
 
         # 8b. Push via Supabase Realtime for Notify-mode endpoints
@@ -330,15 +330,15 @@ class EventProcessor:
         return event_id
 
     def _record_delivery(
-        self, endpoint_id: str, event_id: str, svix_message_id: str | None
+        self, endpoint_id: str, event_id: str, provider_message_id: str | None
     ) -> None:
         """Record a webhook delivery attempt via WebhookDeliveryRepository."""
         try:
             self._delivery_repo.create(
                 endpoint_id=endpoint_id,
                 event_id=event_id,
-                svix_message_id=svix_message_id,
-                status="sent" if svix_message_id else "failed",
+                provider_message_id=provider_message_id,
+                status="sent" if provider_message_id else "failed",
             )
         except Exception:
             logger.exception(

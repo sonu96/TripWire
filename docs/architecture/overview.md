@@ -2,7 +2,7 @@
 
 > "Stripe Webhooks for x402" -- the infrastructure layer between onchain micropayments and application execution.
 
-TripWire is an event-driven middleware that watches ERC-3009 `transferWithAuthorization` payments on EVM chains, verifies finality, resolves onchain AI agent identities via ERC-8004, evaluates developer-defined policies, and delivers structured webhook payloads through Svix.
+TripWire is an event-driven middleware that watches ERC-3009 `transferWithAuthorization` payments on EVM chains, verifies finality, resolves onchain AI agent identities via ERC-8004, evaluates developer-defined policies, and delivers structured webhook payloads through Convoy self-hosted.
 
 ---
 
@@ -50,7 +50,7 @@ graph TB
     end
 
     subgraph L3["L3 -- Delivery Layer"]
-        SVIX["Svix"]
+        CONVOY["Convoy self-hosted"]
         RETRY["Exponential Backoff Retries"]
         HMAC["HMAC-SHA256 Signing"]
         DLQ["Dead Letter Queue"]
@@ -72,11 +72,11 @@ graph TB
     FINALITY --> IDENTITY
     IDENTITY --> POLICY
     POLICY --> DISPATCH
-    DISPATCH --> SVIX
-    SVIX --> RETRY
-    SVIX --> HMAC
-    SVIX --> DLQ
-    SVIX --> DEV_EXEC
+    DISPATCH --> CONVOY
+    CONVOY --> RETRY
+    CONVOY --> HMAC
+    CONVOY --> DLQ
+    CONVOY --> DEV_EXEC
     SB_SINK -.->|"Supabase Realtime"| DEV_NOTIFY
 ```
 
@@ -88,7 +88,7 @@ graph TB
 | API Framework | FastAPI + Uvicorn | HTTP API server |
 | Database | Supabase (managed PostgreSQL) | Event storage, endpoint registry, nonce dedup |
 | Blockchain Indexing | Goldsky Mirror/Turbo | Stream raw logs from chains into Supabase |
-| Webhook Delivery | Svix (hosted, free tier 50k msgs/mo) | Retries, HMAC signing, DLQ |
+| Webhook Delivery | Convoy self-hosted | Retries, HMAC signing, DLQ |
 | Blockchain RPC | httpx (raw JSON-RPC) | Finality checks, identity resolution |
 | ABI Decoding | eth-abi | Decode ERC-3009 event data |
 | Validation | Pydantic v2 | Input/output schema validation |
@@ -127,14 +127,14 @@ The core application layer, implemented as a FastAPI service. It performs:
 - **Finality tracking**: Queries the chain's latest block via `eth_blockNumber` JSON-RPC and computes confirmation depth.
 - **Identity resolution**: Resolves the sender's ERC-8004 onchain agent identity (agent class, capabilities, reputation score) from the IdentityRegistry and ReputationRegistry contracts.
 - **Policy evaluation**: Checks the transfer against the endpoint's configured policies (amount bounds, sender lists, agent class, reputation threshold).
-- **Dispatch**: Builds a `WebhookPayload` and sends it to Svix for delivery.
+- **Dispatch**: Builds a `WebhookPayload` and sends it to Convoy for delivery.
 
-### L3 -- Svix Delivery Layer
+### L3 -- Convoy Delivery Layer
 
-Svix is a hosted webhook delivery service. TripWire delegates all delivery concerns to Svix with a single API call per message:
+Convoy self-hosted is a webhook delivery service. TripWire delegates all delivery concerns to Convoy with a single API call per message:
 
 - **Retries**: Exponential backoff (5s, 5m, 30m, 2h, 5h, 10h) -- up to 6 attempts over ~17 hours.
-- **HMAC-SHA256 signing**: Every payload is signed. Developers verify signatures using Svix's standard verification libraries.
+- **HMAC-SHA256 signing**: Every payload is signed. Developers verify signatures using the Convoy REST API via httpx or manual HMAC verification.
 - **Dead Letter Queue (DLQ)**: Failed messages after all retry attempts are preserved for manual inspection and replay.
 - **Delivery logs**: Full audit trail of every attempt, response code, and timing.
 
@@ -142,7 +142,7 @@ Svix is a hosted webhook delivery service. TripWire delegates all delivery conce
 
 Developers receive verified payment events in two modes:
 
-- **Execute mode**: Svix delivers a webhook to the developer's registered URL. The developer's server executes business logic upon receipt.
+- **Execute mode**: Convoy delivers a webhook to the developer's registered URL. The developer's server executes business logic upon receipt.
 - **Notify mode**: The developer subscribes to Supabase Realtime and receives events as database row changes. No webhook server required.
 
 ---
@@ -157,7 +157,7 @@ sequenceDiagram
     participant GS as L1: Goldsky
     participant SB as Supabase
     participant TW as L2: TripWire
-    participant Svix as L3: Svix
+    participant Convoy as L3: Convoy
     participant Dev as L4: Developer App
 
     Chain->>Chain: transferWithAuthorization() called
@@ -192,10 +192,10 @@ sequenceDiagram
         TW->>TW: Log rejection reason, skip delivery
     else Policy allows
         TW->>TW: Build WebhookPayload (transfer + finality + identity)
-        TW->>Svix: MessageIn(event_type, payload)
-        Svix->>Dev: POST webhook with HMAC signature
-        Dev-->>Svix: 2xx OK
-        Svix-->>TW: Message ID
+        TW->>Convoy: MessageIn(event_type, payload)
+        Convoy->>Dev: POST webhook with HMAC signature
+        Dev-->>Convoy: 2xx OK
+        Convoy-->>TW: Message ID
     end
 ```
 
@@ -208,7 +208,7 @@ sequenceDiagram
 5. **Finality check**: TripWire queries `eth_blockNumber` via JSON-RPC and computes confirmations. If below the required depth for the chain, the event is marked `payment.pending`; otherwise `payment.confirmed`.
 6. **Identity enrichment**: The sender's address is resolved against the ERC-8004 IdentityRegistry contract to retrieve agent class, capabilities, deployer, and reputation score.
 7. **Policy evaluation**: The transfer is checked against the endpoint's policies (amount bounds, sender allowlist/blocklist, required agent class, minimum reputation score).
-8. **Svix delivers**: If the policy passes, TripWire builds a `WebhookPayload` and sends it to Svix via `message.create()`. Svix handles HMAC signing, delivery, retries, and DLQ.
+8. **Convoy delivers**: If the policy passes, TripWire builds a `WebhookPayload` and sends it to Convoy via `message.create()`. Convoy handles HMAC signing, delivery, retries, and DLQ.
 9. **Developer receives**: The developer's registered endpoint receives a signed HTTP POST with the full payment payload including transfer data, finality status, and agent identity.
 
 ---
@@ -515,17 +515,17 @@ In development (`APP_ENV=development`), a `MockResolver` is used instead of the 
 
 ## Webhook Delivery
 
-TripWire uses Svix as a fully managed webhook delivery service. The integration is implemented in `tripwire/webhook/svix_client.py` (Svix SDK wrapper) and `tripwire/webhook/dispatcher.py` (orchestration layer).
+TripWire uses Convoy self-hosted as a webhook delivery service. The integration is implemented in `tripwire/webhook/convoy_client.py` (Convoy REST API via httpx wrapper) and `tripwire/webhook/dispatcher.py` (orchestration layer).
 
-### Svix Model
+### Convoy Model
 
 ```mermaid
 graph TD
     subgraph TripWire
         DISPATCH["Dispatcher<br/>Build payload + match endpoints"]
     end
-    subgraph Svix["Svix (Hosted)"]
-        APP["Application<br/>(one per developer)"]
+    subgraph Convoy["Convoy self-hosted"]
+        APP["Project<br/>(one per developer)"]
         EP["Endpoint<br/>(developer's webhook URL)"]
         MSG["Message<br/>(payment event payload)"]
         SIGN["HMAC-SHA256 Signing"]
@@ -546,18 +546,18 @@ graph TD
     EP --> LOG
 ```
 
-### Svix Resource Mapping
+### Convoy Resource Mapping
 
-| Svix Concept | TripWire Mapping |
-|-------------|-----------------|
-| Application | One per registered developer/endpoint |
+| Convoy Concept | TripWire Mapping |
+|---------------|-----------------|
+| Project | One per registered developer/endpoint |
 | Endpoint | Developer's webhook URL |
 | Message | A single `WebhookPayload` (payment event) |
 | Event Type | `payment.confirmed`, `payment.pending`, `payment.failed`, `payment.reorged` |
 
 ### Retry Schedule
 
-Svix retries failed deliveries (non-2xx responses) on an exponential backoff schedule:
+Convoy handles retries for failed deliveries (non-2xx responses) on an exponential backoff schedule:
 
 | Attempt | Delay After Previous |
 |---------|---------------------|
@@ -596,10 +596,10 @@ For Notify mode, subscriptions are matched against transfer data using filters:
 
 | Aspect | Execute Mode | Notify Mode |
 |--------|-------------|-------------|
-| Delivery | Svix webhook POST | Supabase Realtime push |
+| Delivery | Convoy webhook POST | Supabase Realtime push |
 | Server required | Yes (developer hosts a URL) | No (client-side subscription) |
-| Retries | Svix handles (6 attempts) | Supabase Realtime reconnection |
-| Signing | HMAC-SHA256 via Svix | N/A (Supabase auth) |
+| Retries | Convoy handles retries (6 attempts) | Supabase Realtime reconnection |
+| Signing | HMAC-SHA256 via Convoy | N/A (Supabase auth) |
 | Use case | Server-to-server automation | Client-side dashboards, notifications |
 
 ### Webhook Payload Structure
@@ -771,7 +771,7 @@ erDiagram
         text id PK
         text endpoint_id FK
         text event_id FK
-        text svix_message_id
+        text convoy_message_id
         text status "pending | delivered | failed"
         timestamptz created_at
     }
@@ -805,7 +805,7 @@ Combined ERC-3009 event data: Transfer fields (`from_address`, `to_address`, `am
 Deduplication table. The `UNIQUE (chain_id, nonce, authorizer)` constraint enforces that each ERC-3009 authorization nonce can only be processed once per chain and authorizer. INSERT failures on this constraint indicate duplicate events.
 
 #### `webhook_deliveries`
-Tracks the relationship between events and endpoint deliveries. Stores the Svix message ID for cross-referencing delivery status with Svix's delivery logs. Cascades on both endpoint and event deletion.
+Tracks the relationship between events and endpoint deliveries. Stores the Convoy message ID for cross-referencing delivery status with Convoy's delivery logs. Cascades on both endpoint and event deletion.
 
 #### `audit_log`
 Immutable append-only log of system actions. Records the action type, affected entity, and metadata JSONB for forensic analysis. Primary key is auto-generated via `gen_random_uuid()`.
@@ -830,24 +830,24 @@ Immutable append-only log of system actions. Records the action type, affected e
 
 ### HMAC-SHA256 Webhook Signing
 
-Every webhook payload delivered by Svix is signed with HMAC-SHA256. The signing process is handled entirely by Svix:
+Every webhook payload delivered by Convoy is signed with HMAC-SHA256. The signing process is handled entirely by Convoy:
 
 ```mermaid
 sequenceDiagram
     participant TW as TripWire
-    participant Svix
+    participant Convoy
     participant Dev as Developer App
 
-    TW->>Svix: message.create(payload)
-    Svix->>Svix: Sign payload with endpoint secret<br/>(HMAC-SHA256)
-    Svix->>Dev: POST /webhook<br/>Headers: svix-id, svix-timestamp, svix-signature
-    Dev->>Dev: Verify signature using Svix SDK<br/>or manual HMAC-SHA256 check
-    Dev-->>Svix: 200 OK
+    TW->>Convoy: message.create(payload)
+    Convoy->>Convoy: Sign payload with endpoint secret<br/>(HMAC-SHA256)
+    Convoy->>Dev: POST /webhook<br/>Headers: X-TripWire-ID, X-TripWire-Timestamp, X-TripWire-Signature
+    Dev->>Dev: Verify signature using Convoy REST API via httpx<br/>or manual HMAC-SHA256 check
+    Dev-->>Convoy: 200 OK
 ```
 
-Each Svix endpoint gets a unique signing secret. Developers verify incoming webhooks by:
-1. Extracting `svix-id`, `svix-timestamp`, and `svix-signature` headers
-2. Computing `HMAC-SHA256(secret, "{svix-id}.{svix-timestamp}.{body}")` and comparing against the signature
+Each Convoy endpoint gets a unique signing secret. Developers verify incoming webhooks by:
+1. Extracting `X-TripWire-ID`, `X-TripWire-Timestamp`, and `X-TripWire-Signature` headers
+2. Computing `HMAC-SHA256(secret, "{X-TripWire-ID}.{X-TripWire-Timestamp}.{body}")` and comparing against the signature
 3. Rejecting requests where the timestamp is older than a tolerance window (replay protection)
 
 ### Nonce Replay Protection
@@ -888,8 +888,8 @@ TripWire uses the `supabase_service_role_key` (not the anon key) for database op
 
 | Layer | Mechanism | Protects Against |
 |-------|-----------|-----------------|
-| Webhook signing | HMAC-SHA256 via Svix | Payload tampering, webhook spoofing |
-| Timestamp validation | Svix signature includes timestamp | Replay attacks on webhook delivery |
+| Webhook signing | HMAC-SHA256 via Convoy | Payload tampering, webhook spoofing |
+| Timestamp validation | Convoy signature includes timestamp | Replay attacks on webhook delivery |
 | Nonce deduplication | PostgreSQL unique constraint | Double-processing, replay of onchain events |
 | API key hashing | Stored hash, not plaintext | Credential theft from database breach |
 | Contract validation | Address check against known USDC contracts | Spoofed events from malicious contracts |

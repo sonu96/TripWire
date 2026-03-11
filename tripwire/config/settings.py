@@ -14,8 +14,10 @@ class Settings(BaseSettings):
     supabase_anon_key: str
     supabase_service_role_key: str
 
-    # Svix (Webhook Delivery)
-    svix_api_key: str = ""
+    # Convoy (Webhook Delivery)
+    convoy_api_key: str = ""
+    convoy_url: str = "http://localhost:5005"
+    webhook_signing_secret: str = ""  # Default HMAC secret, can be overridden per endpoint
 
     # Goldsky
     goldsky_api_key: str = ""

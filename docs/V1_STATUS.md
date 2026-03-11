@@ -4,7 +4,7 @@
 
 ## v1 Summary
 
-TripWire v1 is the complete x402 execution middleware — the infrastructure layer between onchain ERC-3009 micropayments and application execution. Two delivery modes: **Execute** (Svix webhook delivery) and **Notify** (Supabase Realtime push).
+TripWire v1 is the complete x402 execution middleware — the infrastructure layer between onchain ERC-3009 micropayments and application execution. Two delivery modes: **Execute** (Convoy webhook delivery) and **Notify** (Supabase Realtime push).
 
 **67 tests passing** | **29 source modules** | **7 DB migrations** | **Python SDK**
 
@@ -21,9 +21,9 @@ TripWire v1 is the complete x402 execution middleware — the infrastructure lay
 - [x] **Endpoint matching** — Routes events to endpoints by recipient address + chain ID.
 
 ### Delivery
-- [x] **Execute mode (Svix)** — Webhook delivery with retries, HMAC signing, DLQ. Svix app + endpoint created on registration.
+- [x] **Execute mode (Convoy)** — Webhook delivery with retries, HMAC signing, DLQ. Convoy project + endpoint created on registration.
 - [x] **Notify mode (Supabase Realtime)** — Events inserted into `realtime_events` table, pushed to subscribed clients via WebSocket.
-- [x] **WebhookProvider abstraction** — Protocol/Strategy pattern decouples delivery from Svix. `SvixProvider` for production, `LogOnlyProvider` for development. Swap providers by implementing the protocol.
+- [x] **WebhookProvider abstraction** — Protocol/Strategy pattern decouples delivery from Convoy. `ConvoyProvider` for production, `LogOnlyProvider` for development. Swap providers by implementing the protocol.
 - [x] **Subscription filtering** — Notify-mode subscriptions with filters: chains, senders, recipients, min_amount, agent_class.
 
 ### API
@@ -82,15 +82,15 @@ TripWire v1 is the complete x402 execution middleware — the infrastructure lay
 ### Pre-Launch (before first user)
 - [ ] **Run migrations on Supabase** — Execute 001-007 against production database
 - [ ] **Configure Goldsky pipeline** — Deploy the Mirror/Turbo pipeline config to stream USDC events into Supabase
-- [ ] **Set production env vars** — SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SVIX_API_KEY, GOLDSKY_WEBHOOK_SECRET, RPC URLs
+- [ ] **Set production env vars** — SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, CONVOY_API_KEY, GOLDSKY_WEBHOOK_SECRET, RPC URLs
 - [ ] **Deploy to Railway** — Push Docker image, configure health check (`/ready`), set env vars
-- [ ] **Verify Svix webhook delivery** — End-to-end test with a real endpoint receiving webhooks
+- [ ] **Verify Convoy webhook delivery** — End-to-end test with a real endpoint receiving webhooks
 - [ ] **CORS lockdown** — Replace `allow_origins=["*"]` with actual allowed domains
 
 ### Post-Launch (iterative)
 - [ ] **CI/CD pipeline** — GitHub Actions for: test on push, Docker build, deploy to Railway
 - [ ] **TypeScript/JavaScript SDK** — For frontend and Node.js consumers
-- [ ] **Webhook retry dashboard** — Svix portal integration for endpoint owners to see delivery history
+- [ ] **Webhook retry dashboard** — Convoy portal integration for endpoint owners to see delivery history
 - [ ] **Multi-chain expansion** — Add Polygon, Optimism, Avalanche USDC contracts
 - [ ] **Batch processing optimization** — Parallel event processing within a batch (currently sequential)
 - [ ] **OpenAPI schema export** — Auto-generate and publish API spec from FastAPI
@@ -115,7 +115,7 @@ L2  Middleware       TripWire FastAPI
                      └── Route (endpoint matching)
                             |
                     ┌───────┴───────┐
-L3  Delivery    Svix (Execute)   Supabase Realtime (Notify)
+L3  Delivery    Convoy (Execute)   Supabase Realtime (Notify)
                     |                       |
 L4  Application  Developer API      Client WebSocket
 ```
@@ -159,7 +159,7 @@ tripwire/
 └── webhook/
     ├── dispatcher.py          # Webhook dispatch orchestrator
     ├── provider.py            # WebhookProvider Protocol + implementations
-    ├── svix_client.py         # Svix SDK wrapper
+    ├── convoy_client.py       # Convoy REST API via httpx wrapper
     └── verify.py              # HMAC verification
 
 sdk/tripwire_sdk/
@@ -190,7 +190,7 @@ tests/                         # 67 tests
 | Runtime | Python 3.11+ | Core language |
 | API | FastAPI + Uvicorn | HTTP framework |
 | Database | Supabase (PostgreSQL) | Managed DB + Auth + Realtime |
-| Webhooks | Svix | Delivery, retries, HMAC, DLQ |
+| Webhooks | Convoy self-hosted | Delivery, retries, HMAC, DLQ |
 | Indexing | Goldsky Mirror/Turbo | Blockchain → Supabase streaming |
 | RPC | httpx | Raw JSON-RPC to chains |
 | ABI | eth-abi | ERC-3009 event decoding |

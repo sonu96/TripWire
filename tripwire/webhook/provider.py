@@ -1,4 +1,4 @@
-"""Webhook provider abstraction — decouples TripWire from Svix."""
+"""Webhook provider abstraction — decouples TripWire from Convoy."""
 
 from __future__ import annotations
 
@@ -16,46 +16,84 @@ logger = structlog.get_logger(__name__)
 class WebhookProvider(Protocol):
     """Interface for webhook delivery backends.
 
-    Implementations must provide methods for managing applications,
-    endpoints, and sending webhooks. Currently backed by Svix;
+    Implementations must provide methods for managing projects,
+    endpoints, and sending webhooks. Currently backed by Convoy;
     swap by implementing this protocol and updating the factory.
     """
 
     async def send(self, app_id: str, event_type: str, payload: dict) -> str:
-        """Send a webhook message. Returns a provider-specific message ID."""
+        """Send a webhook message via the managed Convoy project. Returns a provider-specific message ID."""
         ...
 
     async def create_app(self, developer_id: str, name: str) -> str:
-        """Create a webhook application. Returns the provider app ID."""
+        """Create a webhook project. Returns the provider project ID."""
         ...
 
-    async def create_endpoint(self, app_id: str, url: str, description: str | None = None) -> str:
+    async def create_endpoint(self, app_id: str, url: str, description: str | None = None, secret: str | None = None) -> str:
         """Register a webhook endpoint URL. Returns the provider endpoint ID."""
         ...
 
+    async def direct_deliver(self, url: str, payload: dict, secret: str) -> bool:
+        """Directly deliver a webhook payload to a URL via the fast httpx path.
 
-class SvixProvider:
-    """WebhookProvider backed by Svix."""
+        Signs the payload with the given secret and POSTs directly to the URL,
+        bypassing the managed Convoy queue. Returns True on success.
+        """
+        ...
 
-    def __init__(self, api_key: str) -> None:
-        from tripwire.webhook.svix_client import init_svix
 
-        self._client = init_svix(api_key)
+class ConvoyProvider:
+    """WebhookProvider backed by Convoy self-hosted."""
+
+    def __init__(self, api_key: str, convoy_url: str) -> None:
+        from tripwire.webhook.convoy_client import init_convoy
+
+        init_convoy(api_key, convoy_url)
+        self._api_key = api_key
+        self._convoy_url = convoy_url
 
     async def send(self, app_id: str, event_type: str, payload: dict) -> str:
-        from tripwire.webhook.svix_client import send_webhook
+        """Send a webhook event to all endpoints registered under the given Convoy project.
 
-        return await send_webhook(app_id=app_id, event_type=event_type, payload=payload)
+        ``app_id`` is treated as ``project_id`` in Convoy terminology.
+        ``endpoint_id`` is derived from the project; pass via payload meta when needed.
+        Returns the Convoy event ID.
+        """
+        from tripwire.webhook.convoy_client import send_webhook
+
+        # app_id carries the convoy project_id; endpoint_id is embedded as metadata
+        # when the caller also has an endpoint_id it passes it via the payload dict
+        # under the reserved key "__convoy_endpoint_id__" which we pop here.
+        endpoint_id: str = payload.pop("__convoy_endpoint_id__", "")
+        return await send_webhook(
+            app_id=app_id,
+            event_type=event_type,
+            payload=payload,
+            endpoint_id=endpoint_id,
+        )
 
     async def create_app(self, developer_id: str, name: str) -> str:
-        from tripwire.webhook.svix_client import create_application
+        """Create a Convoy project for the given developer. Returns the project ID."""
+        from tripwire.webhook.convoy_client import create_application
 
         return await create_application(developer_id=developer_id, name=name)
 
-    async def create_endpoint(self, app_id: str, url: str, description: str | None = None) -> str:
-        from tripwire.webhook.svix_client import create_endpoint
+    async def create_endpoint(self, app_id: str, url: str, description: str | None = None, secret: str | None = None) -> str:
+        """Register a webhook endpoint in the given Convoy project. Returns the endpoint ID."""
+        from tripwire.webhook.convoy_client import create_endpoint as _create_endpoint
 
-        return await create_endpoint(app_id=app_id, url=url, description=description)
+        return await _create_endpoint(
+            app_id=app_id,
+            url=url,
+            description=description or "",
+            secret=secret or "",
+        )
+
+    async def direct_deliver(self, url: str, payload: dict, secret: str) -> bool:
+        """Directly deliver payload to ``url`` via the httpx fast path in convoy_client."""
+        from tripwire.webhook.convoy_client import direct_deliver as _direct_deliver
+
+        return await _direct_deliver(url=url, payload=payload, secret=secret)
 
 
 class LogOnlyProvider:
@@ -76,17 +114,34 @@ class LogOnlyProvider:
         logger.info("log_only_app_created", developer_id=developer_id, app_id=app_id)
         return app_id
 
-    async def create_endpoint(self, app_id: str, url: str, description: str | None = None) -> str:
+    async def create_endpoint(self, app_id: str, url: str, description: str | None = None, secret: str | None = None) -> str:
         endpoint_id = f"log-ep-{uuid.uuid4()}"
-        logger.info("log_only_endpoint_created", app_id=app_id, endpoint_id=endpoint_id)
+        logger.info(
+            "log_only_endpoint_created",
+            app_id=app_id,
+            url=url,
+            endpoint_id=endpoint_id,
+        )
         return endpoint_id
+
+    async def direct_deliver(self, url: str, payload: dict, secret: str) -> bool:
+        logger.info(
+            "log_only_direct_deliver",
+            url=url,
+            payload_keys=list(payload.keys()),
+            has_secret=bool(secret),
+        )
+        return True
 
 
 def create_webhook_provider(settings: Settings) -> WebhookProvider:
     """Factory: build the appropriate WebhookProvider for the current environment."""
-    if settings.svix_api_key:
-        logger.info("using_svix_webhook_provider")
-        return SvixProvider(api_key=settings.svix_api_key)
+    if settings.convoy_api_key:
+        logger.info("using_convoy_webhook_provider", convoy_url=settings.convoy_url)
+        return ConvoyProvider(api_key=settings.convoy_api_key, convoy_url=settings.convoy_url)
 
-    logger.warning("using_log_only_webhook_provider", msg="No SVIX_API_KEY — webhooks will not be delivered")
+    logger.warning(
+        "using_log_only_webhook_provider",
+        msg="No CONVOY_API_KEY — webhooks will not be delivered",
+    )
     return LogOnlyProvider()

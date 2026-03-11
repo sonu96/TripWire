@@ -1,6 +1,6 @@
 """TripWire application entry point.
 
-Initialises logging, Supabase, Svix, identity resolver, nonce repository,
+Initialises logging, Supabase, Convoy, identity resolver, nonce repository,
 and the event processor, then wires the full ingestion → policy → dispatch
 pipeline together.
 """
@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.supabase = supabase
     logger.info("supabase_ready")
 
-    # Webhook provider (Svix in production, LogOnly in dev without key)
+    # Webhook provider (Convoy in production, LogOnly in dev without key)
     webhook_provider = create_webhook_provider(settings)
     app.state.webhook_provider = webhook_provider
     logger.info("webhook_provider_ready")
@@ -197,9 +197,9 @@ def create_app() -> FastAPI:
         # Check webhook provider availability
         try:
             wp = request.app.state.webhook_provider
-            # LogOnlyProvider is always healthy; SvixProvider has a _client attr
-            if hasattr(wp, "_client"):
-                components["webhook_provider"] = {"status": "healthy", "type": "svix"}
+            # LogOnlyProvider is always healthy; ConvoyProvider has _api_key attr
+            if hasattr(wp, "_api_key"):
+                components["webhook_provider"] = {"status": "healthy", "type": "convoy"}
             else:
                 components["webhook_provider"] = {"status": "healthy", "type": "log_only"}
         except Exception as exc:

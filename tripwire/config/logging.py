@@ -73,5 +73,5 @@ def setup_logging(log_level: str = "info", app_env: str = "development") -> None
     root.setLevel(level)
 
     # Quiet noisy third-party loggers
-    for name in ("httpx", "httpcore", "hpack", "supabase", "svix"):
+    for name in ("httpx", "httpcore", "hpack", "supabase"):
         logging.getLogger(name).setLevel(max(level, logging.WARNING))

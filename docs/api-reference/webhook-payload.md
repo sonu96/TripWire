@@ -1,6 +1,6 @@
 # Webhook Payload Reference
 
-When a payment event is detected and passes policy evaluation, TripWire delivers a webhook to your registered endpoint URL. Webhooks are delivered via [Svix](https://www.svix.com/) which handles HMAC signing, retries, and delivery tracking.
+When a payment event is detected and passes policy evaluation, TripWire delivers a webhook to your registered endpoint URL. Webhooks are delivered via [Convoy self-hosted](https://getconvoy.io/) which handles HMAC signing, retries, and delivery tracking.
 
 ---
 
@@ -126,29 +126,29 @@ Every webhook delivery includes these HTTP headers:
 | `Content-Type`        | `application/json`                                               |
 | `Tripwire-Event-Id`   | Unique event ID (matches the `id` field in the payload)          |
 | `Tripwire-Timestamp`  | Unix timestamp of the delivery attempt                           |
-| `Tripwire-Signature`  | HMAC signature for verifying authenticity (Svix format)          |
-| `svix-id`             | Svix message ID                                                  |
-| `svix-timestamp`      | Svix delivery timestamp                                          |
-| `svix-signature`      | Svix HMAC-SHA256 signature (used for verification)               |
+| `Tripwire-Signature`  | HMAC signature for verifying authenticity (Convoy format)        |
+| `X-TripWire-ID`       | Convoy message ID                                                |
+| `X-TripWire-Timestamp` | Convoy delivery timestamp                                       |
+| `X-TripWire-Signature` | Convoy HMAC-SHA256 signature (used for verification)            |
 
 ---
 
 ## Signature Verification
 
-TripWire uses Svix for webhook delivery, which signs every payload with HMAC-SHA256. You should always verify webhook signatures to ensure payloads are authentic and have not been tampered with.
+TripWire uses Convoy self-hosted for webhook delivery, which signs every payload with HMAC-SHA256. You should always verify webhook signatures to ensure payloads are authentic and have not been tampered with.
 
 ### Signature Format
 
-Svix uses a signing secret prefixed with `whsec_` that is assigned to each endpoint. The signature is computed as:
+Convoy uses a hex signing secret that is assigned to each endpoint. The signature is computed as:
 
 ```
 HMAC-SHA256(
-  key = base64_decode(whsec_secret),
-  message = "{svix-id}.{svix-timestamp}.{body}"
+  key = hex_decode(secret),
+  message = "{X-TripWire-ID}.{X-TripWire-Timestamp}.{body}"
 )
 ```
 
-The `svix-signature` header contains one or more signatures in the format:
+The `X-TripWire-Signature` header contains one or more signatures in the format:
 
 ```
 v1,{base64_encoded_signature}
@@ -156,9 +156,9 @@ v1,{base64_encoded_signature}
 
 Multiple signatures may be present (comma-separated) during key rotation.
 
-### Verification with the Svix Library (Recommended)
+### Verification with the Convoy REST API via httpx (Recommended)
 
-The simplest way to verify webhooks is using the official Svix library, which TripWire wraps for convenience.
+The simplest way to verify webhooks is using the Convoy REST API via httpx, which TripWire wraps for convenience.
 
 **Using `tripwire-sdk`**
 
@@ -169,27 +169,41 @@ from tripwire_sdk.verify import verify_webhook
 is_valid = verify_webhook(
     payload=request.body,       # raw request body (str or bytes)
     headers=dict(request.headers),
-    secret="whsec_your_endpoint_secret",
+    secret="your_hex_endpoint_secret",
 )
 
 if not is_valid:
     return Response(status_code=401)
 ```
 
-**Using `svix` directly**
+**Using Convoy REST API via httpx directly**
 
 ```python
-from svix.webhooks import Webhook, WebhookVerificationError
+import hashlib
+import hmac
 
 def handle_webhook(request):
     payload = request.body
     headers = dict(request.headers)
-    secret = "whsec_your_endpoint_secret"
+    secret = "your_hex_endpoint_secret"
 
-    try:
-        wh = Webhook(secret)
-        wh.verify(payload, headers)
-    except WebhookVerificationError:
+    msg_id = headers.get("X-TripWire-ID", "")
+    timestamp = headers.get("X-TripWire-Timestamp", "")
+    signature = headers.get("X-TripWire-Signature", "")
+
+    signed_content = f"{msg_id}.{timestamp}.{payload}"
+    expected = hmac.new(
+        bytes.fromhex(secret),
+        signed_content.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    import base64
+    expected_b64 = base64.b64encode(expected).decode("utf-8")
+
+    if not any(
+        hmac.compare_digest(expected_b64, sig.removeprefix("v1,"))
+        for sig in signature.split(" ")
+    ):
         return Response(status_code=401)
 
     # Signature is valid -- process the event
@@ -199,7 +213,7 @@ def handle_webhook(request):
 
 ### Manual Verification (Without Library)
 
-If you cannot use the Svix library, you can verify manually:
+If you cannot use the Convoy REST API via httpx, you can verify manually:
 
 ```python
 import base64
@@ -213,28 +227,28 @@ def verify_webhook_manual(payload: str, headers: dict, secret: str) -> bool:
     Args:
         payload: Raw request body as string.
         headers: Request headers dict.
-        secret: Endpoint signing secret (whsec_...).
+        secret: Endpoint signing secret (hex string).
     """
-    svix_id = headers.get("svix-id")
-    svix_timestamp = headers.get("svix-timestamp")
-    svix_signature = headers.get("svix-signature")
+    msg_id = headers.get("X-TripWire-ID")
+    timestamp = headers.get("X-TripWire-Timestamp")
+    signature = headers.get("X-TripWire-Signature")
 
-    if not all([svix_id, svix_timestamp, svix_signature]):
+    if not all([msg_id, timestamp, signature]):
         return False
 
     # Reject timestamps older than 5 minutes to prevent replay attacks
     try:
-        ts = int(svix_timestamp)
+        ts = int(timestamp)
         if abs(time.time() - ts) > 300:
             return False
     except ValueError:
         return False
 
-    # Decode the signing secret (strip "whsec_" prefix)
-    secret_bytes = base64.b64decode(secret.removeprefix("whsec_"))
+    # Decode the signing secret (hex-encoded)
+    secret_bytes = bytes.fromhex(secret)
 
     # Construct the signed content
-    signed_content = f"{svix_id}.{svix_timestamp}.{payload}"
+    signed_content = f"{msg_id}.{timestamp}.{payload}"
 
     # Compute HMAC-SHA256
     expected = hmac.new(
@@ -245,7 +259,7 @@ def verify_webhook_manual(payload: str, headers: dict, secret: str) -> bool:
     expected_b64 = base64.b64encode(expected).decode("utf-8")
 
     # Compare against each signature in the header (supports key rotation)
-    for sig in svix_signature.split(" "):
+    for sig in signature.split(" "):
         sig_value = sig.removeprefix("v1,")
         if hmac.compare_digest(expected_b64, sig_value):
             return True
@@ -259,21 +273,24 @@ def verify_webhook_manual(payload: str, headers: dict, secret: str) -> bool:
 
 ```python
 from fastapi import FastAPI, Request, HTTPException
-from svix.webhooks import Webhook, WebhookVerificationError
-import json
+import hashlib, hmac, base64, time, json
 
 app = FastAPI()
-WEBHOOK_SECRET = "whsec_your_endpoint_secret"
+WEBHOOK_SECRET = "your_hex_endpoint_secret"
 
 @app.post("/webhooks/tripwire")
 async def handle_tripwire_webhook(request: Request):
     payload = await request.body()
     headers = dict(request.headers)
 
-    try:
-        wh = Webhook(WEBHOOK_SECRET)
-        wh.verify(payload, headers)
-    except WebhookVerificationError:
+    msg_id = headers.get("x-tripwire-id", "")
+    timestamp = headers.get("x-tripwire-timestamp", "")
+    signature = headers.get("x-tripwire-signature", "")
+    signed = f"{msg_id}.{timestamp}.{payload.decode()}"
+    expected = base64.b64encode(
+        hmac.new(bytes.fromhex(WEBHOOK_SECRET), signed.encode(), hashlib.sha256).digest()
+    ).decode()
+    if not any(hmac.compare_digest(expected, s.removeprefix("v1,")) for s in signature.split(" ")):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     event = json.loads(payload)
@@ -297,21 +314,24 @@ async def handle_tripwire_webhook(request: Request):
 
 ```python
 from flask import Flask, request, jsonify
-from svix.webhooks import Webhook, WebhookVerificationError
-import json
+import hashlib, hmac, base64, json
 
 app = Flask(__name__)
-WEBHOOK_SECRET = "whsec_your_endpoint_secret"
+WEBHOOK_SECRET = "your_hex_endpoint_secret"
 
 @app.route("/webhooks/tripwire", methods=["POST"])
 def handle_tripwire_webhook():
     payload = request.get_data(as_text=True)
     headers = dict(request.headers)
 
-    try:
-        wh = Webhook(WEBHOOK_SECRET)
-        wh.verify(payload, headers)
-    except WebhookVerificationError:
+    msg_id = headers.get("X-TripWire-ID", "")
+    timestamp = headers.get("X-TripWire-Timestamp", "")
+    signature = headers.get("X-TripWire-Signature", "")
+    signed = f"{msg_id}.{timestamp}.{payload}"
+    expected = base64.b64encode(
+        hmac.new(bytes.fromhex(WEBHOOK_SECRET), signed.encode(), hashlib.sha256).digest()
+    ).decode()
+    if not any(hmac.compare_digest(expected, s.removeprefix("v1,")) for s in signature.split(" ")):
         return jsonify({"error": "Invalid signature"}), 401
 
     event = json.loads(payload)
@@ -327,7 +347,7 @@ def handle_tripwire_webhook():
 
 ## Retry Schedule
 
-When your endpoint returns a non-2xx status code (or is unreachable), Svix automatically retries delivery with exponential backoff. You do not need to configure retries -- they happen automatically.
+When your endpoint returns a non-2xx status code (or is unreachable), Convoy automatically retries delivery with exponential backoff. You do not need to configure retries -- they happen automatically.
 
 | Attempt | Delay After Previous |
 |---------|---------------------|
@@ -340,13 +360,13 @@ When your endpoint returns a non-2xx status code (or is unreachable), Svix autom
 | 7       | 10 hours            |
 | 8       | 10 hours            |
 
-After 8 failed attempts, the message is sent to the dead letter queue (DLQ). Failed messages can be manually retried via the Svix dashboard or API.
+After 8 failed attempts, the message is sent to the dead letter queue (DLQ). Failed messages can be manually retried via the Convoy dashboard or API.
 
 ### Best Practices for Webhook Handlers
 
-- **Return 200 quickly.** Process the webhook asynchronously if your handler takes more than a few seconds. Svix will retry if your endpoint times out.
+- **Return 200 quickly.** Process the webhook asynchronously if your handler takes more than a few seconds. Convoy handles retries if your endpoint times out.
 - **Handle duplicates.** Use the event `id` field for idempotency. The same event may be delivered more than once due to retries.
-- **Verify signatures.** Always verify the `svix-signature` header before processing. Never trust unverified payloads.
+- **Verify signatures.** Always verify the `X-TripWire-Signature` header before processing. Never trust unverified payloads.
 - **Handle `payment.reorged`.** If you fulfill orders on `payment.confirmed`, you must reverse them on `payment.reorged`. Chain reorganizations are rare but do happen.
 - **Log the event ID.** Store the `id` from each webhook for debugging and support requests.
 

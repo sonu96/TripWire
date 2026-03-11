@@ -9,6 +9,8 @@ services:
       - .env
     environment:
       APP_ENV: development
+      CONVOY_API_KEY: ${CONVOY_API_KEY:-convoy-api-key}
+      CONVOY_URL: ${CONVOY_URL:-http://convoy-server:5005}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3402/health')"]
       interval: 30s
@@ -16,3 +18,57 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
+    depends_on:
+      convoy-server:
+        condition: service_started
+
+  convoy-server:
+    image: getconvoy/convoy:v24.12.1
+    command: server
+    ports:
+      - "5005:5005"
+    environment:
+      CONVOY_DB_DSN: postgres://convoy:convoy@convoy-postgres:5432/convoy?sslmode=disable
+      CONVOY_REDIS_DSN: redis://convoy-redis:6379
+      CONVOY_HOST: 0.0.0.0
+      CONVOY_PORT: 5005
+    depends_on:
+      convoy-postgres:
+        condition: service_started
+      convoy-redis:
+        condition: service_started
+    restart: unless-stopped
+
+  convoy-worker:
+    image: getconvoy/convoy:v24.12.1
+    command: worker
+    environment:
+      CONVOY_DB_DSN: postgres://convoy:convoy@convoy-postgres:5432/convoy?sslmode=disable
+      CONVOY_REDIS_DSN: redis://convoy-redis:6379
+      CONVOY_HOST: convoy-server
+      CONVOY_PORT: 5005
+    depends_on:
+      convoy-server:
+        condition: service_started
+    restart: unless-stopped
+
+  convoy-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: convoy
+      POSTGRES_PASSWORD: convoy
+      POSTGRES_DB: convoy
+    ports:
+      - "5433:5432"
+    volumes:
+      - convoy_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  convoy-redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    restart: unless-stopped
+
+volumes:
+  convoy_pgdata:

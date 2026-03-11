@@ -6,7 +6,7 @@ This guide walks you through setting up TripWire from scratch, registering your 
 
 - **Python 3.11+** -- check with `python --version`
 - **Supabase account** -- free tier at [supabase.com](https://supabase.com)
-- **Svix account** -- free tier (50k messages/month) at [svix.com](https://svix.com)
+- **Convoy self-hosted** -- open source webhook delivery at [getconvoy.io](https://getconvoy.io)
 - **Git** -- to clone the repository
 
 ## 1. Clone and Install
@@ -117,7 +117,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id              TEXT PRIMARY KEY,
     endpoint_id     TEXT NOT NULL REFERENCES endpoints (id) ON DELETE CASCADE,
     event_id        TEXT NOT NULL REFERENCES events (id) ON DELETE CASCADE,
-    svix_message_id TEXT,
+    convoy_message_id TEXT,
     status          TEXT NOT NULL DEFAULT 'pending',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -163,9 +163,9 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=eyJ...your_anon_key
 SUPABASE_SERVICE_ROLE_KEY=eyJ...your_service_role_key
 
-# Svix (from svix.com dashboard)
-SVIX_API_KEY=sk_your_svix_api_key
-SVIX_SIGNING_SECRET=whsec_your_signing_secret
+# Convoy (from your self-hosted Convoy instance)
+CONVOY_API_KEY=your_convoy_api_key
+CONVOY_SIGNING_SECRET=your_hex_signing_secret
 
 # Goldsky (optional -- needed for production indexing)
 GOLDSKY_API_KEY=
@@ -177,7 +177,7 @@ ETHEREUM_RPC_URL=https://eth.llamarpc.com
 ARBITRUM_RPC_URL=https://arb1.arbitrum.io/rpc
 ```
 
-At minimum, you need `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, and `SVIX_API_KEY`.
+At minimum, you need `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, and `CONVOY_API_KEY`.
 
 ## 5. Start the Server
 
@@ -190,7 +190,7 @@ You should see output like:
 ```
 INFO     tripwire_starting env=development port=3402
 INFO     supabase_ready
-INFO     svix_ready
+INFO     convoy_ready
 INFO     Uvicorn running on http://0.0.0.0:3402 (Press CTRL+C to quit)
 ```
 
@@ -289,7 +289,7 @@ When a real x402 payment is made to your recipient address on a configured chain
 2. Verify finality by checking block confirmations
 3. Resolve identity via ERC-8004 (if available)
 4. Evaluate your endpoint policies
-5. Deliver the webhook via Svix (with retries and HMAC signing)
+5. Deliver the webhook via Convoy (with retries and HMAC signing)
 
 ## 9. Verify It Works
 

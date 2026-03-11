@@ -24,8 +24,8 @@ Think of it as **Stripe Webhooks for crypto-native micropayments**: you register
 
 ## ✨ Key Features
 
-- **Two Delivery Modes** -- *Notify* (Supabase Realtime push for lightweight listeners) and *Execute* (Svix webhook delivery with retries, HMAC signing, and dead-letter queue)
-- **Svix-Powered Webhooks** -- One API call gives you exponential-backoff retries, HMAC signature verification, delivery logs, and a DLQ -- zero infrastructure to manage
+- **Two Delivery Modes** -- *Notify* (Supabase Realtime push for lightweight listeners) and *Execute* (Convoy + direct httpx fast path with retries, HMAC signing, and dead-letter queue)
+- **Self-Hosted Webhook Delivery (Convoy + direct POST)** -- One API call gives you exponential-backoff retries, HMAC signature verification, delivery logs, and a DLQ -- fully self-hosted, no vendor lock-in
 - **ERC-8004 Agent Identity** -- Resolve onchain AI agent identities (agent class, deployer, capabilities, reputation score) and enrich every webhook payload
 - **Goldsky Indexing** -- Goldsky Mirror/Turbo streams ERC-3009 events directly into Supabase in real time -- no subgraph, no polling
 - **Policy Engine** -- Filter payments by min/max amount, sender allowlists/blocklists, required agent class, minimum reputation score, and custom finality depth
@@ -55,7 +55,7 @@ flowchart LR
     end
 
     subgraph L3["L3 -- Delivery"]
-        D[Svix]
+        D[Convoy + Direct POST]
         D1[Retries + HMAC + DLQ]
         D --> D1
     end
@@ -70,7 +70,7 @@ flowchart LR
     D1 -- "Signed POST" --> E
 ```
 
-**The flow**: An ERC-3009 `transferWithAuthorization` settles onchain (L0). Goldsky indexes it in real time and pipes the event into Supabase (L1). TripWire picks it up, verifies the transfer, deduplicates by nonce, resolves the payer's ERC-8004 identity, and evaluates policies (L2). If the payment passes, TripWire dispatches a signed webhook via Svix (L3), which handles retries and HMAC signing. The developer's application receives a `payment.confirmed` POST and executes business logic (L4).
+**The flow**: An ERC-3009 `transferWithAuthorization` settles onchain (L0). Goldsky indexes it in real time and pipes the event into Supabase (L1). TripWire picks it up, verifies the transfer, deduplicates by nonce, resolves the payer's ERC-8004 identity, and evaluates policies (L2). If the payment passes, TripWire dispatches a signed webhook via Convoy self-hosted (L3), which handles retries and HMAC signing. The developer's application receives a `payment.confirmed` POST and executes business logic (L4).
 
 ---
 
@@ -80,7 +80,7 @@ flowchart LR
 
 - Python 3.11+
 - A [Supabase](https://supabase.com) project (free tier works)
-- A [Svix](https://svix.com) account (free tier: 50k messages/month)
+- Docker (for Convoy self-hosted webhook delivery)
 - (Optional) A [Goldsky](https://goldsky.com) account for live chain indexing
 
 ### 1. Clone the repository
@@ -100,7 +100,7 @@ pip install -e ".[dev]"
 
 ```bash
 cp .env.example .env
-# Edit .env with your Supabase, Svix, and RPC credentials
+# Edit .env with your Supabase, Convoy, and RPC credentials
 ```
 
 ### 4. Run database migrations
@@ -197,11 +197,11 @@ def handle_webhook(request):
     is_valid = verify_webhook_signature(
         payload=request.body,
         headers={
-            "svix-id": request.headers["svix-id"],
-            "svix-timestamp": request.headers["svix-timestamp"],
-            "svix-signature": request.headers["svix-signature"],
+            "X-TripWire-ID": request.headers["X-TripWire-ID"],
+            "X-TripWire-Timestamp": request.headers["X-TripWire-Timestamp"],
+            "X-TripWire-Signature": request.headers["X-TripWire-Signature"],
         },
-        secret="whsec_your_endpoint_signing_secret",
+        secret="a3f8c2e1d9b74056f1a2e3d4c5b6a7f8e9d0c1b2a3f4e5d6c7b8a9f0e1d2c3b4",
     )
 
     if not is_valid:
@@ -271,7 +271,8 @@ All configuration is via environment variables (loaded from `.env`):
 | `SUPABASE_URL` | **Yes** | -- | Supabase project URL |
 | `SUPABASE_ANON_KEY` | **Yes** | -- | Supabase anon/public key |
 | `SUPABASE_SERVICE_ROLE_KEY` | **Yes** | -- | Supabase service role key |
-| `SVIX_API_KEY` | **Yes** | -- | Svix API key for webhook delivery |
+| `CONVOY_API_KEY` | **Yes** | -- | Convoy API key for webhook delivery |
+| `CONVOY_URL` | **Yes** | -- | Convoy self-hosted instance URL |
 | `GOLDSKY_API_KEY` | No | `""` | Goldsky API key for chain indexing |
 | `GOLDSKY_PROJECT_ID` | No | `""` | Goldsky project ID |
 | `BASE_RPC_URL` | No | `https://mainnet.base.org` | Base RPC endpoint |
@@ -289,7 +290,7 @@ All configuration is via environment variables (loaded from `.env`):
 | Runtime | Python 3.11+ | Async-first, Pydantic v2 native |
 | API Framework | FastAPI + Uvicorn | High performance async, auto-generated OpenAPI docs |
 | Database | Supabase (PostgreSQL) | Managed Postgres + Realtime subscriptions for Notify mode |
-| Webhook Delivery | Svix | Enterprise-grade retries, HMAC signing, DLQ -- zero ops |
+| Webhook Delivery | Convoy self-hosted | Self-hosted retries, HMAC signing, DLQ -- full control, no vendor lock-in |
 | Chain Indexing | Goldsky Mirror/Turbo | Real-time event streaming, no subgraph maintenance |
 | Blockchain RPC | httpx | Lightweight raw JSON-RPC calls -- no web3.py dependency |
 | ABI Decoding | eth-abi | Minimal decoder for ERC-3009 event data |
@@ -315,7 +316,7 @@ TripWire/
 │   │       └── engine.py        # Policy evaluation engine
 │   ├── webhook/
 │   │   ├── dispatcher.py        # Payment matching and webhook orchestration
-│   │   ├── svix_client.py       # Svix SDK wrapper (send, retry, manage)
+│   │   ├── convoy_client.py     # Convoy REST API client (send, retry, manage)
 │   │   └── verify.py            # HMAC signature verification
 │   ├── ingestion/
 │   │   ├── pipeline.py          # Goldsky pipeline configuration
@@ -353,7 +354,7 @@ TripWire/
 
 ### Phase 1 -- MVP (current)
 - [x] FastAPI REST API with endpoint registration
-- [x] Svix webhook delivery with retries and HMAC signing
+- [x] Convoy webhook delivery with retries and HMAC signing
 - [x] ERC-3009 event ingestion and nonce deduplication
 - [x] Policy engine (amount, sender, agent class, reputation filters)
 - [x] ERC-8004 identity resolution (mock)
@@ -390,7 +391,7 @@ Proprietary. All Rights Reserved. See [LICENSE](LICENSE) for details.
 - **SDK** -- `sdk/` directory or `pip install tripwire-sdk`
 - **x402 Protocol** -- [x402.org](https://www.x402.org/)
 - **ERC-8004** -- Onchain AI Agent Identity Registry
-- **Svix** -- [svix.com](https://www.svix.com/) (webhook infrastructure)
+- **Convoy** -- [getconvoy.io](https://getconvoy.io/) (self-hosted webhook infrastructure)
 - **Goldsky** -- [goldsky.com](https://goldsky.com/) (blockchain data indexing)
 - **Supabase** -- [supabase.com](https://supabase.com/) (managed PostgreSQL + Realtime)
 

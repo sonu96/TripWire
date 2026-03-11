@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-webhook = ["svix>=1.86.0"]
+webhook = []  # No extra deps — verification uses stdlib hmac/hashlib
 
 [build-system]
 requires = ["hatchling"]

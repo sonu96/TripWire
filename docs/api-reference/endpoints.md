@@ -57,7 +57,7 @@ Register a new webhook endpoint to receive payment notifications.
 | Field       | Type             | Required | Description                                                                 |
 |-------------|------------------|----------|-----------------------------------------------------------------------------|
 | `url`       | string           | Yes      | The URL where webhooks will be delivered                                    |
-| `mode`      | string           | Yes      | `"notify"` (Supabase Realtime push) or `"execute"` (Svix webhook delivery) |
+| `mode`      | string           | Yes      | `"notify"` (Supabase Realtime push) or `"execute"` (Convoy webhook delivery) |
 | `chains`    | array of int     | Yes      | Chain IDs to monitor. At least one required. Values: `1` (Ethereum), `8453` (Base), `42161` (Arbitrum) |
 | `recipient` | string           | Yes      | Ethereum address (0x-prefixed, 40 hex chars) to match incoming transfers   |
 | `policies`  | object or null   | No       | Optional policy rules (see [Policies](#endpoint-policies) below)           |
