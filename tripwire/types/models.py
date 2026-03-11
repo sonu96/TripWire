@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ── Chain Types ─────────────────────────────────────────────────
@@ -101,6 +101,13 @@ class RegisterEndpointRequest(BaseModel):
     recipient: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
     policies: EndpointPolicies | None = None
 
+    @field_validator("url")
+    @classmethod
+    def url_must_be_safe(cls, v: str) -> str:
+        from tripwire.api.validation import validate_endpoint_url
+
+        return validate_endpoint_url(v)
+
 
 class Endpoint(BaseModel):
     id: str
@@ -153,6 +160,7 @@ class WebhookData(BaseModel):
 
 class WebhookPayload(BaseModel):
     id: str
+    idempotency_key: str
     type: WebhookEventType
     mode: EndpointMode
     timestamp: int

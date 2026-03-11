@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 
 import structlog
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from tripwire.api import get_supabase
 from tripwire.api.auth import require_api_key
+from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 
 logger = structlog.get_logger(__name__)
 
@@ -16,7 +17,8 @@ router = APIRouter(tags=["stats"], dependencies=[Depends(require_api_key)])
 
 
 @router.get("/stats")
-async def get_stats(sb=Depends(get_supabase)):
+@limiter.limit(CRUD_LIMIT)
+async def get_stats(request: Request, sb=Depends(get_supabase)):
     """Return application-level processing statistics from the database."""
 
     # Total events count

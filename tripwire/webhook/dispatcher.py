@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 import uuid
 
@@ -24,6 +25,19 @@ from tripwire.types.models import (
 from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
+
+
+def generate_idempotency_key(
+    chain_id: int, tx_hash: str, log_index: int, endpoint_id: str, event_type: str
+) -> str:
+    """Generate a deterministic idempotency key for a webhook delivery.
+
+    The same (chain_id, tx_hash, log_index, endpoint_id, event_type) tuple
+    always produces the same key, ensuring duplicate deliveries can be detected.
+    """
+    raw = f"{chain_id}:{tx_hash.lower()}:{log_index}:{endpoint_id}:{event_type}"
+    digest = hashlib.sha256(raw.encode()).hexdigest()[:32]
+    return f"idem_{digest}"
 
 
 def build_transfer_data(transfer: ERC3009Transfer) -> TransferData:
@@ -55,12 +69,21 @@ def _build_payload(
     transfer: ERC3009Transfer,
     event_type: WebhookEventType,
     mode: EndpointMode,
+    endpoint_id: str,
     finality: FinalityStatus | None = None,
     identity: AgentIdentity | None = None,
 ) -> WebhookPayload:
     """Build a WebhookPayload from transfer, finality, and identity data."""
+    idempotency_key = generate_idempotency_key(
+        chain_id=transfer.chain_id.value,
+        tx_hash=transfer.tx_hash,
+        log_index=transfer.log_index,
+        endpoint_id=endpoint_id,
+        event_type=event_type.value,
+    )
     return WebhookPayload(
         id=str(uuid.uuid4()),
+        idempotency_key=idempotency_key,
         type=event_type,
         mode=mode,
         timestamp=int(time.time()),
@@ -169,6 +192,7 @@ async def dispatch_event(
             transfer=transfer,
             event_type=event_type,
             mode=endpoint.mode,
+            endpoint_id=endpoint.id,
             finality=finality,
             identity=identity,
         )

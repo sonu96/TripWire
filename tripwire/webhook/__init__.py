@@ -4,7 +4,9 @@ from tripwire.webhook.convoy_client import (
     create_application,
     create_endpoint,
     direct_deliver,
+    force_resend,
     init_convoy,
+    list_failed_deliveries,
     list_messages,
     retry_message,
     send_webhook,
@@ -20,6 +22,7 @@ from tripwire.webhook.provider import (
     WebhookProvider,
     create_webhook_provider,
 )
+from tripwire.webhook.dlq_handler import DLQHandler
 from tripwire.webhook.verify import verify_webhook
 
 __all__ = [
@@ -36,6 +39,10 @@ __all__ = [
     "direct_deliver",
     "list_messages",
     "retry_message",
+    "list_failed_deliveries",
+    "force_resend",
+    # DLQ handler
+    "DLQHandler",
     # Dispatcher
     "dispatch_event",
     "match_endpoints",

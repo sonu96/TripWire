@@ -6,6 +6,8 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from nanoid import generate as nanoid
 
+from postgrest.exceptions import APIError as PostgrestAPIError
+
 from tripwire.api import get_supabase
 from tripwire.api.auth import require_api_key
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
@@ -45,7 +47,12 @@ async def create_subscription(
         "created_at": now,
     }
 
-    result = sb.table("subscriptions").insert(row).execute()
+    try:
+        result = sb.table("subscriptions").insert(row).execute()
+    except PostgrestAPIError as exc:
+        if exc.code == "23505":
+            raise HTTPException(status_code=409, detail="Subscription already exists")
+        raise
     logger.info("subscription_created", subscription_id=sub_id, endpoint_id=endpoint_id)
     return Subscription(**result.data[0])
 

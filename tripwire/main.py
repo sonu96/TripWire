@@ -11,17 +11,20 @@ import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
+import httpx
 import structlog
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from postgrest.exceptions import APIError as PostgrestAPIError
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
 from tripwire import __version__
 from tripwire.api.middleware import RequestLoggingMiddleware
 from tripwire.api.ratelimit import limiter, rate_limit_exceeded_handler
+from tripwire.api.routes.deliveries import router as deliveries_router
 from tripwire.api.routes.endpoints import router as endpoints_router
 from tripwire.api.routes.events import router as events_router
 from tripwire.api.routes.ingest import router as ingest_router
@@ -37,6 +40,7 @@ from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.identity.resolver import create_resolver
 from tripwire.ingestion.processor import EventProcessor
 from tripwire.notify.realtime import RealtimeNotifier
+from tripwire.webhook.dlq_handler import DLQHandler
 from tripwire.webhook.provider import create_webhook_provider
 
 # Configure structlog BEFORE any logger is created
@@ -107,9 +111,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         identity_resolver=resolver,
         realtime_notifier=realtime_notifier,
         webhook_provider=webhook_provider,
+        supabase_client=supabase,
     )
     app.state.processor = processor
     logger.info("event_processor_ready")
+
+    # Dead Letter Queue handler (background poller for failed Convoy deliveries)
+    dlq_handler: DLQHandler | None = None
+    if settings.dlq_enabled and settings.convoy_api_key:
+        dlq_handler = DLQHandler(
+            endpoint_repo=endpoint_repo,
+            delivery_repo=delivery_repo,
+            settings=settings,
+        )
+        await dlq_handler.start()
+        app.state.dlq_handler = dlq_handler
+        logger.info("dlq_handler_ready")
+    else:
+        logger.info(
+            "dlq_handler_skipped",
+            dlq_enabled=settings.dlq_enabled,
+            convoy_configured=bool(settings.convoy_api_key),
+        )
 
     # Mark application as ready for traffic
     app.state.ready = True
@@ -119,6 +142,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # -- Shutdown ------------------------------------------------
+    # Stop DLQ handler if running
+    if dlq_handler is not None:
+        await dlq_handler.stop()
+
     # Close identity resolver HTTP client if it has one
     if hasattr(resolver, "close"):
         await resolver.close()
@@ -141,6 +168,68 @@ def create_app() -> FastAPI:
     # Rate limiter (must be set on app.state before adding middleware)
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+
+    # Supabase / PostgREST exception handler
+    @app.exception_handler(PostgrestAPIError)
+    async def supabase_exception_handler(request: Request, exc: PostgrestAPIError):
+        code = getattr(exc, "code", None) or ""
+        message = getattr(exc, "message", str(exc))
+
+        # Map PostgreSQL error codes to HTTP status codes
+        pg_code_map = {
+            "23505": (409, "Conflict: unique constraint violation"),
+            "23503": (422, "Unprocessable: foreign key violation"),
+            "23514": (422, "Unprocessable: check constraint violation"),
+            "42501": (403, "Forbidden: insufficient privilege"),
+        }
+
+        if code in pg_code_map:
+            status_code, detail = pg_code_map[code]
+        elif str(code).startswith("PGRST"):
+            status_code = 502
+            detail = f"PostgREST error: {message}"
+        else:
+            status_code = 500
+            detail = f"Database error: {message}"
+
+        logger.error(
+            "supabase_api_error",
+            path=request.url.path,
+            method=request.method,
+            error_code=code,
+            detail=detail,
+        )
+        return JSONResponse(
+            status_code=status_code,
+            content={"detail": detail, "error_code": code},
+        )
+
+    # Network exception handlers (httpx connectivity / timeout)
+    @app.exception_handler(httpx.ConnectError)
+    async def network_connect_exception_handler(request: Request, exc: httpx.ConnectError):
+        logger.error(
+            "network_connect_error",
+            path=request.url.path,
+            method=request.method,
+            error=str(exc),
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Service temporarily unavailable"},
+        )
+
+    @app.exception_handler(httpx.TimeoutException)
+    async def network_timeout_exception_handler(request: Request, exc: httpx.TimeoutException):
+        logger.error(
+            "network_timeout_error",
+            path=request.url.path,
+            method=request.method,
+            error=str(exc),
+        )
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Service temporarily unavailable"},
+        )
 
     # Middleware (order matters — outermost first)
     app.add_middleware(RequestLoggingMiddleware)
@@ -169,6 +258,7 @@ def create_app() -> FastAPI:
         )
 
     # Mount route groups
+    app.include_router(deliveries_router, prefix="/api/v1")
     app.include_router(endpoints_router, prefix="/api/v1")
     app.include_router(subscriptions_router, prefix="/api/v1")
     app.include_router(events_router, prefix="/api/v1")

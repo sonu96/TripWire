@@ -93,3 +93,87 @@ class WebhookDeliveryRepository:
             query = query.eq("status", status)
         query = query.order("created_at", desc=True).limit(limit)
         return query.execute().data
+
+    def get_by_id(self, delivery_id: str) -> dict | None:
+        """Get a single delivery by ID."""
+        result = (
+            self._sb.table("webhook_deliveries")
+            .select("*")
+            .eq("id", delivery_id)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    def get_by_provider_message_id(self, provider_message_id: str) -> dict | None:
+        """Get a single delivery by its provider (Convoy) message ID."""
+        result = (
+            self._sb.table("webhook_deliveries")
+            .select("*")
+            .eq("provider_message_id", provider_message_id)
+            .limit(1)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    def list_paginated(
+        self,
+        *,
+        endpoint_id: str | None = None,
+        event_id: str | None = None,
+        status: str | None = None,
+        cursor: str | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """List deliveries with optional filters and keyset pagination."""
+        query = (
+            self._sb.table("webhook_deliveries")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit + 1)
+        )
+
+        if cursor:
+            cursor_row = (
+                self._sb.table("webhook_deliveries")
+                .select("created_at")
+                .eq("id", cursor)
+                .execute()
+            )
+            if cursor_row.data:
+                query = query.lt("created_at", cursor_row.data[0]["created_at"])
+
+        if endpoint_id:
+            query = query.eq("endpoint_id", endpoint_id)
+        if event_id:
+            query = query.eq("event_id", event_id)
+        if status:
+            query = query.eq("status", status)
+
+        return query.execute().data
+
+    def get_stats_for_endpoint(self, endpoint_id: str) -> dict:
+        """Get delivery counts grouped by status for an endpoint."""
+        result = (
+            self._sb.table("webhook_deliveries")
+            .select("status")
+            .eq("endpoint_id", endpoint_id)
+            .execute()
+        )
+        rows = result.data
+
+        counts = {"pending": 0, "sent": 0, "delivered": 0, "failed": 0}
+        for row in rows:
+            s = row.get("status", "pending")
+            if s in counts:
+                counts[s] += 1
+
+        total = len(rows)
+        success = counts["delivered"] + counts["sent"]
+        success_rate = round(success / total, 4) if total > 0 else 0.0
+
+        return {
+            "endpoint_id": endpoint_id,
+            "total": total,
+            **counts,
+            "success_rate": success_rate,
+        }

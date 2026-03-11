@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request
 from nanoid import generate as nanoid
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+
+from postgrest.exceptions import APIError as PostgrestAPIError
 
 from tripwire.api import get_supabase
 from tripwire.api.auth import generate_api_key, hash_api_key, require_api_key
@@ -42,6 +44,15 @@ class UpdateEndpointRequest(BaseModel):
     policies: EndpointPolicies | None = None
     active: bool | None = None
 
+    @field_validator("url")
+    @classmethod
+    def url_must_be_safe(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        from tripwire.api.validation import validate_endpoint_url
+
+        return validate_endpoint_url(v)
+
 
 @router.post("", response_model=Endpoint, status_code=201)
 @limiter.limit(CRUD_LIMIT)
@@ -71,7 +82,12 @@ async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=
         "updated_at": now,
     }
 
-    result = sb.table("endpoints").insert(row).execute()
+    try:
+        result = sb.table("endpoints").insert(row).execute()
+    except PostgrestAPIError as exc:
+        if exc.code == "23505":
+            raise HTTPException(status_code=409, detail="Endpoint already exists")
+        raise
     endpoint = Endpoint(**result.data[0])
     # Attach plaintext key — only shown on creation
     endpoint.api_key = api_key
@@ -182,11 +198,10 @@ async def update_endpoint(request: Request, endpoint_id: str, body: UpdateEndpoi
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    # Serialize enum and nested model
+    # Serialize enum for Supabase storage (model_dump already converts
+    # nested models like policies to dicts, but leaves enums as Enum objects)
     if "mode" in updates:
         updates["mode"] = updates["mode"].value
-    if "policies" in updates:
-        updates["policies"] = updates["policies"].model_dump()
 
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
 

@@ -26,12 +26,14 @@ from tripwire.types.models import (
     Endpoint,
     EndpointMode,
     EndpointPolicies,
+    Subscription,
     WebhookEventType,
 )
 from tripwire.webhook.dispatcher import (
     build_transfer_data,
     dispatch_event,
     match_endpoints,
+    match_subscriptions,
 )
 from tripwire.webhook.provider import WebhookProvider
 
@@ -50,6 +52,7 @@ class EventProcessor:
         identity_resolver: IdentityResolver,
         realtime_notifier: RealtimeNotifier,
         webhook_provider: WebhookProvider,
+        supabase_client: Any | None = None,
     ) -> None:
         self._endpoint_repo = endpoint_repo
         self._event_repo = event_repo
@@ -58,6 +61,8 @@ class EventProcessor:
         self._resolver = identity_resolver
         self._realtime_notifier = realtime_notifier
         self._webhook_provider = webhook_provider
+        # Supabase client for subscription queries; falls back to endpoint_repo's client
+        self._sb = supabase_client or getattr(endpoint_repo, "_sb", None)
 
     async def process_event(self, raw_log: dict[str, Any]) -> dict[str, Any]:
         """Process a single Goldsky-decoded event through the full pipeline.
@@ -91,11 +96,15 @@ class EventProcessor:
 
         # 2. Nonce deduplication
         t0 = time.perf_counter()
-        is_new = self._nonce_repo.record_nonce(
-            chain_id=chain_id.value,
-            nonce=transfer.nonce,
-            authorizer=transfer.authorizer,
-        )
+        try:
+            is_new = self._nonce_repo.record_nonce(
+                chain_id=chain_id.value,
+                nonce=transfer.nonce,
+                authorizer=transfer.authorizer,
+            )
+        except Exception:
+            logger.exception("nonce_dedup_failed", tx_hash=tx_hash)
+            return {"status": "error", "reason": "nonce_dedup_failed", "tx_hash": tx_hash}
         timings["dedup_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         if not is_new:
@@ -123,12 +132,17 @@ class EventProcessor:
         timings["identity_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # 5. Match endpoints for this transfer's recipient + chain
-        endpoints = self._fetch_matching_endpoints(transfer)
+        try:
+            endpoints = self._fetch_matching_endpoints(transfer)
+        except Exception:
+            logger.exception("endpoint_fetch_failed", tx_hash=tx_hash)
+            return {"status": "error", "reason": "endpoint_fetch_failed", "tx_hash": tx_hash}
         if not endpoints:
             logger.info("no_matching_endpoints", tx_hash=tx_hash)
             # Still record the event even if no endpoints match
+            event_type = WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING
             event_id = self._record_event(
-                transfer, finality, identity, event_type=WebhookEventType.PAYMENT_CONFIRMED
+                transfer, finality, identity, event_type=event_type
             )
             return {
                 "status": "no_endpoints",
@@ -139,8 +153,9 @@ class EventProcessor:
         matched = match_endpoints(transfer, endpoints)
         if not matched:
             logger.info("no_endpoints_matched_filters", tx_hash=tx_hash)
+            event_type = WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING
             event_id = self._record_event(
-                transfer, finality, identity, event_type=WebhookEventType.PAYMENT_CONFIRMED
+                transfer, finality, identity, event_type=event_type
             )
             return {
                 "status": "no_match",
@@ -168,12 +183,12 @@ class EventProcessor:
         timings["policy_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # Determine event type based on finality
+        if finality is None:
+            logger.warning("finality_unknown_defaulting_to_pending", tx_hash=tx_hash)
         if finality and finality.is_finalized:
             event_type = WebhookEventType.PAYMENT_CONFIRMED
-        elif finality:
-            event_type = WebhookEventType.PAYMENT_PENDING
         else:
-            event_type = WebhookEventType.PAYMENT_CONFIRMED
+            event_type = WebhookEventType.PAYMENT_PENDING
 
         # 7. Record the event (link to the first matched endpoint)
         first_endpoint_id = matched[0].id if matched else None
@@ -213,7 +228,28 @@ class EventProcessor:
                 )
 
         # 8b. Push via Supabase Realtime for Notify-mode endpoints
+        #     Filter through subscription matching first
         notify_event_ids: list[str] = []
+        if notify_endpoints:
+            filtered_notify_endpoints: list[Endpoint] = []
+            for ep in notify_endpoints:
+                subs = self._fetch_subscriptions(ep.id)
+                if not subs:
+                    # No subscriptions defined → backwards-compatible, receive all events
+                    filtered_notify_endpoints.append(ep)
+                else:
+                    matched_subs = match_subscriptions(transfer, identity, subs)
+                    if matched_subs:
+                        filtered_notify_endpoints.append(ep)
+                    else:
+                        logger.info(
+                            "subscription_filter_skipped",
+                            endpoint_id=ep.id,
+                            tx_hash=tx_hash,
+                            subscriptions_checked=len(subs),
+                        )
+            notify_endpoints = filtered_notify_endpoints
+
         if notify_endpoints:
             try:
                 notify_event_ids = await self._realtime_notifier.notify_batch(
@@ -258,7 +294,11 @@ class EventProcessor:
         """Process a batch of Goldsky-decoded events."""
         results = []
         for raw_log in raw_logs:
-            result = await self.process_event(raw_log)
+            try:
+                result = await self.process_event(raw_log)
+            except Exception:
+                logger.exception("batch_event_unexpected_failure", raw_log=raw_log)
+                result = {"status": "error", "reason": "unexpected_failure"}
             results.append(result)
         return results
 
@@ -267,6 +307,21 @@ class EventProcessor:
     def _fetch_matching_endpoints(self, transfer) -> list[Endpoint]:
         """Fetch active endpoints whose recipient matches the transfer."""
         return self._endpoint_repo.list_by_recipient(transfer.to_address)
+
+    def _fetch_subscriptions(self, endpoint_id: str) -> list[Subscription]:
+        """Fetch active subscriptions for a given endpoint."""
+        try:
+            result = (
+                self._sb.table("subscriptions")
+                .select("*")
+                .eq("endpoint_id", endpoint_id)
+                .eq("active", True)
+                .execute()
+            )
+            return [Subscription(**row) for row in result.data]
+        except Exception:
+            logger.exception("fetch_subscriptions_failed", endpoint_id=endpoint_id)
+            return []
 
     def _record_event(self, transfer, finality, identity, event_type, endpoint_id: str | None = None) -> str:
         """Insert an event row into the events table via EventRepository."""

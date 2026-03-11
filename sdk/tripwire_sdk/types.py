@@ -84,6 +84,7 @@ class Event(BaseModel):
 
 class WebhookPayload(BaseModel):
     id: str
+    idempotency_key: str
     type: WebhookEventType
     mode: EndpointMode
     timestamp: int

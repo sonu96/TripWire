@@ -217,6 +217,12 @@ async def direct_deliver(url: str, payload: dict, secret: str) -> bool:
     payload_json = json.dumps(payload, separators=(",", ":"))
     sig_headers = _signature_header(secret, payload_json)
 
+    # Include Idempotency-Key header when present in the payload
+    extra_headers: dict[str, str] = {}
+    idem_key = payload.get("idempotency_key")
+    if idem_key:
+        extra_headers["Idempotency-Key"] = idem_key
+
     try:
         response = await client.post(
             url,
@@ -224,6 +230,7 @@ async def direct_deliver(url: str, payload: dict, secret: str) -> bool:
             headers={
                 "Content-Type": "application/json",
                 **sig_headers,
+                **extra_headers,
             },
         )
         success = response.is_success
@@ -248,6 +255,7 @@ async def send_webhook(
     event_type: str,
     payload: dict,
     endpoint_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
     """Send a webhook event via Convoy (reliable path).
 
@@ -264,6 +272,8 @@ async def send_webhook(
     }
     if endpoint_id:
         body["endpoint_id"] = endpoint_id
+    if idempotency_key:
+        body["idempotency_key"] = idempotency_key
 
     try:
         response = await client.post(
@@ -312,6 +322,68 @@ async def list_messages(app_id: str) -> list[dict[str, Any]]:
         return events
     except Exception:
         logger.exception("convoy_events_list_failed", project_id=app_id)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter queue helpers
+# ---------------------------------------------------------------------------
+
+
+async def list_failed_deliveries(
+    project_id: str,
+    *,
+    per_page: int = 50,
+    page: int = 1,
+) -> list[dict[str, Any]]:
+    """List failed event deliveries for a Convoy project.
+
+    Queries the Convoy event deliveries endpoint filtered by ``status=Failed``.
+    Returns a list of raw delivery dicts from the API response.
+    """
+    client = _get_convoy_client()
+    try:
+        response = await client.get(
+            f"/api/v1/projects/{project_id}/eventdeliveries",
+            params={"status": "Failed", "perPage": per_page, "page": page},
+        )
+        response.raise_for_status()
+        data = response.json()
+        deliveries: list[dict[str, Any]] = data.get("data", {}).get("content", [])
+        logger.debug(
+            "convoy_failed_deliveries_listed",
+            project_id=project_id,
+            count=len(deliveries),
+        )
+        return deliveries
+    except Exception:
+        logger.exception("convoy_failed_deliveries_list_failed", project_id=project_id)
+        raise
+
+
+async def force_resend(project_id: str, delivery_ids: list[str]) -> None:
+    """Batch-retry failed event deliveries for a Convoy project.
+
+    Sends a POST to the Convoy batch retry endpoint with the given delivery IDs.
+    """
+    client = _get_convoy_client()
+    try:
+        response = await client.post(
+            f"/api/v1/projects/{project_id}/eventdeliveries/batchretry",
+            json={"ids": delivery_ids},
+        )
+        response.raise_for_status()
+        logger.info(
+            "convoy_batch_retry_sent",
+            project_id=project_id,
+            delivery_count=len(delivery_ids),
+        )
+    except Exception:
+        logger.exception(
+            "convoy_batch_retry_failed",
+            project_id=project_id,
+            delivery_ids=delivery_ids,
+        )
         raise
 
 

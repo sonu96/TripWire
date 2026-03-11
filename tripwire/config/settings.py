@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     # API key rotation
     key_rotation_grace_hours: int = 24
 
+    # Dead Letter Queue
+    dlq_poll_interval_seconds: int = 60
+    dlq_max_retries: int = 3
+    dlq_alert_webhook_url: str = ""
+    dlq_enabled: bool = True
+
     # Identity resolver
     identity_cache_ttl: int = 300
 

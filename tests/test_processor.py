@@ -163,3 +163,108 @@ async def test_process_batch():
 
     assert len(results) == 2
     assert all(r["tx_hash"] == TX_HASH for r in results)
+
+
+# ── Issue #10: Error handling paths ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_nonce_dedup_failure_returns_error():
+    """Issue #10: nonce dedup exception returns proper error dict."""
+    processor = _make_processor()
+    processor._nonce_repo.record_nonce = MagicMock(side_effect=RuntimeError("db down"))
+
+    result = await processor.process_event(_raw_log())
+    assert result["status"] == "error"
+    assert result["reason"] == "nonce_dedup_failed"
+    assert result["tx_hash"] == TX_HASH
+
+
+@pytest.mark.asyncio
+async def test_endpoint_fetch_failure_returns_error():
+    """Issue #10: endpoint fetch exception returns proper error dict."""
+    processor = _make_processor()
+    processor._endpoint_repo.list_by_recipient = MagicMock(
+        side_effect=RuntimeError("db down")
+    )
+
+    with patch("tripwire.ingestion.processor.check_finality", new_callable=AsyncMock) as mock_fin:
+        mock_fin.return_value = MagicMock(is_finalized=True, confirmations=3, required_confirmations=3)
+        result = await processor.process_event(_raw_log())
+
+    assert result["status"] == "error"
+    assert result["reason"] == "endpoint_fetch_failed"
+    assert result["tx_hash"] == TX_HASH
+
+
+@pytest.mark.asyncio
+async def test_process_batch_catches_unexpected_exception():
+    """Issue #10: process_batch wraps per-event exceptions with continue."""
+    processor = _make_processor()
+
+    with patch.object(processor, "process_event", new_callable=AsyncMock) as mock_pe:
+        # First event raises, second succeeds
+        mock_pe.side_effect = [
+            RuntimeError("boom"),
+            {"status": "processed", "tx_hash": TX_HASH},
+        ]
+        results = await processor.process_batch([_raw_log(), _raw_log()])
+
+    assert len(results) == 2
+    assert results[0]["status"] == "error"
+    assert results[0]["reason"] == "unexpected_failure"
+    assert results[1]["status"] == "processed"
+
+
+# ── Issue #11: Finality fallback ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_finality_none_defaults_to_pending():
+    """Issue #11: when finality check fails (returns None), event type is PENDING."""
+    ep_row = _endpoint_row()
+    processor = _make_processor(endpoint_rows=[ep_row])
+    ep = Endpoint(**ep_row)
+
+    with patch("tripwire.ingestion.processor.check_finality", new_callable=AsyncMock) as mock_fin, \
+         patch("tripwire.ingestion.processor.dispatch_event", new_callable=AsyncMock) as mock_disp, \
+         patch("tripwire.ingestion.processor.match_endpoints", return_value=[ep]):
+        # Simulate finality check failure -- exception caught, finality=None
+        mock_fin.side_effect = RuntimeError("rpc down")
+        mock_disp.return_value = ["msg_001"]
+
+        result = await processor.process_event(_raw_log())
+
+    assert result["status"] == "processed"
+    # Verify the event was recorded with pending status
+    insert_call = processor._event_repo.insert.call_args
+    assert insert_call is not None
+    row = insert_call[0][0]
+    assert row["status"] == "pending"
+    assert row["type"] == "payment.pending"
+
+
+@pytest.mark.asyncio
+async def test_finality_not_finalized_is_pending():
+    """Issue #11: when finality check says not finalized, event type is PENDING."""
+    ep_row = _endpoint_row()
+    processor = _make_processor(endpoint_rows=[ep_row])
+    ep = Endpoint(**ep_row)
+
+    with patch("tripwire.ingestion.processor.check_finality", new_callable=AsyncMock) as mock_fin, \
+         patch("tripwire.ingestion.processor.dispatch_event", new_callable=AsyncMock) as mock_disp, \
+         patch("tripwire.ingestion.processor.match_endpoints", return_value=[ep]):
+        mock_fin.return_value = MagicMock(
+            is_finalized=False,
+            confirmations=1,
+            required_confirmations=3,
+        )
+        mock_disp.return_value = ["msg_001"]
+
+        result = await processor.process_event(_raw_log())
+
+    assert result["status"] == "processed"
+    insert_call = processor._event_repo.insert.call_args
+    row = insert_call[0][0]
+    assert row["status"] == "pending"
+    assert row["type"] == "payment.pending"
