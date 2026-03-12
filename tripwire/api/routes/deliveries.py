@@ -5,14 +5,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from tripwire.api import get_supabase
-from tripwire.api.auth import require_api_key
+from tripwire.api.auth import require_wallet_auth
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.webhook.convoy_client import retry_message
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["deliveries"], dependencies=[Depends(require_api_key)])
+router = APIRouter(tags=["deliveries"], dependencies=[Depends(require_wallet_auth)])
 
 
 # ── Response models ──────────────────────────────────────────

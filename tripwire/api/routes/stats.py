@@ -8,12 +8,12 @@ import structlog
 from fastapi import APIRouter, Depends, Request
 
 from tripwire.api import get_supabase
-from tripwire.api.auth import require_api_key
+from tripwire.api.auth import require_wallet_auth
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["stats"], dependencies=[Depends(require_api_key)])
+router = APIRouter(tags=["stats"], dependencies=[Depends(require_wallet_auth)])
 
 
 @router.get("/stats")

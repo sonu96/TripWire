@@ -23,13 +23,21 @@ services:
         condition: service_started
 
   convoy-server:
-    image: getconvoy/convoy:v24.12.1
+    image: getconvoy/convoy:v26.2.2
     command: server
     ports:
       - "5005:5005"
     environment:
-      CONVOY_DB_DSN: postgres://convoy:convoy@convoy-postgres:5432/convoy?sslmode=disable
-      CONVOY_REDIS_DSN: redis://convoy-redis:6379
+      CONVOY_DB_TYPE: postgres
+      CONVOY_DB_HOST: convoy-postgres
+      CONVOY_DB_PORT: 5432
+      CONVOY_DB_USERNAME: convoy
+      CONVOY_DB_PASSWORD: convoy
+      CONVOY_DB_DATABASE: convoy
+      CONVOY_DB_OPTIONS: sslmode=disable
+      CONVOY_REDIS_HOST: convoy-redis
+      CONVOY_REDIS_PORT: 6379
+      CONVOY_REDIS_SCHEME: redis
       CONVOY_HOST: 0.0.0.0
       CONVOY_PORT: 5005
     depends_on:
@@ -40,11 +48,19 @@ services:
     restart: unless-stopped
 
   convoy-worker:
-    image: getconvoy/convoy:v24.12.1
-    command: worker
+    image: getconvoy/convoy:v26.2.2
+    command: agent
     environment:
-      CONVOY_DB_DSN: postgres://convoy:convoy@convoy-postgres:5432/convoy?sslmode=disable
-      CONVOY_REDIS_DSN: redis://convoy-redis:6379
+      CONVOY_DB_TYPE: postgres
+      CONVOY_DB_HOST: convoy-postgres
+      CONVOY_DB_PORT: 5432
+      CONVOY_DB_USERNAME: convoy
+      CONVOY_DB_PASSWORD: convoy
+      CONVOY_DB_DATABASE: convoy
+      CONVOY_DB_OPTIONS: sslmode=disable
+      CONVOY_REDIS_HOST: convoy-redis
+      CONVOY_REDIS_PORT: 6379
+      CONVOY_REDIS_SCHEME: redis
       CONVOY_HOST: convoy-server
       CONVOY_PORT: 5005
     depends_on:

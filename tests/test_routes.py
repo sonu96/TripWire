@@ -11,6 +11,7 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from tripwire.api.auth import WalletAuthContext
 from tripwire.api.middleware import RequestLoggingMiddleware
 from tripwire.api.routes.endpoints import router as endpoints_router
 from tripwire.api.routes.ingest import router as ingest_router
@@ -21,6 +22,7 @@ NOW_ISO = NOW.isoformat()
 
 USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 RECIPIENT = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
+OWNER_ADDRESS = "0x1111111111111111111111111111111111111111"
 TX_HASH = "0x" + "ff" * 32
 NONCE_HEX = "0x" + "ab" * 32
 
@@ -75,6 +77,7 @@ def _endpoint_row() -> dict:
         "mode": "execute",
         "chains": [8453],
         "recipient": RECIPIENT,
+        "owner_address": OWNER_ADDRESS,
         "policies": EndpointPolicies().model_dump(),
         "active": True,
         "created_at": NOW_ISO,
@@ -115,6 +118,7 @@ async def test_health():
 
 @pytest.mark.asyncio
 async def test_register_endpoint():
+    """Registration uses wallet auth; in dev mode the dev bypass provides a default owner_address."""
     app = _create_test_app()
     transport = httpx.ASGITransport(app=app)
 
@@ -126,6 +130,7 @@ async def test_register_endpoint():
     }
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # No wallet auth headers — dev-mode bypass assigns a zero address as owner
         resp = await client.post("/api/v1/endpoints", json=payload)
 
     assert resp.status_code == 201
@@ -134,6 +139,7 @@ async def test_register_endpoint():
     assert body["mode"] == "execute"
     assert body["recipient"] == RECIPIENT
     assert body["active"] is True
+    assert "owner_address" in body
 
 
 @pytest.mark.asyncio

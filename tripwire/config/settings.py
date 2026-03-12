@@ -34,8 +34,10 @@ class Settings(BaseSettings):
     ethereum_rpc_url: str = "https://eth.llamarpc.com"
     arbitrum_rpc_url: str = "https://arb1.arbitrum.io/rpc"
 
-    # API key rotation
-    key_rotation_grace_hours: int = 24
+    # Wallet-based auth
+    tripwire_treasury_address: str = ""  # USDC recipient for registration payments
+    registration_fee_usdc: str = "1000000"  # 1 USDC, 6 decimals
+    auth_timestamp_tolerance_seconds: int = 300
 
     # Dead Letter Queue
     dlq_poll_interval_seconds: int = 60

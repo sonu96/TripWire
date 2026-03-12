@@ -5,7 +5,9 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+from eth_account import Account
 
+from tripwire_sdk.signer import make_auth_headers
 from tripwire_sdk.types import (
     Endpoint,
     EndpointMode,
@@ -29,9 +31,14 @@ class TripwireAPIError(Exception):
 class TripwireClient:
     """Async client for interacting with the TripWire REST API.
 
+    Authenticates every request by signing it with the caller's Ethereum
+    private key (EIP-191).  The server verifies the signature to identify
+    the wallet address.
+
     Usage::
 
-        async with TripwireClient(api_key="tw_...") as client:
+        async with TripwireClient(private_key="0x...") as client:
+            print(client.wallet_address)
             ep = await client.register_endpoint(
                 url="https://example.com/webhook",
                 mode="execute",
@@ -42,22 +49,28 @@ class TripwireClient:
 
     def __init__(
         self,
-        api_key: str,
-        base_url: str = "https://api.tripwire.xyz",
+        private_key: str,
+        base_url: str = "https://tripwire-production.up.railway.app",
     ) -> None:
-        self._api_key = api_key
+        self._private_key = private_key
         self._base_url = base_url.rstrip("/")
+        self._account = Account.from_key(private_key)
+        self._address: str = self._account.address
         self._http: httpx.AsyncClient | None = None
+
+    # ── Properties ─────────────────────────────────────────────
+
+    @property
+    def wallet_address(self) -> str:
+        """The checksummed Ethereum address derived from the private key."""
+        return self._address
 
     # ── Context manager ───────────────────────────────────────
 
     async def __aenter__(self) -> TripwireClient:
         self._http = httpx.AsyncClient(
             base_url=self._base_url,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Content-Type": "application/json"},
             timeout=30.0,
         )
         return self
@@ -76,10 +89,7 @@ class TripwireClient:
         if self._http is None:
             self._http = httpx.AsyncClient(
                 base_url=self._base_url,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
+                headers={"Content-Type": "application/json"},
                 timeout=30.0,
             )
         return self._http
@@ -92,7 +102,10 @@ class TripwireClient:
         json: dict | None = None,
         params: dict | None = None,
     ) -> Any:
-        resp = await self._client().request(method, path, json=json, params=params)
+        auth_headers = make_auth_headers(self._private_key, self._address, path)
+        resp = await self._client().request(
+            method, path, json=json, params=params, headers=auth_headers
+        )
         if resp.status_code >= 400:
             detail = resp.text
             try:

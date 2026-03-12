@@ -5,13 +5,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from tripwire.api import get_supabase
-from tripwire.api.auth import require_api_key
+from tripwire.api.auth import require_wallet_auth
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.types.models import WebhookEventType
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["events"], dependencies=[Depends(require_api_key)])
+router = APIRouter(tags=["events"], dependencies=[Depends(require_wallet_auth)])
 
 
 class EventResponse(BaseModel):

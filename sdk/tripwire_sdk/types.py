@@ -23,6 +23,7 @@ class EndpointMode(str, Enum):
 class WebhookEventType(str, Enum):
     PAYMENT_CONFIRMED = "payment.confirmed"
     PAYMENT_PENDING = "payment.pending"
+    PAYMENT_PRE_CONFIRMED = "payment.pre_confirmed"
     PAYMENT_FAILED = "payment.failed"
     PAYMENT_REORGED = "payment.reorged"
 
@@ -47,6 +48,7 @@ class Endpoint(BaseModel):
     mode: EndpointMode
     chains: list[int]
     recipient: str
+    owner_address: str
     policies: EndpointPolicies
     active: bool = True
     created_at: datetime

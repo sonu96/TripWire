@@ -99,6 +99,7 @@ class RegisterEndpointRequest(BaseModel):
     mode: EndpointMode
     chains: list[int] = Field(min_length=1)
     recipient: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    owner_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
     policies: EndpointPolicies | None = None
 
     @field_validator("url")
@@ -115,13 +116,14 @@ class Endpoint(BaseModel):
     mode: EndpointMode
     chains: list[int]
     recipient: str
+    owner_address: str
+    registration_tx_hash: str | None = None
+    registration_chain_id: int | None = None
     policies: EndpointPolicies
     active: bool = True
-    api_key: str | None = None  # Only populated on creation/rotation response
     convoy_project_id: str | None = None
     convoy_endpoint_id: str | None = None
     webhook_secret: str | None = None  # Per-endpoint HMAC signing secret
-    key_rotated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

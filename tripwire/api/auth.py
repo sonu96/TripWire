@@ -1,99 +1,96 @@
-"""API key authentication for TripWire endpoints."""
+"""Wallet-based EIP-191 signature authentication for TripWire endpoints."""
 
-import hashlib
-import secrets
-from datetime import datetime, timedelta, timezone
+import time
+from dataclasses import dataclass
 
 import structlog
-from fastapi import Depends, HTTPException, Request
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from eth_account import Account
+from eth_account.messages import encode_defunct
+from fastapi import HTTPException, Request
 
 from tripwire.config.settings import settings
 
 logger = structlog.get_logger(__name__)
 
-# auto_error=False so we can handle dev-mode skip ourselves
-_bearer_scheme = HTTPBearer(auto_error=False)
+# Maximum age (in seconds) of a signed timestamp before it's rejected
+_TIMESTAMP_TOLERANCE = 300
 
 
-def generate_api_key() -> str:
-    """Generate a new API key with the 'tw_' prefix."""
-    return "tw_" + secrets.token_hex(32)
+@dataclass(frozen=True)
+class WalletAuthContext:
+    """Authenticated caller context carrying the verified wallet address."""
+
+    wallet_address: str
 
 
-def hash_api_key(key: str) -> str:
-    """Return the SHA-256 hex digest of an API key."""
-    return hashlib.sha256(key.encode()).hexdigest()
+async def require_wallet_auth(request: Request) -> WalletAuthContext:
+    """FastAPI dependency that enforces EIP-191 wallet signature authentication.
 
+    Expected headers:
+        X-TripWire-Address   – caller's Ethereum address (0x…)
+        X-TripWire-Signature – EIP-191 personal_sign hex signature (0x…)
+        X-TripWire-Timestamp – Unix epoch seconds when the message was signed
 
-async def require_api_key(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> str | None:
-    """FastAPI dependency that enforces Bearer token authentication.
+    The signed message format is:
+        TripWire:{address}:{timestamp}:{request_path}
 
-    Uses FastAPI's built-in HTTPBearer to extract the Bearer token from the
-    Authorization header, hashes it, and looks it up in the endpoints table.
+    Verification steps:
+        1. Reconstruct the canonical message from the headers and request path.
+        2. Recover the signer address from the EIP-191 signature.
+        3. Compare recovered address to the claimed address (case-insensitive).
+        4. Ensure the timestamp is within the allowed tolerance window.
 
-    Returns the endpoint_id associated with the key.
-    Raises 401 if the key is invalid or missing.
-
-    In development (APP_ENV=development), skips auth if no header is present.
-
-    Supports a grace period after key rotation: if key_rotated_at is within
-    the configured window, both the current and old key hashes are accepted.
+    In development mode (APP_ENV=development), authentication is skipped when
+    none of the required headers are present.
     """
-    # In development, skip if no Authorization header
-    if credentials is None:
+    address = request.headers.get("X-TripWire-Address")
+    signature = request.headers.get("X-TripWire-Signature")
+    timestamp = request.headers.get("X-TripWire-Timestamp")
+
+    # Dev-mode bypass: skip auth when no headers are supplied at all
+    if address is None and signature is None and timestamp is None:
         if settings.app_env == "development":
-            return None
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+            logger.debug("wallet_auth_skipped", reason="development mode, no headers")
+            return WalletAuthContext(wallet_address="0x0000000000000000000000000000000000000000")
+        raise HTTPException(status_code=401, detail="Missing authentication headers")
 
-    token = credentials.credentials
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing API key")
+    # If some but not all headers are present, reject immediately
+    if not all([address, signature, timestamp]):
+        raise HTTPException(
+            status_code=401,
+            detail="Incomplete authentication headers; "
+            "X-TripWire-Address, X-TripWire-Signature, and X-TripWire-Timestamp are all required",
+        )
 
-    key_hash = hash_api_key(token)
+    # --- Timestamp validation ---
+    try:
+        ts = int(timestamp)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid timestamp format")
 
-    sb = request.app.state.supabase
+    now = int(time.time())
+    if abs(now - ts) > _TIMESTAMP_TOLERANCE:
+        raise HTTPException(status_code=401, detail="Timestamp expired or too far in the future")
 
-    # First, try the current api_key_hash (fast path)
-    result = (
-        sb.table("endpoints")
-        .select("id")
-        .eq("api_key_hash", key_hash)
-        .eq("active", True)
-        .execute()
-    )
+    # --- Signature recovery ---
+    request_path = request.url.path
+    message_text = f"TripWire:{address}:{timestamp}:{request_path}"
+    signable = encode_defunct(text=message_text)
 
-    if result.data:
-        endpoint_id = result.data[0]["id"]
-        logger.debug("api_key_authenticated", endpoint_id=endpoint_id)
-        return endpoint_id
+    try:
+        recovered = Account.recover_message(signable, signature=signature)
+    except Exception as exc:
+        logger.warning("wallet_auth_recovery_failed", error=str(exc))
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # Fall back: check old_api_key_hash within grace period
-    result = (
-        sb.table("endpoints")
-        .select("id, key_rotated_at")
-        .eq("old_api_key_hash", key_hash)
-        .eq("active", True)
-        .execute()
-    )
+    # --- Address comparison (EIP-55 checksum-safe) ---
+    if recovered.lower() != address.lower():
+        logger.warning(
+            "wallet_auth_address_mismatch",
+            claimed=address,
+            recovered=recovered,
+        )
+        raise HTTPException(status_code=401, detail="Signature does not match claimed address")
 
-    if result.data:
-        row = result.data[0]
-        rotated_at = row.get("key_rotated_at")
-        if rotated_at:
-            if isinstance(rotated_at, str):
-                rotated_at = datetime.fromisoformat(rotated_at)
-            grace_cutoff = datetime.now(timezone.utc) - timedelta(hours=settings.key_rotation_grace_hours)
-            if rotated_at >= grace_cutoff:
-                endpoint_id = row["id"]
-                logger.debug(
-                    "api_key_authenticated_via_old_key",
-                    endpoint_id=endpoint_id,
-                    key_rotated_at=rotated_at.isoformat(),
-                )
-                return endpoint_id
-
-    raise HTTPException(status_code=401, detail="Invalid API key")
+    logger.debug("wallet_auth_ok", wallet_address=recovered)
+    return WalletAuthContext(wallet_address=recovered)
