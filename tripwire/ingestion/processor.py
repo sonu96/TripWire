@@ -265,14 +265,19 @@ class EventProcessor:
             authorizer=transfer.authorizer,
         )
 
-        # 2. Nonce deduplication (must run first — short-circuits on duplicates)
+        # 2. Deduplication
+        #    ERC-3009: use authorizer + nonce (unique per authorization)
+        #    Plain Transfer: use tx_hash + log_index (no meaningful nonce)
         t0 = time.perf_counter()
+        is_plain_transfer = not transfer.authorizer
+        dedup_nonce = transfer.nonce if not is_plain_transfer else f"{tx_hash}:{transfer.log_index}"
+        dedup_authorizer = transfer.authorizer if not is_plain_transfer else "transfer"
         try:
             is_new = await asyncio.to_thread(
                 self._nonce_repo.record_nonce,
                 chain_id=chain_id.value,
-                nonce=transfer.nonce,
-                authorizer=transfer.authorizer,
+                nonce=dedup_nonce,
+                authorizer=dedup_authorizer,
             )
         except Exception:
             logger.exception("nonce_dedup_failed", tx_hash=tx_hash)
@@ -280,7 +285,7 @@ class EventProcessor:
         timings["dedup_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         if not is_new:
-            logger.info("duplicate_nonce", tx_hash=tx_hash, nonce=transfer.nonce)
+            logger.info("duplicate_nonce", tx_hash=tx_hash, nonce=dedup_nonce)
             return {"status": "duplicate", "tx_hash": tx_hash}
 
         # 3-4. Finality check and identity resolution

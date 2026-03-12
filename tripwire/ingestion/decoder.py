@@ -275,13 +275,21 @@ def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
     decoded = raw_log.get("decoded", {})
     transfer = raw_log.get("transfer", {})
 
+    # Parse raw topics to determine event type
+    topics = _parse_topics(raw_log.get("topics", []))
+    topic0 = topics[0].lower() if topics else ""
+    is_transfer_event = topic0 == TRANSFER_TOPIC.lower()
+
     if decoded:
         # Pre-decoded path (Mirror with _gs_log_decode)
         authorizer = decoded.get("authorizer", "")
         nonce = decoded.get("nonce", "0x" + "00" * 32)
+    elif is_transfer_event:
+        # Raw Transfer event: topics[1]=from, topics[2]=to, data=value
+        authorizer = ""
+        nonce = "0x" + "00" * 32
     else:
-        # Raw path (Turbo) — decode AuthorizationUsed from topics
-        topics = _parse_topics(raw_log.get("topics", []))
+        # Raw AuthorizationUsed event: topics[1]=authorizer, topics[2]=nonce
         if len(topics) >= 3:
             authorizer = _address_from_topic(topics[1])
             nonce = topics[2]
@@ -297,10 +305,26 @@ def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
                 topic_count=len(topics),
             )
 
-    # Extract Transfer fields from the joined row when available
-    from_address = transfer.get("from_address", "") or authorizer
-    to_address = transfer.get("to_address", "")
-    value = str(transfer.get("value", "0"))
+    # Extract Transfer fields: from joined row, or from raw Transfer topics
+    if is_transfer_event and len(topics) >= 3:
+        from_address = _address_from_topic(topics[1])
+        to_address = _address_from_topic(topics[2])
+        # Decode value from data field (uint256)
+        raw_data = raw_log.get("data", "0x")
+        if raw_data and raw_data != "0x":
+            try:
+                data_bytes = bytes.fromhex(raw_data.removeprefix("0x"))
+                (val,) = decode(["uint256"], data_bytes)
+                value = str(val)
+            except Exception:
+                value = "0"
+                logger.warning("transfer_data_decode_failed", tx_hash=raw_log.get("transaction_hash", ""))
+        else:
+            value = "0"
+    else:
+        from_address = transfer.get("from_address", "") or authorizer
+        to_address = transfer.get("to_address", "")
+        value = str(transfer.get("value", "0"))
 
     if not to_address:
         logger.warning(
