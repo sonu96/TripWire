@@ -65,6 +65,18 @@ class Settings(BaseSettings):
     erc8004_identity_registry: str = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
     erc8004_reputation_registry: str = "0x8004BAa17C55a88189AE136b182e5fdA19dE9b63"
 
+    # Metrics endpoint authentication (optional — set to protect /metrics in production)
+    metrics_bearer_token: str = ""
+
+    # Sentry (optional error tracking — install with: pip install tripwire[sentry])
+    sentry_dsn: SecretStr = SecretStr("")
+    sentry_traces_sample_rate: float = 0.1
+
+    # OpenTelemetry (optional distributed tracing)
+    otel_enabled: bool = False
+    otel_endpoint: str = ""
+    otel_service_name: str = "tripwire"
+
     # WebSocket Subscriber (medium-speed fast path ~200-500ms)
     ws_subscriber_enabled: bool = False  # opt-in; Goldsky is the primary ingestion path
     ethereum_ws_url: str = ""

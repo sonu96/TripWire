@@ -8,10 +8,17 @@ from __future__ import annotations
 
 from typing import Any
 
+import time
+
 import httpx
 import structlog
 
 from tripwire.config.settings import settings
+from tripwire.observability.metrics import (
+    tripwire_webhook_delivery_duration_seconds,
+    tripwire_webhooks_sent_total,
+)
+from tripwire.observability.tracing import tracer, StatusCode
 
 logger = structlog.get_logger(__name__)
 
@@ -180,38 +187,57 @@ async def send_webhook(
 
     Returns the Convoy event ID.
     """
-    client = _get_convoy_client()
-    body: dict[str, Any] = {
-        "event_type": event_type,
-        "data": payload,
-    }
-    if endpoint_id:
-        body["endpoint_id"] = endpoint_id
-    if idempotency_key:
-        body["idempotency_key"] = idempotency_key
+    with tracer.start_as_current_span("convoy_send_webhook") as span:
+        span.set_attribute("convoy.project_id", app_id)
+        span.set_attribute("convoy.event_type", event_type)
+        if endpoint_id:
+            span.set_attribute("convoy.endpoint_id", endpoint_id)
 
-    try:
-        response = await client.post(
-            f"/api/v1/projects/{app_id}/events",
-            json=body,
-        )
-        response.raise_for_status()
-        data = response.json()
-        event_id: str = data["data"]["uid"]
-        logger.info(
-            "convoy_webhook_sent",
-            project_id=app_id,
-            event_type=event_type,
-            event_id=event_id,
-        )
-        return event_id
-    except Exception:
-        logger.exception(
-            "convoy_webhook_send_failed",
-            project_id=app_id,
-            event_type=event_type,
-        )
-        raise
+        client = _get_convoy_client()
+        body: dict[str, Any] = {
+            "event_type": event_type,
+            "data": payload,
+        }
+        if endpoint_id:
+            body["endpoint_id"] = endpoint_id
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key
+
+        send_start = time.perf_counter()
+        try:
+            response = await client.post(
+                f"/api/v1/projects/{app_id}/events",
+                json=body,
+            )
+            response.raise_for_status()
+            tripwire_webhook_delivery_duration_seconds.observe(
+                time.perf_counter() - send_start
+            )
+            data = response.json()
+            event_id: str = data["data"]["uid"]
+            tripwire_webhooks_sent_total.labels(status="success", mode="execute").inc()
+            span.set_attribute("convoy.status", "success")
+            logger.info(
+                "convoy_webhook_sent",
+                project_id=app_id,
+                event_type=event_type,
+                event_id=event_id,
+            )
+            return event_id
+        except Exception as exc:
+            tripwire_webhook_delivery_duration_seconds.observe(
+                time.perf_counter() - send_start
+            )
+            tripwire_webhooks_sent_total.labels(status="failed", mode="execute").inc()
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            span.set_attribute("convoy.status", "failed")
+            logger.exception(
+                "convoy_webhook_send_failed",
+                project_id=app_id,
+                event_type=event_type,
+            )
+            raise
 
 
 # ---------------------------------------------------------------------------

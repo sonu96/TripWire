@@ -1,0 +1,19 @@
+# Grafana Dashboard Provisioning
+# ---
+# Dashboards in /var/lib/grafana/dashboards are loaded automatically on startup.
+# Changes made in the Grafana UI will NOT persist across restarts because
+# allowUiUpdates is false; edit the JSON source files instead.
+
+apiVersion: 1
+
+providers:
+  - name: TripWire
+    orgId: 1
+    folder: TripWire
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

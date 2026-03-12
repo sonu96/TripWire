@@ -11,6 +11,7 @@ from fastapi import HTTPException, Request
 
 from tripwire.api.redis import get_redis
 from tripwire.config.settings import settings
+from tripwire.observability.audit import fire_and_forget
 
 logger = structlog.get_logger(__name__)
 
@@ -46,6 +47,12 @@ def _build_siwe_message(
     )
 
 
+
+def _get_audit_logger(request: Request):
+    """Return the audit logger if available, else None."""
+    return getattr(getattr(request, "app", None), "state", None) and getattr(request.app.state, "audit_logger", None)
+
+
 async def require_wallet_auth(request: Request) -> WalletAuthContext:
     """FastAPI dependency that enforces SIWE wallet signature authentication.
 
@@ -71,6 +78,16 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
     expiration_time = request.headers.get("X-TripWire-Expiration")
 
     if not all([address, signature, nonce, issued_at, expiration_time]):
+        _audit = _get_audit_logger(request)
+        if _audit:
+            fire_and_forget(_audit.log(
+                action="auth.failed",
+                actor=address or "unknown",
+                resource_type="auth",
+                resource_id="missing_headers",
+                details={"reason": "missing_headers"},
+                ip_address=request.client.host if request.client else None,
+            ))
         raise HTTPException(
             status_code=401,
             detail="Missing authentication headers; "
@@ -87,6 +104,16 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
         raise HTTPException(status_code=401, detail="Invalid expiration time format")
 
     if datetime.now(timezone.utc) > exp_dt:
+        _audit = _get_audit_logger(request)
+        if _audit:
+            fire_and_forget(_audit.log(
+                action="auth.failed",
+                actor=address,
+                resource_type="auth",
+                resource_id="expired",
+                details={"reason": "signature_expired"},
+                ip_address=request.client.host if request.client else None,
+            ))
         raise HTTPException(status_code=401, detail="Signature has expired")
 
     # --- Body hash ---
@@ -113,6 +140,16 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
         recovered = Account.recover_message(signable, signature=signature)
     except Exception as exc:
         logger.warning("wallet_auth_recovery_failed", error=str(exc))
+        _audit = _get_audit_logger(request)
+        if _audit:
+            fire_and_forget(_audit.log(
+                action="auth.failed",
+                actor=address,
+                resource_type="auth",
+                resource_id="invalid_signature",
+                details={"reason": "signature_recovery_failed"},
+                ip_address=request.client.host if request.client else None,
+            ))
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     # --- Address comparison (EIP-55 checksum-safe) ---
@@ -122,6 +159,16 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
             claimed=address,
             recovered=recovered,
         )
+        _audit = _get_audit_logger(request)
+        if _audit:
+            fire_and_forget(_audit.log(
+                action="auth.failed",
+                actor=address,
+                resource_type="auth",
+                resource_id="address_mismatch",
+                details={"reason": "address_mismatch", "claimed": address, "recovered": recovered},
+                ip_address=request.client.host if request.client else None,
+            ))
         raise HTTPException(status_code=401, detail="Signature does not match claimed address")
 
     # --- Nonce consumption (atomic: delete returns 1 if key existed, 0 if not) ---
@@ -129,7 +176,27 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
     consumed = await r.delete(f"siwe:nonce:{nonce}")
     if consumed == 0:
         logger.warning("wallet_auth_nonce_invalid", nonce=nonce)
+        _audit = _get_audit_logger(request)
+        if _audit:
+            fire_and_forget(_audit.log(
+                action="auth.failed",
+                actor=address,
+                resource_type="auth",
+                resource_id="invalid_nonce",
+                details={"reason": "nonce_invalid_or_reused"},
+                ip_address=request.client.host if request.client else None,
+            ))
         raise HTTPException(status_code=401, detail="Invalid or already-used nonce")
 
     logger.debug("wallet_auth_ok", wallet_address=recovered)
+    _audit = _get_audit_logger(request)
+    if _audit:
+        fire_and_forget(_audit.log(
+            action="auth.success",
+            actor=recovered,
+            resource_type="auth",
+            resource_id=recovered,
+            details={"method": method, "path": path},
+            ip_address=request.client.host if request.client else None,
+        ))
     return WalletAuthContext(wallet_address=recovered)

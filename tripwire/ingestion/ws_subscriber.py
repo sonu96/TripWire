@@ -24,6 +24,7 @@ import websockets.exceptions
 
 from tripwire.config.settings import settings
 from tripwire.ingestion.decoder import AUTHORIZATION_USED_TOPIC
+from tripwire.observability.health import health_registry
 from tripwire.types.models import USDC_CONTRACTS, ChainId
 
 logger = structlog.get_logger(__name__)
@@ -169,6 +170,7 @@ class ChainSubscriber:
                     chain_id=self.chain_id.value,
                     backoff_s=backoff,
                 )
+                health_registry.record_error("ws_subscriber", f"error on chain {self.chain_id.value}")
 
             if not self._running:
                 return
@@ -179,6 +181,7 @@ class ChainSubscriber:
                 backoff_s=backoff,
             )
             await asyncio.sleep(backoff)
+            health_registry.record_run("ws_subscriber")
             backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX)
 
     async def _connect_and_listen(self, ws_url: str) -> None:
@@ -213,6 +216,9 @@ class ChainSubscriber:
                 )
                 return
 
+            # Connection established and subscribed — record liveness
+            health_registry.record_run("ws_subscriber")
+
             # Backfill missed blocks if we have a last-known block
             if self._last_block > 0:
                 await self._backfill(ws)
@@ -222,6 +228,7 @@ class ChainSubscriber:
                 if not self._running:
                     break
                 await self._handle_message(message)
+                health_registry.record_run("ws_subscriber")
 
     async def _backfill(self, ws: Any) -> None:
         """Fetch missed logs since last seen block via eth_getLogs."""
@@ -435,6 +442,8 @@ class WebSocketSubscriberManager:
 
     async def start(self) -> None:
         """Launch one asyncio task per configured chain."""
+        health_registry.register("ws_subscriber")
+
         for chain_id in (ChainId.ETHEREUM, ChainId.BASE, ChainId.ARBITRUM):
             ws_url = _ws_url_for_chain(chain_id)
             if not ws_url:

@@ -1,0 +1,18 @@
+# Grafana Datasource Provisioning
+# ---
+# Prometheus is configured as the default datasource.
+# The URL uses the Docker Compose service name "prometheus" on port 9090.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    uid: prometheus
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"

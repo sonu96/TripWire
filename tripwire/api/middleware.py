@@ -10,7 +10,24 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from tripwire.observability.metrics import tripwire_request_duration_seconds
+
 logger = structlog.get_logger(__name__)
+
+
+def _get_path_template(request: Request) -> str:
+    """Return the FastAPI route path template for low-cardinality metric labels.
+
+    Uses the matched route object (e.g. ``/api/v1/endpoints/{endpoint_id}``)
+    so that any ID format (UUID, nanoid, etc.) is already parameterised.
+    Falls back to the first path segment + ``/{...}`` for unmatched routes (404s).
+    """
+    route = request.scope.get("route")
+    if route is not None and hasattr(route, "path"):
+        return route.path
+    # No matched route — collapse to first segment to avoid cardinality explosion
+    parts = request.url.path.strip("/").split("/", 1)
+    return f"/{parts[0]}/{{...}}" if parts and parts[0] else request.url.path
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -45,7 +62,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except Exception:
-            duration_ms = round((time.perf_counter() - start) * 1000, 1)
+            duration_s = time.perf_counter() - start
+            duration_ms = round(duration_s * 1000, 1)
+            # Record histogram for unhandled exceptions as 500
+            path_template = _get_path_template(request)
+            tripwire_request_duration_seconds.labels(
+                method=method,
+                path_template=path_template,
+                status_code="500",
+            ).observe(duration_s)
             logger.exception(
                 "request_failed",
                 method=method,
@@ -54,8 +79,17 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             )
             raise
 
-        duration_ms = round((time.perf_counter() - start) * 1000, 1)
+        duration_s = time.perf_counter() - start
+        duration_ms = round(duration_s * 1000, 1)
         status = response.status_code
+
+        # Record Prometheus request duration
+        path_template = _get_path_template(request)
+        tripwire_request_duration_seconds.labels(
+            method=method,
+            path_template=path_template,
+            status_code=str(status),
+        ).observe(duration_s)
 
         log = logger.info if status < 400 else logger.warning
         log(

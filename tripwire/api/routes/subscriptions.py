@@ -11,6 +11,7 @@ from postgrest.exceptions import APIError as PostgrestAPIError
 from tripwire.api import get_supabase
 from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
+from tripwire.observability.audit import fire_and_forget
 from tripwire.types.models import CreateSubscriptionRequest, Subscription
 
 logger = structlog.get_logger(__name__)
@@ -69,6 +70,14 @@ async def create_subscription(
             raise HTTPException(status_code=409, detail="Subscription already exists")
         raise
     logger.info("subscription_created", subscription_id=sub_id, endpoint_id=endpoint_id)
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="subscription.created",
+        actor=wallet_auth.wallet_address,
+        resource_type="subscription",
+        resource_id=sub_id,
+        details={"endpoint_id": endpoint_id},
+        ip_address=request.client.host if request.client else None,
+    ))
     return Subscription(**result.data[0])
 
 
@@ -124,3 +133,11 @@ async def remove_subscription(
         "active": False,
     }).eq("id", subscription_id).execute()
     logger.info("subscription_deactivated", subscription_id=subscription_id)
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="subscription.deleted",
+        actor=wallet_auth.wallet_address,
+        resource_type="subscription",
+        resource_id=subscription_id,
+        details={"endpoint_id": existing.data[0]["endpoint_id"]},
+        ip_address=request.client.host if request.client else None,
+    ))

@@ -19,6 +19,7 @@ from tripwire.types.models import (
     EndpointPolicies,
     RegisterEndpointRequest,
 )
+from tripwire.observability.audit import fire_and_forget
 from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
@@ -149,6 +150,14 @@ async def register_endpoint(
         except Exception:
             logger.exception("webhook_provider_setup_failed", endpoint_id=endpoint_id)
 
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="endpoint.created",
+        actor=wallet.wallet_address,
+        resource_type="endpoint",
+        resource_id=endpoint_id,
+        details={"url": body.url, "mode": body.mode.value},
+        ip_address=request.client.host if request.client else None,
+    ))
     return endpoint
 
 
@@ -217,6 +226,14 @@ async def update_endpoint(
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     result = sb.table("endpoints").update(updates).eq("id", endpoint_id).execute()
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="endpoint.updated",
+        actor=wallet_auth.wallet_address,
+        resource_type="endpoint",
+        resource_id=endpoint_id,
+        details={"fields": list(updates.keys())},
+        ip_address=request.client.host if request.client else None,
+    ))
     return Endpoint(**result.data[0])
 
 
@@ -240,3 +257,10 @@ async def deactivate_endpoint(
         "active": False,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", endpoint_id).execute()
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="endpoint.deleted",
+        actor=wallet_auth.wallet_address,
+        resource_type="endpoint",
+        resource_id=endpoint_id,
+        ip_address=request.client.host if request.client else None,
+    ))

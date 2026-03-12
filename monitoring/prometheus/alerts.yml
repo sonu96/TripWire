@@ -1,0 +1,172 @@
+# TripWire Prometheus Alerting Rules
+# ---
+# These rules monitor the health of the TripWire x402 execution middleware.
+# Adjust thresholds as needed based on your traffic patterns.
+
+groups:
+  - name: tripwire.rules
+    rules:
+
+      # -- Critical: high application error rate --
+      - alert: TripWireHighErrorRate
+        expr: >
+          (
+            sum(rate(tripwire_errors_total[5m]))
+            /
+            (sum(rate(tripwire_events_processed_total[5m])) + sum(rate(tripwire_errors_total[5m])))
+            > 0.05
+          )
+          and
+          (sum(rate(tripwire_events_processed_total[5m])) + sum(rate(tripwire_errors_total[5m]))) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: tripwire
+        annotations:
+          summary: "TripWire error rate exceeds 5%"
+          description: >
+            The ratio of errors to total events has been above 5% for the last
+            5 minutes. Current value: {{ $value | humanizePercentage }}.
+          runbook_url: "https://docs.tripwire.dev/runbooks/high-error-rate"
+
+      # -- Critical: webhook delivery failures --
+      - alert: TripWireWebhookDeliveryFailures
+        expr: >
+          (
+            sum(rate(tripwire_webhooks_sent_total{status!="success"}[5m]))
+            /
+            sum(rate(tripwire_webhooks_sent_total[5m]))
+            > 0.10
+          )
+          and
+          sum(rate(tripwire_webhooks_sent_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: tripwire
+        annotations:
+          summary: "Webhook delivery failure rate exceeds 10%"
+          description: >
+            More than 10% of webhook deliveries have been failing for the last
+            5 minutes. Current failure rate: {{ $value | humanizePercentage }}.
+            Check Convoy health and downstream endpoint availability.
+          runbook_url: "https://docs.tripwire.dev/runbooks/webhook-failures"
+
+      # -- Warning: DLQ backlog growing --
+      - alert: TripWireDLQBacklogHigh
+        expr: tripwire_dlq_backlog > 100
+        for: 10m
+        labels:
+          severity: warning
+          service: tripwire
+        annotations:
+          summary: "Dead Letter Queue backlog exceeds 100"
+          description: >
+            The DLQ has had more than 100 items for over 10 minutes.
+            Current backlog: {{ $value }}. Failed deliveries are accumulating
+            faster than retries can process them.
+          runbook_url: "https://docs.tripwire.dev/runbooks/dlq-backlog"
+
+      # -- Warning: pipeline latency degradation --
+      - alert: TripWirePipelineLatencyHigh
+        expr: >
+          histogram_quantile(0.95,
+            sum(rate(tripwire_pipeline_duration_seconds_bucket[5m])) by (le)
+          ) > 5
+        for: 5m
+        labels:
+          severity: warning
+          service: tripwire
+        annotations:
+          summary: "Pipeline P95 latency exceeds 5 seconds"
+          description: >
+            The 95th-percentile end-to-end pipeline duration has been above
+            5 seconds for 5 minutes. Current P95: {{ $value | humanizeDuration }}.
+            Investigate Supabase, Convoy, or RPC latency.
+          runbook_url: "https://docs.tripwire.dev/runbooks/pipeline-latency"
+
+      # -- Warning: no events being processed --
+      - alert: TripWireNoEventsProcessed
+        expr: >
+          sum(increase(tripwire_events_processed_total[15m])) == 0
+        for: 15m
+        labels:
+          severity: warning
+          service: tripwire
+        annotations:
+          summary: "No events processed in 30 minutes"
+          description: >
+            TripWire has active endpoints but has not processed any events in
+            the last 15 minutes. Verify that Goldsky pipeline and/or WebSocket
+            subscribers are connected and producing data.
+          runbook_url: "https://docs.tripwire.dev/runbooks/no-events"
+
+      # -- Critical: auth failure spike (possible attack) --
+      - alert: TripWireAuthFailureSpike
+        expr: >
+          (
+            sum(rate(tripwire_auth_requests_total{result="failure"}[5m]))
+            /
+            sum(rate(tripwire_auth_requests_total[5m]))
+            > 0.50
+          )
+          and
+          sum(rate(tripwire_auth_requests_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: tripwire
+        annotations:
+          summary: "Auth failure rate exceeds 50% -- possible attack"
+          description: >
+            More than 50% of authentication requests are failing over the last
+            5 minutes. Current failure rate: {{ $value | humanizePercentage }}.
+            This may indicate a credential stuffing or replay attack.
+            Review auth logs and consider enabling additional rate limiting.
+          runbook_url: "https://docs.tripwire.dev/runbooks/auth-failure-spike"
+
+      # -- Warning: WebSocket connections down --
+      - alert: TripWireWSConnectionDown
+        expr: >
+          tripwire_ws_connections_active == 0
+          and
+          tripwire_build_info{env=~"production|staging"} == 1
+        for: 5m
+        labels:
+          severity: warning
+          service: tripwire
+        annotations:
+          summary: "WebSocket subscriber connections are down"
+          description: >
+            All WebSocket connections to blockchain RPC nodes have dropped
+            to zero. The real-time fast-path for ERC-3009 detection is
+            not operational. Fallback to Goldsky polling remains active.
+          runbook_url: "https://docs.tripwire.dev/runbooks/ws-connection-down"
+
+      # -- Critical: instance down --
+      - alert: TripWireInstanceDown
+        expr: up{job="tripwire"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: tripwire
+        annotations:
+          summary: "TripWire instance is down"
+          description: >
+            Prometheus has been unable to scrape the TripWire metrics endpoint
+            for over 2 minutes. The instance at {{ $labels.instance }} may have
+            crashed or become unreachable.
+          runbook_url: "https://docs.tripwire.dev/runbooks/instance-down"
+
+      # -- Warning: Supabase scrape target down --
+      - alert: TripWireSupabaseScrapeDown
+        expr: up{job="supabase"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: tripwire
+        annotations:
+          summary: "Supabase metrics endpoint unreachable"
+          description: >
+            Cannot scrape Supabase metrics for {{ $labels.instance }}.
+            Check credentials and endpoint availability.

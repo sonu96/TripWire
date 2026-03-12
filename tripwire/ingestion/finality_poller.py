@@ -38,6 +38,7 @@ from tripwire.types.models import (
     FinalityStatus,
     WebhookEventType,
 )
+from tripwire.observability.health import health_registry
 from tripwire.webhook.dispatcher import dispatch_event
 from tripwire.webhook.provider import WebhookProvider
 
@@ -84,6 +85,8 @@ class FinalityPoller:
             logger.warning("finality_poller_already_running")
             return
 
+        health_registry.register("finality_poller")
+
         for chain_id, attr_name in _CHAIN_INTERVAL_ATTR.items():
             interval = getattr(self._settings, attr_name)
             task = asyncio.create_task(
@@ -122,10 +125,12 @@ class FinalityPoller:
         while True:
             try:
                 await self._poll_chain(chain_id)
+                health_registry.record_run("finality_poller")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("finality_poll_error", chain=chain_id.name)
+                health_registry.record_error("finality_poller", f"poll error on {chain_id.name}")
 
             try:
                 await asyncio.sleep(interval)

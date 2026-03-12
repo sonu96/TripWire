@@ -16,6 +16,8 @@ import structlog
 from tripwire.config.settings import Settings
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
+from tripwire.observability.health import health_registry
+from tripwire.observability.metrics import tripwire_dlq_backlog, tripwire_errors_total
 from tripwire.webhook.convoy_client import force_resend, list_failed_deliveries
 
 logger = structlog.get_logger(__name__)
@@ -59,6 +61,7 @@ class DLQHandler:
         if self._task is not None and self._task.done():
             logger.warning("dlq_handler_previous_task_finished_unexpectedly")
             self._task = None
+        health_registry.register("dlq_handler")
         self._task = asyncio.create_task(self._poll_loop(), name="dlq-handler")
         logger.info(
             "dlq_handler_started",
@@ -87,10 +90,12 @@ class DLQHandler:
         while True:
             try:
                 await self._poll_once()
+                health_registry.record_run("dlq_handler")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("dlq_poll_error")
+                health_registry.record_error("dlq_handler", str("poll error"))
 
             try:
                 await asyncio.sleep(self._settings.dlq_poll_interval_seconds)
@@ -100,6 +105,7 @@ class DLQHandler:
     async def _poll_once(self) -> None:
         """Single poll iteration across all active endpoints."""
         endpoints = self._endpoint_repo.list_active()
+        total_dlq_backlog = 0
 
         for endpoint in endpoints:
             convoy_project_id = getattr(endpoint, "convoy_project_id", None)
@@ -107,7 +113,8 @@ class DLQHandler:
                 continue
 
             try:
-                await self._process_endpoint(endpoint.id, convoy_project_id)
+                count = await self._process_endpoint(endpoint.id, convoy_project_id)
+                total_dlq_backlog += count
             except Exception:
                 logger.exception(
                     "dlq_endpoint_error",
@@ -115,17 +122,23 @@ class DLQHandler:
                     convoy_project_id=convoy_project_id,
                 )
 
+        # Set DLQ backlog gauge once with the total across all endpoints
+        tripwire_dlq_backlog.set(total_dlq_backlog)
+
     # ------------------------------------------------------------------
     # Per-endpoint processing
     # ------------------------------------------------------------------
 
     async def _process_endpoint(
         self, endpoint_id: str, convoy_project_id: str
-    ) -> None:
-        """Fetch failed deliveries for one endpoint and handle them."""
+    ) -> int:
+        """Fetch failed deliveries for one endpoint and handle them.
+
+        Returns the number of failed deliveries found for this endpoint.
+        """
         failed = await list_failed_deliveries(convoy_project_id)
         if not failed:
-            return
+            return 0
 
         logger.info(
             "dlq_failed_deliveries_found",
@@ -176,6 +189,8 @@ class DLQHandler:
                     convoy_project_id=convoy_project_id,
                 )
 
+        return len(failed)
+
     # ------------------------------------------------------------------
     # Dead-letter handling
     # ------------------------------------------------------------------
@@ -184,6 +199,7 @@ class DLQHandler:
         self, endpoint_id: str, delivery_uid: str, event_id: str
     ) -> None:
         """Mark a delivery as dead-lettered and fire an alert."""
+        tripwire_errors_total.labels(error_type="dead_lettered").inc()
         logger.warning(
             "dlq_delivery_dead_lettered",
             endpoint_id=endpoint_id,
