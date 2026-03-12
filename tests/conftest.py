@@ -1,16 +1,19 @@
 """Shared fixtures for TripWire test suite."""
 
 import os
-from datetime import datetime, timezone
 
+# Set APP_ENV to testing BEFORE any settings import so dev bypass is never active
+os.environ["APP_ENV"] = "testing"
 os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
 os.environ.setdefault("SUPABASE_ANON_KEY", "test-anon-key")
 os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key")
 os.environ.setdefault("CONVOY_API_KEY", "test-convoy-key")
 os.environ.setdefault("CONVOY_URL", "http://localhost:5005")
-os.environ.setdefault("APP_ENV", "development")
+
+from datetime import datetime, timezone
 
 import pytest
+from eth_account import Account
 
 from tripwire.types.models import (
     AgentIdentity,
@@ -21,6 +24,15 @@ from tripwire.types.models import (
     ERC3009Transfer,
 )
 
+from tests._wallet_helpers import (
+    TEST_PRIVATE_KEY,
+    OTHER_PRIVATE_KEY,
+    make_auth_headers,
+    MockRedis,
+)
+
+# ── Constants ─────────────────────────────────────────────────
+
 USDC_BASE = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 SENDER = "0x1234567890abcdef1234567890abcdef12345678"
 RECIPIENT = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
@@ -28,6 +40,38 @@ AUTHORIZER = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 NONCE_HEX = "0x" + "ab" * 32
 TX_HASH = "0x" + "ff" * 32
 BLOCK_HASH = "0x" + "ee" * 32
+
+
+# ── Wallet fixtures ──────────────────────────────────────────
+
+
+@pytest.fixture
+def test_wallet():
+    """Primary test wallet derived from Hardhat account #0."""
+    acct = Account.from_key(TEST_PRIVATE_KEY)
+    return {"account": acct, "address": acct.address}
+
+
+@pytest.fixture
+def other_wallet():
+    """Secondary test wallet derived from Hardhat account #1."""
+    acct = Account.from_key(OTHER_PRIVATE_KEY)
+    return {"account": acct, "address": acct.address}
+
+
+@pytest.fixture
+def mock_redis():
+    """In-memory Redis mock for nonce management."""
+    return MockRedis()
+
+
+@pytest.fixture
+def auth_headers(test_wallet):
+    """Auth headers for the primary test wallet, targeting GET /."""
+    return make_auth_headers(test_wallet["account"], method="GET", path="/")
+
+
+# ── Sample model fixtures ────────────────────────────────────
 
 
 @pytest.fixture
@@ -59,6 +103,7 @@ def sample_endpoint() -> Endpoint:
         mode=EndpointMode.EXECUTE,
         chains=[8453],
         recipient=RECIPIENT,
+        owner_address="0x0000000000000000000000000000000000000000",
         policies=EndpointPolicies(),
         active=True,
         created_at=now,

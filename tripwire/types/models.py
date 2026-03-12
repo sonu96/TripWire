@@ -2,9 +2,14 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# ── Reusable Types ─────────────────────────────────────────────
+
+EthAddress = Annotated[str, Field(pattern=r"^0x[a-fA-F0-9]{40}$")]
 
 
 # ── Chain Types ─────────────────────────────────────────────────
@@ -37,15 +42,17 @@ USDC_CONTRACTS: dict[ChainId, str] = {
 # ── ERC-3009 Transfer ──────────────────────────────────────────
 
 class ERC3009Transfer(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     chain_id: ChainId
     tx_hash: str
     block_number: int
     block_hash: str
     log_index: int
-    from_address: str
-    to_address: str
+    from_address: EthAddress
+    to_address: EthAddress
     value: str  # string to preserve USDC 6-decimal precision
-    authorizer: str  # AuthorizationUsed: address that signed the authorization
+    authorizer: EthAddress  # AuthorizationUsed: address that signed the authorization
     valid_after: int
     valid_before: int
     nonce: str  # AuthorizationUsed: bytes32 hex nonce
@@ -68,13 +75,15 @@ class FinalityStatus(BaseModel):
 # ── ERC-8004 Agent Identity ───────────────────────────────────
 
 class AgentIdentity(BaseModel):
-    address: str
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    address: EthAddress
     agent_class: str
-    deployer: str
+    deployer: EthAddress
     capabilities: list[str]
     reputation_score: float = Field(ge=0, le=100)
     registered_at: int
-    metadata: dict[str, Any] = {}
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 # ── Endpoint Registration ─────────────────────────────────────
@@ -85,21 +94,25 @@ class EndpointMode(str, Enum):
 
 
 class EndpointPolicies(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     min_amount: str | None = None
     max_amount: str | None = None
-    allowed_senders: list[str] | None = None
-    blocked_senders: list[str] | None = None
+    allowed_senders: list[EthAddress] | None = None
+    blocked_senders: list[EthAddress] | None = None
     required_agent_class: str | None = None
     min_reputation_score: float | None = Field(None, ge=0, le=100)
     finality_depth: int = Field(default=3, ge=1, le=64)
 
 
 class RegisterEndpointRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     url: str
     mode: EndpointMode
     chains: list[int] = Field(min_length=1)
-    recipient: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
-    owner_address: str = Field(pattern=r"^0x[a-fA-F0-9]{40}$")
+    recipient: EthAddress
+    owner_address: EthAddress
     policies: EndpointPolicies | None = None
 
     @field_validator("url")
@@ -111,12 +124,14 @@ class RegisterEndpointRequest(BaseModel):
 
 
 class Endpoint(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     id: str
     url: str
     mode: EndpointMode
     chains: list[int]
-    recipient: str
-    owner_address: str
+    recipient: EthAddress
+    owner_address: EthAddress
     registration_tx_hash: str | None = None
     registration_chain_id: int | None = None
     policies: EndpointPolicies

@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
     depends_on:
       convoy-server:
-        condition: service_started
+        condition: service_healthy
 
   convoy-server:
     image: getconvoy/convoy:v26.2.2
@@ -40,6 +40,12 @@ services:
       CONVOY_REDIS_SCHEME: redis
       CONVOY_HOST: 0.0.0.0
       CONVOY_PORT: 5005
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5005/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     depends_on:
       convoy-postgres:
         condition: service_started

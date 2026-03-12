@@ -24,6 +24,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from tripwire import __version__
 from tripwire.api.middleware import RequestLoggingMiddleware
 from tripwire.api.ratelimit import limiter, rate_limit_exceeded_handler
+from tripwire.api.routes.auth import router as auth_router
 from tripwire.api.routes.deliveries import router as deliveries_router
 from tripwire.api.routes.endpoints import router as endpoints_router
 from tripwire.api.routes.events import router as events_router
@@ -78,7 +79,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("webhook_provider_ready")
 
     # Warn if Goldsky webhook secret is missing in non-development environments
-    if settings.app_env != "development" and not settings.goldsky_webhook_secret:
+    if settings.app_env != "development" and not settings.goldsky_webhook_secret.get_secret_value():
         logger.warning(
             "goldsky_webhook_secret_missing",
             env=settings.app_env,
@@ -121,7 +122,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Dead Letter Queue handler (background poller for failed Convoy deliveries)
     dlq_handler: DLQHandler | None = None
-    if settings.dlq_enabled and settings.convoy_api_key:
+    if settings.dlq_enabled and settings.convoy_api_key.get_secret_value():
         dlq_handler = DLQHandler(
             endpoint_repo=endpoint_repo,
             delivery_repo=delivery_repo,
@@ -134,7 +135,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info(
             "dlq_handler_skipped",
             dlq_enabled=settings.dlq_enabled,
-            convoy_configured=bool(settings.convoy_api_key),
+            convoy_configured=bool(settings.convoy_api_key.get_secret_value()),
         )
 
     # Finality poller (background task for confirming pending events & reorg detection)
@@ -298,6 +299,7 @@ def create_app() -> FastAPI:
         )
 
     # Mount route groups
+    app.include_router(auth_router)
     app.include_router(deliveries_router, prefix="/api/v1")
     app.include_router(endpoints_router, prefix="/api/v1")
     app.include_router(subscriptions_router, prefix="/api/v1")

@@ -42,7 +42,7 @@ async def _verify_facilitator_request(request: Request) -> None:
     Uses a separate ``facilitator_webhook_secret`` so that Goldsky and
     facilitator credentials can be rotated independently.
     """
-    secret = settings.facilitator_webhook_secret
+    secret = settings.facilitator_webhook_secret.get_secret_value()
     if not secret:
         if settings.app_env != "development":
             raise HTTPException(

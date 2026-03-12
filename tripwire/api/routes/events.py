@@ -5,13 +5,22 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from tripwire.api import get_supabase
-from tripwire.api.auth import require_wallet_auth
+from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.types.models import WebhookEventType
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["events"], dependencies=[Depends(require_wallet_auth)])
+router = APIRouter(tags=["events"])
+
+
+# ── Helper: verify endpoint ownership ────────────────────────
+
+
+def _verify_endpoint_ownership(endpoint_row: dict, wallet_address: str) -> None:
+    """Raise 403 if the endpoint does not belong to the authenticated wallet."""
+    if endpoint_row.get("owner_address", "").lower() != wallet_address.lower():
+        raise HTTPException(status_code=403, detail="Not authorized to access this endpoint")
 
 
 class EventResponse(BaseModel):
@@ -28,6 +37,17 @@ class EventListResponse(BaseModel):
     has_more: bool = False
 
 
+def _get_wallet_endpoint_ids(sb, wallet_address: str) -> list[str]:
+    """Return all endpoint IDs owned by the given wallet address."""
+    result = (
+        sb.table("endpoints")
+        .select("id")
+        .eq("owner_address", wallet_address)
+        .execute()
+    )
+    return [row["id"] for row in result.data]
+
+
 @router.get("/events", response_model=EventListResponse)
 @limiter.limit(CRUD_LIMIT)
 async def list_events(
@@ -36,11 +56,20 @@ async def list_events(
     limit: int = Query(50, ge=1, le=200),
     event_type: WebhookEventType | None = Query(None),
     chain_id: int | None = Query(None),
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
     sb=Depends(get_supabase),
 ):
-    """List events with cursor pagination and optional filters."""
+    """List events with cursor pagination and optional filters.
 
-    query = sb.table("events").select("*").order("created_at", desc=True).limit(limit + 1)
+    Only returns events belonging to the authenticated wallet's endpoints.
+    """
+
+    # Get all endpoint IDs owned by this wallet
+    endpoint_ids = _get_wallet_endpoint_ids(sb, wallet_auth.wallet_address)
+    if not endpoint_ids:
+        return EventListResponse(data=[], cursor=None, has_more=False)
+
+    query = sb.table("events").select("*").in_("endpoint_id", endpoint_ids).order("created_at", desc=True).limit(limit + 1)
 
     if cursor:
         # Fetch the cursor event's created_at for keyset pagination
@@ -67,12 +96,30 @@ async def list_events(
 
 @router.get("/events/{event_id}", response_model=EventResponse)
 @limiter.limit(CRUD_LIMIT)
-async def get_event(request: Request, event_id: str, sb=Depends(get_supabase)):
-    """Get event details."""
+async def get_event(
+    request: Request,
+    event_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
+    """Get event details (must belong to an endpoint owned by the authenticated wallet)."""
     result = sb.table("events").select("*").eq("id", event_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Event not found")
-    return EventResponse(**result.data[0])
+
+    event = result.data[0]
+
+    # Verify ownership through the parent endpoint
+    if event.get("endpoint_id"):
+        ep = sb.table("endpoints").select("*").eq("id", event["endpoint_id"]).execute()
+        if not ep.data:
+            raise HTTPException(status_code=404, detail="Parent endpoint not found")
+        _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
+    else:
+        # Events without an endpoint_id cannot be verified — deny access
+        raise HTTPException(status_code=403, detail="Not authorized to access this event")
+
+    return EventResponse(**event)
 
 
 @router.get("/endpoints/{endpoint_id}/events", response_model=EventListResponse)
@@ -82,14 +129,16 @@ async def list_endpoint_events(
     endpoint_id: str,
     cursor: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
     sb=Depends(get_supabase),
 ):
-    """List events for a specific endpoint."""
+    """List events for a specific endpoint (must belong to authenticated wallet)."""
 
-    # Verify endpoint exists
-    ep = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()
+    # Verify endpoint exists and ownership
+    ep = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not ep.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
 
     query = (
         sb.table("events")

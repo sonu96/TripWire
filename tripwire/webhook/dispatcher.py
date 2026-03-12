@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import time
 import uuid
@@ -155,13 +154,10 @@ async def dispatch_event(
     finality: FinalityStatus | None = None,
     identity: AgentIdentity | None = None,
 ) -> list[str]:
-    """Build a WebhookPayload and send via the webhook provider for each matched endpoint.
+    """Build a WebhookPayload and send via Convoy for each matched endpoint.
 
-    For each endpoint two delivery paths are fired in parallel:
-    1. Convoy managed queue — via provider.send() using convoy_project_id / convoy_endpoint_id.
-    2. Direct httpx fast path — via provider.direct_deliver() posting straight to endpoint.url.
-
-    Returns a list of Convoy message IDs for successful managed-queue deliveries.
+    All deliveries are routed through Convoy which handles retries, DLQ, and
+    delivery logging. Returns a list of Convoy message IDs for successful sends.
     """
     message_ids: list[str] = []
 
@@ -192,45 +188,13 @@ async def dispatch_event(
         if endpoint.convoy_endpoint_id:
             payload_dict["__convoy_endpoint_id__"] = endpoint.convoy_endpoint_id
 
-        # --- Parallel delivery: managed queue + direct fast path ---
-        convoy_coro = provider.send(
-            app_id=project_id,
-            event_type=event_type.value,
-            payload=payload_dict,
-        )
-        direct_coro = provider.direct_deliver(
-            url=endpoint.url,
-            payload=payload.model_dump(),
-            secret=endpoint.webhook_secret or "",
-        )
-
         try:
-            convoy_result, direct_result = await asyncio.gather(
-                convoy_coro,
-                direct_coro,
-                return_exceptions=True,
-            )
-        except Exception:
-            logger.exception(
-                "webhook_dispatch_gather_failed",
-                endpoint_id=endpoint.id,
-                tx_hash=transfer.tx_hash,
-            )
-            continue
-
-        # Log Convoy managed-queue result
-        if isinstance(convoy_result, BaseException):
-            logger.error(
-                "webhook_convoy_send_failed",
-                endpoint_id=endpoint.id,
-                convoy_project_id=project_id,
-                convoy_endpoint_id=endpoint.convoy_endpoint_id,
-                tx_hash=transfer.tx_hash,
+            message_id = await provider.send(
+                app_id=project_id,
                 event_type=event_type.value,
-                error=str(convoy_result),
+                payload=payload_dict,
             )
-        else:
-            message_ids.append(convoy_result)
+            message_ids.append(message_id)
             logger.info(
                 "webhook_convoy_send_ok",
                 endpoint_id=endpoint.id,
@@ -238,27 +202,16 @@ async def dispatch_event(
                 convoy_endpoint_id=endpoint.convoy_endpoint_id,
                 tx_hash=transfer.tx_hash,
                 event_type=event_type.value,
-                message_id=convoy_result,
+                message_id=message_id,
             )
-
-        # Log direct fast-path result
-        if isinstance(direct_result, BaseException):
-            logger.error(
-                "webhook_direct_deliver_failed",
+        except Exception:
+            logger.exception(
+                "webhook_convoy_send_failed",
                 endpoint_id=endpoint.id,
-                url=endpoint.url,
+                convoy_project_id=project_id,
+                convoy_endpoint_id=endpoint.convoy_endpoint_id,
                 tx_hash=transfer.tx_hash,
                 event_type=event_type.value,
-                error=str(direct_result),
-            )
-        else:
-            logger.info(
-                "webhook_direct_deliver_ok",
-                endpoint_id=endpoint.id,
-                url=endpoint.url,
-                tx_hash=transfer.tx_hash,
-                event_type=event_type.value,
-                success=direct_result,
             )
 
     return message_ids

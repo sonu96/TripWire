@@ -2,7 +2,15 @@
 
 __version__ = "0.1.0"
 
-from tripwire_sdk.client import TripwireAPIError, TripwireClient
+from tripwire_sdk.client import TripwireClient
+from tripwire_sdk.errors import (
+    TripWireAuthError,
+    TripWireError,
+    TripWireNotFoundError,
+    TripWireRateLimitError,
+    TripWireServerError,
+    TripWireValidationError,
+)
 from tripwire_sdk.signer import build_auth_message, make_auth_headers, sign_auth_message
 from tripwire_sdk.types import (
     ChainId,
@@ -15,6 +23,8 @@ from tripwire_sdk.types import (
     Subscription,
     SubscriptionFilter,
     TransferData,
+    TripWireBaseModel,
+    WebhookData,
     WebhookEventType,
     WebhookPayload,
 )
@@ -26,15 +36,26 @@ from tripwire_sdk.verify import (
 )
 
 __all__ = [
+    # Client
     "TripwireClient",
-    "TripwireAPIError",
+    # Errors
+    "TripWireError",
+    "TripWireAuthError",
+    "TripWireNotFoundError",
+    "TripWireRateLimitError",
+    "TripWireServerError",
+    "TripWireValidationError",
+    # Auth helpers
     "build_auth_message",
     "sign_auth_message",
     "make_auth_headers",
+    # Webhook verification
     "WebhookVerificationError",
     "verify_webhook_signature",
     "verify_webhook_signature_safe",
     "sign_payload",
+    # Types
+    "TripWireBaseModel",
     "ChainId",
     "Endpoint",
     "EndpointMode",
@@ -45,6 +66,7 @@ __all__ = [
     "Subscription",
     "SubscriptionFilter",
     "TransferData",
+    "WebhookData",
     "WebhookEventType",
     "WebhookPayload",
 ]

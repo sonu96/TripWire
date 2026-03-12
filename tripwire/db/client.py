@@ -16,7 +16,7 @@ def get_supabase_client() -> Client:
     if _client is None:
         _client = create_client(
             settings.supabase_url,
-            settings.supabase_service_role_key,
+            settings.supabase_service_role_key.get_secret_value(),
         )
         logger.info("supabase_client_initialized", url=settings.supabase_url)
     return _client

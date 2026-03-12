@@ -9,7 +9,12 @@ import os
 
 from fastapi import FastAPI, HTTPException, Request
 
-from tripwire_sdk import WebhookPayload, verify_webhook_signature
+from tripwire_sdk import (
+    WebhookEventType,
+    WebhookPayload,
+    WebhookVerificationError,
+    verify_webhook_signature,
+)
 
 app = FastAPI()
 
@@ -24,20 +29,20 @@ async def handle_webhook(request: Request):
     # Step 2: Verify the signature
     try:
         verify_webhook_signature(body, headers, WEBHOOK_SECRET)
-    except Exception:
+    except WebhookVerificationError:
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     # Step 3: Process the event
     payload = WebhookPayload.model_validate_json(body)
 
-    if payload.type == "payment.confirmed":
-        transfer = payload.data["transfer"]
-        identity = payload.data.get("identity")
+    if payload.type == WebhookEventType.PAYMENT_CONFIRMED:
+        transfer = payload.data.transfer
+        identity = payload.data.identity
 
-        print(f"Payment confirmed!")
-        print(f"  From: {transfer['from_address']}")
-        print(f"  Amount: {int(transfer['amount']) / 1_000_000} USDC")
-        print(f"  Chain: {transfer['chain_id']}")
+        print("Payment confirmed!")
+        print(f"  From: {transfer.from_address}")
+        print(f"  Amount: {int(transfer.amount) / 1_000_000} USDC")
+        print(f"  Chain: {transfer.chain_id}")
 
         if identity:
             print(f"  Agent class: {identity['agent_class']}")

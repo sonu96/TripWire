@@ -15,7 +15,7 @@ from tripwire_sdk import TripwireClient
 
 async def main():
     # Load your Ethereum private key from the environment (never hard-code it!)
-    private_key = os.environ.get("TRIPWIRE_PRIVATE_KEY", "0xYourPrivateKeyHere")
+    private_key = os.environ["TRIPWIRE_PRIVATE_KEY"]
 
     # Step 1: Register your webhook endpoint
     async with TripwireClient(private_key=private_key) as client:

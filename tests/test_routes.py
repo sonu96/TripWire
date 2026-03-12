@@ -8,21 +8,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import httpx
+from eth_account import Account
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from tripwire.api.auth import WalletAuthContext
+from tripwire.api import get_supabase
+from tripwire.api.auth import WalletAuthContext, require_wallet_auth
 from tripwire.api.middleware import RequestLoggingMiddleware
 from tripwire.api.routes.endpoints import router as endpoints_router
-from tripwire.api.routes.ingest import router as ingest_router
+from tripwire.api.routes.ingest import router as ingest_router, _verify_goldsky_request
 from tripwire.types.models import EndpointMode, EndpointPolicies
+
+from tests._wallet_helpers import TEST_PRIVATE_KEY
 
 NOW = datetime.now(timezone.utc)
 NOW_ISO = NOW.isoformat()
 
 USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 RECIPIENT = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-OWNER_ADDRESS = "0x1111111111111111111111111111111111111111"
+_TEST_WALLET = Account.from_key(TEST_PRIVATE_KEY)
+OWNER_ADDRESS = _TEST_WALLET.address
 TX_HASH = "0x" + "ff" * 32
 NONCE_HEX = "0x" + "ab" * 32
 
@@ -96,10 +101,24 @@ def _create_test_app(supabase_data: list | None = None) -> FastAPI:
         from tripwire import __version__
         return {"status": "ok", "service": "tripwire", "version": __version__}
 
-    app.state.supabase = MockSupabase(data=supabase_data)
+    mock_sb = MockSupabase(data=supabase_data)
+    app.state.supabase = mock_sb
     app.state.webhook_provider = AsyncMock()
     app.state.webhook_provider.create_app = AsyncMock(return_value="app_test")
     app.state.webhook_provider.create_endpoint = AsyncMock(return_value="ep_test")
+
+    # Override wallet auth to return a deterministic owner address
+    async def _override_auth():
+        return WalletAuthContext(wallet_address=OWNER_ADDRESS)
+
+    app.dependency_overrides[require_wallet_auth] = _override_auth
+
+    # Override Goldsky auth so ingest routes work in testing env
+    async def _override_goldsky():
+        return None
+
+    app.dependency_overrides[_verify_goldsky_request] = _override_goldsky
+
     return app
 
 
@@ -118,7 +137,7 @@ async def test_health():
 
 @pytest.mark.asyncio
 async def test_register_endpoint():
-    """Registration uses wallet auth; in dev mode the dev bypass provides a default owner_address."""
+    """Registration uses overridden wallet auth that provides a deterministic owner_address."""
     app = _create_test_app()
     transport = httpx.ASGITransport(app=app)
 
@@ -127,10 +146,10 @@ async def test_register_endpoint():
         "mode": "execute",
         "chains": [8453],
         "recipient": RECIPIENT,
+        "owner_address": OWNER_ADDRESS,
     }
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # No wallet auth headers — dev-mode bypass assigns a zero address as owner
         resp = await client.post("/api/v1/endpoints", json=payload)
 
     assert resp.status_code == 201
@@ -139,7 +158,7 @@ async def test_register_endpoint():
     assert body["mode"] == "execute"
     assert body["recipient"] == RECIPIENT
     assert body["active"] is True
-    assert "owner_address" in body
+    assert body["owner_address"] == OWNER_ADDRESS
 
 
 @pytest.mark.asyncio

@@ -101,7 +101,7 @@ def build_pipeline_config(chain_id: ChainId) -> dict:
                 "url": f"{settings.app_base_url}/api/v1/ingest/goldsky",
                 "one_row_per_request": True,
                 "headers": {
-                    "Authorization": f"Bearer {settings.goldsky_webhook_secret}",
+                    "Authorization": f"Bearer {settings.goldsky_webhook_secret.get_secret_value()}",
                     "Content-Type": "application/json",
                 },
             }
@@ -126,8 +126,8 @@ def build_all_pipeline_configs() -> dict[ChainId, dict]:
 def _run_goldsky(args: list[str]) -> subprocess.CompletedProcess[str]:
     """Run a goldsky CLI command."""
     cmd = ["goldsky", *args]
-    if settings.goldsky_api_key:
-        cmd.extend(["--api-key", settings.goldsky_api_key])
+    if settings.goldsky_api_key.get_secret_value():
+        cmd.extend(["--api-key", settings.goldsky_api_key.get_secret_value()])
     if settings.goldsky_project_id:
         cmd.extend(["--project-id", settings.goldsky_project_id])
 

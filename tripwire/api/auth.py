@@ -1,19 +1,18 @@
-"""Wallet-based EIP-191 signature authentication for TripWire endpoints."""
+"""SIWE (EIP-4361) wallet authentication with replay prevention for TripWire."""
 
-import time
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import structlog
 from eth_account import Account
 from eth_account.messages import encode_defunct
 from fastapi import HTTPException, Request
 
+from tripwire.api.redis import get_redis
 from tripwire.config.settings import settings
 
 logger = structlog.get_logger(__name__)
-
-# Maximum age (in seconds) of a signed timestamp before it's rejected
-_TIMESTAMP_TOLERANCE = 300
 
 
 @dataclass(frozen=True)
@@ -23,60 +22,93 @@ class WalletAuthContext:
     wallet_address: str
 
 
+def _build_siwe_message(
+    domain: str,
+    address: str,
+    statement: str,
+    nonce: str,
+    issued_at: str,
+    expiration_time: str,
+) -> str:
+    """Construct an EIP-4361 SIWE message string."""
+    return (
+        f"{domain} wants you to sign in with your Ethereum account:\n"
+        f"{address}\n"
+        f"\n"
+        f"{statement}\n"
+        f"\n"
+        f"URI: https://{domain}\n"
+        f"Version: 1\n"
+        f"Chain ID: 1\n"
+        f"Nonce: {nonce}\n"
+        f"Issued At: {issued_at}\n"
+        f"Expiration Time: {expiration_time}"
+    )
+
+
 async def require_wallet_auth(request: Request) -> WalletAuthContext:
-    """FastAPI dependency that enforces EIP-191 wallet signature authentication.
+    """FastAPI dependency that enforces SIWE wallet signature authentication.
 
     Expected headers:
-        X-TripWire-Address   – caller's Ethereum address (0x…)
-        X-TripWire-Signature – EIP-191 personal_sign hex signature (0x…)
-        X-TripWire-Timestamp – Unix epoch seconds when the message was signed
-
-    The signed message format is:
-        TripWire:{address}:{timestamp}:{request_path}
+        X-TripWire-Address        -- caller's Ethereum address (0x...)
+        X-TripWire-Signature      -- EIP-191 personal_sign hex signature (0x...)
+        X-TripWire-Nonce          -- nonce previously obtained from GET /auth/nonce
+        X-TripWire-Issued-At      -- ISO-8601 timestamp when the message was signed
+        X-TripWire-Expiration     -- ISO-8601 expiration timestamp
 
     Verification steps:
-        1. Reconstruct the canonical message from the headers and request path.
-        2. Recover the signer address from the EIP-191 signature.
-        3. Compare recovered address to the claimed address (case-insensitive).
-        4. Ensure the timestamp is within the allowed tolerance window.
-
-    In development mode (APP_ENV=development), authentication is skipped when
-    none of the required headers are present.
+        1. Read the request body and compute its SHA-256 hash.
+        2. Reconstruct the SIWE message with method + path + body hash as the statement.
+        3. Recover the signer address from the EIP-191 signature.
+        4. Compare recovered address to the claimed address (case-insensitive).
+        5. Atomically consume the nonce from Redis (reject if missing / already used).
+        6. Validate the expiration time has not passed.
     """
     address = request.headers.get("X-TripWire-Address")
     signature = request.headers.get("X-TripWire-Signature")
-    timestamp = request.headers.get("X-TripWire-Timestamp")
+    nonce = request.headers.get("X-TripWire-Nonce")
+    issued_at = request.headers.get("X-TripWire-Issued-At")
+    expiration_time = request.headers.get("X-TripWire-Expiration")
 
-    # Dev-mode bypass: skip auth when no headers are supplied at all
-    if address is None and signature is None and timestamp is None:
-        if settings.app_env == "development":
-            logger.debug("wallet_auth_skipped", reason="development mode, no headers")
-            return WalletAuthContext(wallet_address="0x0000000000000000000000000000000000000000")
-        raise HTTPException(status_code=401, detail="Missing authentication headers")
-
-    # If some but not all headers are present, reject immediately
-    if not all([address, signature, timestamp]):
+    if not all([address, signature, nonce, issued_at, expiration_time]):
         raise HTTPException(
             status_code=401,
-            detail="Incomplete authentication headers; "
-            "X-TripWire-Address, X-TripWire-Signature, and X-TripWire-Timestamp are all required",
+            detail="Missing authentication headers; "
+            "X-TripWire-Address, X-TripWire-Signature, X-TripWire-Nonce, "
+            "X-TripWire-Issued-At, and X-TripWire-Expiration are all required",
         )
 
-    # --- Timestamp validation ---
+    # --- Expiration validation ---
     try:
-        ts = int(timestamp)
+        exp_dt = datetime.fromisoformat(expiration_time)
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=401, detail="Invalid timestamp format")
+        raise HTTPException(status_code=401, detail="Invalid expiration time format")
 
-    now = int(time.time())
-    if abs(now - ts) > _TIMESTAMP_TOLERANCE:
-        raise HTTPException(status_code=401, detail="Timestamp expired or too far in the future")
+    if datetime.now(timezone.utc) > exp_dt:
+        raise HTTPException(status_code=401, detail="Signature has expired")
 
-    # --- Signature recovery ---
-    request_path = request.url.path
-    message_text = f"TripWire:{address}:{timestamp}:{request_path}"
+    # --- Body hash ---
+    body_bytes = await request.body()
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
+
+    # --- Reconstruct SIWE message ---
+    method = request.method
+    path = request.url.path
+    statement = f"{method} {path} {body_hash}"
+
+    message_text = _build_siwe_message(
+        domain=settings.siwe_domain,
+        address=address,
+        statement=statement,
+        nonce=nonce,
+        issued_at=issued_at,
+        expiration_time=expiration_time,
+    )
     signable = encode_defunct(text=message_text)
 
+    # --- Signature recovery ---
     try:
         recovered = Account.recover_message(signable, signature=signature)
     except Exception as exc:
@@ -91,6 +123,13 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
             recovered=recovered,
         )
         raise HTTPException(status_code=401, detail="Signature does not match claimed address")
+
+    # --- Nonce consumption (atomic: delete returns 1 if key existed, 0 if not) ---
+    r = get_redis()
+    consumed = await r.delete(f"siwe:nonce:{nonce}")
+    if consumed == 0:
+        logger.warning("wallet_auth_nonce_invalid", nonce=nonce)
+        raise HTTPException(status_code=401, detail="Invalid or already-used nonce")
 
     logger.debug("wallet_auth_ok", wallet_address=recovered)
     return WalletAuthContext(wallet_address=recovered)

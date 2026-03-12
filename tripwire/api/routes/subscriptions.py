@@ -9,13 +9,22 @@ from nanoid import generate as nanoid
 from postgrest.exceptions import APIError as PostgrestAPIError
 
 from tripwire.api import get_supabase
-from tripwire.api.auth import require_wallet_auth
+from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.types.models import CreateSubscriptionRequest, Subscription
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["subscriptions"], dependencies=[Depends(require_wallet_auth)])
+router = APIRouter(tags=["subscriptions"])
+
+
+# ── Helper: verify endpoint ownership ────────────────────────
+
+
+def _verify_endpoint_ownership(endpoint_row: dict, wallet_address: str) -> None:
+    """Raise 403 if the endpoint does not belong to the authenticated wallet."""
+    if endpoint_row.get("owner_address", "").lower() != wallet_address.lower():
+        raise HTTPException(status_code=403, detail="Not authorized to access this endpoint")
 
 
 @router.post(
@@ -25,14 +34,20 @@ router = APIRouter(tags=["subscriptions"], dependencies=[Depends(require_wallet_
 )
 @limiter.limit(CRUD_LIMIT)
 async def create_subscription(
-    request: Request, endpoint_id: str, body: CreateSubscriptionRequest, sb=Depends(get_supabase)
+    request: Request,
+    endpoint_id: str,
+    body: CreateSubscriptionRequest,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
 ):
     """Create a subscription for an endpoint (Notify mode)."""
 
-    # Verify endpoint exists and is active
-    ep = sb.table("endpoints").select("id, mode").eq("id", endpoint_id).eq("active", True).execute()
+    # Verify endpoint exists, is active, and belongs to the authenticated wallet
+    ep = sb.table("endpoints").select("*").eq("id", endpoint_id).eq("active", True).execute()
     if not ep.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
+
     if ep.data[0]["mode"] != "notify":
         raise HTTPException(status_code=400, detail="Subscriptions are only for notify-mode endpoints")
 
@@ -62,12 +77,18 @@ async def create_subscription(
     response_model=list[Subscription],
 )
 @limiter.limit(CRUD_LIMIT)
-async def list_subscriptions(request: Request, endpoint_id: str, sb=Depends(get_supabase)):
+async def list_subscriptions(
+    request: Request,
+    endpoint_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
     """List subscriptions for an endpoint."""
 
-    ep = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()
+    ep = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not ep.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
 
     result = (
         sb.table("subscriptions")
@@ -81,12 +102,23 @@ async def list_subscriptions(request: Request, endpoint_id: str, sb=Depends(get_
 
 @router.delete("/subscriptions/{subscription_id}", status_code=204)
 @limiter.limit(CRUD_LIMIT)
-async def remove_subscription(request: Request, subscription_id: str, sb=Depends(get_supabase)):
+async def remove_subscription(
+    request: Request,
+    subscription_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
     """Deactivate a subscription."""
 
-    existing = sb.table("subscriptions").select("id").eq("id", subscription_id).execute()
+    existing = sb.table("subscriptions").select("*").eq("id", subscription_id).execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    # Verify ownership through the parent endpoint
+    ep = sb.table("endpoints").select("*").eq("id", existing.data[0]["endpoint_id"]).execute()
+    if not ep.data:
+        raise HTTPException(status_code=404, detail="Parent endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
 
     sb.table("subscriptions").update({
         "active": False,
