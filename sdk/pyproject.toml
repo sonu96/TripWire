@@ -11,6 +11,7 @@ dependencies = [
 
 [project.optional-dependencies]
 webhook = []  # No extra deps — verification uses stdlib hmac/hashlib
+x402 = ["x402[httpx,evm]>=2.3.0"]
 
 [build-system]
 requires = ["hatchling"]

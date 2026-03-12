@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json as json_mod
+import logging
+import warnings
 from typing import Any
 
 import httpx
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
+
+logger = logging.getLogger(__name__)
 
 from tripwire_sdk.errors import (
     TripWireAuthError,
@@ -51,10 +55,12 @@ class TripwireClient:
         self,
         private_key: str,
         base_url: str = "https://tripwire-production.up.railway.app",
+        enable_x402: bool = True,
     ) -> None:
         self._account: LocalAccount = Account.from_key(private_key)
         self._base_url = base_url.rstrip("/")
         self._address: str = self._account.address
+        self._enable_x402 = enable_x402
         self._http: httpx.AsyncClient | None = None
 
     # ── Properties ─────────────────────────────────────────────
@@ -73,11 +79,32 @@ class TripwireClient:
     # ── Context manager ───────────────────────────────────────
 
     async def __aenter__(self) -> TripwireClient:
-        self._http = httpx.AsyncClient(
-            base_url=self._base_url,
-            headers={"Content-Type": "application/json"},
-            timeout=30.0,
-        )
+        client_kwargs: dict[str, Any] = {
+            "base_url": self._base_url,
+            "headers": {"Content-Type": "application/json"},
+            "timeout": 30.0,
+        }
+
+        if self._enable_x402:
+            try:
+                from x402.client import x402Client
+
+                self._http = x402Client(
+                    wallet=self._account,
+                    **client_kwargs,
+                )
+                logger.debug("x402 payment handling enabled")
+            except ImportError:
+                warnings.warn(
+                    "x402 package is not installed — HTTP 402 Payment Required "
+                    "responses will not be auto-handled. Install with: "
+                    "pip install tripwire-sdk[x402]",
+                    stacklevel=2,
+                )
+                self._http = httpx.AsyncClient(**client_kwargs)
+        else:
+            self._http = httpx.AsyncClient(**client_kwargs)
+
         return self
 
     async def __aexit__(self, *exc: object) -> None:

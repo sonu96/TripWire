@@ -283,6 +283,49 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # x402 payment gating (only enabled when treasury address is configured)
+    if settings.tripwire_treasury_address:
+        try:
+            from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
+            from x402.http.middleware.fastapi import PaymentMiddlewareASGI
+            from x402.http.types import RouteConfig
+            from x402.mechanisms.evm.exact import ExactEvmServerScheme
+            from x402.server import x402ResourceServer
+
+            x402_server = x402ResourceServer(
+                HTTPFacilitatorClient(
+                    FacilitatorConfig(url=settings.x402_facilitator_url)
+                )
+            )
+            x402_server.register(settings.x402_network, ExactEvmServerScheme())
+
+            x402_routes = {
+                "POST /api/v1/endpoints": RouteConfig(
+                    accepts=[
+                        PaymentOption(
+                            scheme="exact",
+                            price=settings.x402_registration_price,
+                            network=settings.x402_network,
+                            pay_to=settings.tripwire_treasury_address,
+                        )
+                    ]
+                ),
+            }
+            app.add_middleware(PaymentMiddlewareASGI, routes=x402_routes, server=x402_server)
+            logger.info(
+                "x402_payment_gating_enabled",
+                network=settings.x402_network,
+                price=settings.x402_registration_price,
+                pay_to=settings.tripwire_treasury_address,
+            )
+        except ImportError:
+            logger.warning(
+                "x402_payment_gating_unavailable",
+                reason="x402 package not installed; run: pip install x402[fastapi,evm]",
+            )
+    else:
+        logger.warning("x402_payment_gating_disabled", reason="tripwire_treasury_address is empty")
+
     # Global error handler
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):

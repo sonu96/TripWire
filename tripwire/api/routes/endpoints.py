@@ -98,6 +98,23 @@ async def register_endpoint(
         raise
     endpoint = Endpoint(**result.data[0])
 
+    # Persist x402 payment details if the middleware verified a payment
+    payment_tx_hash = getattr(request.state, "payment_tx_hash", None)
+    payment_chain_id = getattr(request.state, "payment_chain_id", None)
+    if payment_tx_hash:
+        sb.table("endpoints").update({
+            "registration_tx_hash": payment_tx_hash,
+            "registration_chain_id": payment_chain_id,
+        }).eq("id", endpoint_id).execute()
+        endpoint.registration_tx_hash = payment_tx_hash
+        endpoint.registration_chain_id = payment_chain_id
+        logger.info(
+            "x402_payment_recorded",
+            endpoint_id=endpoint_id,
+            tx_hash=payment_tx_hash,
+            chain_id=payment_chain_id,
+        )
+
     # Create webhook provider application + endpoint for delivery
     if body.mode == EndpointMode.EXECUTE:
         provider: WebhookProvider = request.app.state.webhook_provider

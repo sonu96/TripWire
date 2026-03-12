@@ -35,9 +35,13 @@ class Settings(BaseSettings):
     ethereum_rpc_url: str = "https://eth.llamarpc.com"
     arbitrum_rpc_url: str = "https://arb1.arbitrum.io/rpc"
 
+    # x402 Payment Gating
+    x402_facilitator_url: str = "https://x402.org/facilitator"
+    x402_registration_price: str = "$1.00"
+    x402_network: str = "eip155:8453"  # Base mainnet
+
     # Wallet-based auth
-    tripwire_treasury_address: str = ""  # USDC recipient for registration payments
-    registration_fee_usdc: str = "1000000"  # 1 USDC, 6 decimals
+    tripwire_treasury_address: str = ""  # USDC recipient for x402 registration payments
     auth_timestamp_tolerance_seconds: int = 300
     redis_url: str = "redis://localhost:6379"
     siwe_domain: str = "tripwire.dev"

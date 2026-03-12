@@ -18,6 +18,7 @@ dependencies = [
     "slowapi>=0.1.9",
     "siwe>=4.0.0",
     "redis[hiredis]>=5.0.0",
+    "x402[fastapi,evm]>=2.3.0",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +40,9 @@ select = ["E", "F", "I", "N", "W"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: tests that require external services (x402 facilitator, etc.)",
+]
 
 [tool.hatch.version]
 path = "tripwire/__init__.py"

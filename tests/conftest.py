@@ -10,6 +10,11 @@ os.environ.setdefault("SUPABASE_SERVICE_ROLE_KEY", "test-service-role-key")
 os.environ.setdefault("CONVOY_API_KEY", "test-convoy-key")
 os.environ.setdefault("CONVOY_URL", "http://localhost:5005")
 
+# x402 payment gating: disable in tests by leaving treasury address empty
+os.environ.setdefault("TRIPWIRE_TREASURY_ADDRESS", "")
+os.environ.setdefault("X402_FACILITATOR_URL", "https://x402.org/facilitator")
+os.environ.setdefault("FACILITATOR_WEBHOOK_SECRET", "")
+
 from datetime import datetime, timezone
 
 import pytest
