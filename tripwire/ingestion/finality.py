@@ -13,6 +13,17 @@ from tripwire.types.models import (
 
 logger = structlog.get_logger(__name__)
 
+# ── Persistent httpx client with connection pooling ──────────────
+_rpc_client: httpx.AsyncClient | None = None
+
+
+def _get_rpc_client() -> httpx.AsyncClient:
+    global _rpc_client
+    if _rpc_client is None:
+        _rpc_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+    return _rpc_client
+
+
 _RPC_URLS: dict[ChainId, str] = {
     ChainId.ETHEREUM: settings.ethereum_rpc_url,
     ChainId.BASE: settings.base_rpc_url,
@@ -29,9 +40,9 @@ async def get_block_number(chain_id: ChainId) -> int:
         "params": [],
         "id": 1,
     }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(rpc_url, json=payload, timeout=10.0)
-        resp.raise_for_status()
+    client = _get_rpc_client()
+    resp = await client.post(rpc_url, json=payload)
+    resp.raise_for_status()
 
     data = resp.json()
     if "error" in data:

@@ -27,6 +27,7 @@ from tripwire.api.ratelimit import limiter, rate_limit_exceeded_handler
 from tripwire.api.routes.deliveries import router as deliveries_router
 from tripwire.api.routes.endpoints import router as endpoints_router
 from tripwire.api.routes.events import router as events_router
+from tripwire.api.routes.facilitator import router as facilitator_router
 from tripwire.api.routes.ingest import router as ingest_router
 from tripwire.api.routes.stats import router as stats_router
 from tripwire.api.routes.subscriptions import router as subscriptions_router
@@ -38,7 +39,9 @@ from tripwire.db.repositories.events import EventRepository
 from tripwire.db.repositories.nonces import NonceRepository
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.identity.resolver import create_resolver
+from tripwire.ingestion.finality_poller import FinalityPoller
 from tripwire.ingestion.processor import EventProcessor
+from tripwire.ingestion.ws_subscriber import WebSocketSubscriberManager
 from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.webhook.dlq_handler import DLQHandler
 from tripwire.webhook.provider import create_webhook_provider
@@ -134,6 +137,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             convoy_configured=bool(settings.convoy_api_key),
         )
 
+    # Finality poller (background task for confirming pending events & reorg detection)
+    finality_poller: FinalityPoller | None = None
+    if settings.finality_poller_enabled:
+        finality_poller = FinalityPoller(
+            event_repo=event_repo,
+            endpoint_repo=endpoint_repo,
+            delivery_repo=delivery_repo,
+            webhook_provider=webhook_provider,
+            settings=settings,
+        )
+        await finality_poller.start()
+        app.state.finality_poller = finality_poller
+        logger.info("finality_poller_ready")
+    else:
+        logger.info("finality_poller_skipped", enabled=False)
+
+    # WebSocket subscriber (medium-speed fast path for real-time ERC-3009 detection)
+    ws_manager: WebSocketSubscriberManager | None = None
+    if settings.ws_subscriber_enabled:
+        ws_manager = WebSocketSubscriberManager(processor)
+        await ws_manager.start()
+        app.state.ws_subscriber_manager = ws_manager
+        logger.info("ws_subscriber_ready")
+    else:
+        logger.info(
+            "ws_subscriber_skipped",
+            ws_subscriber_enabled=settings.ws_subscriber_enabled,
+        )
+
     # Mark application as ready for traffic
     app.state.ready = True
     app.state.started_at = time.time()
@@ -142,6 +174,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # -- Shutdown ------------------------------------------------
+    # Stop WebSocket subscriber if running
+    if ws_manager is not None:
+        await ws_manager.stop()
+
+    # Stop finality poller if running
+    if finality_poller is not None:
+        await finality_poller.stop()
+
     # Stop DLQ handler if running
     if dlq_handler is not None:
         await dlq_handler.stop()
@@ -236,7 +276,7 @@ def create_app() -> FastAPI:
     app.add_middleware(SlowAPIMiddleware)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=settings.cors_allowed_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -263,6 +303,7 @@ def create_app() -> FastAPI:
     app.include_router(subscriptions_router, prefix="/api/v1")
     app.include_router(events_router, prefix="/api/v1")
     app.include_router(ingest_router, prefix="/api/v1")
+    app.include_router(facilitator_router, prefix="/api/v1")
     app.include_router(stats_router, prefix="/api/v1")
 
     # ── Operational endpoints (not business logic) ─────────────

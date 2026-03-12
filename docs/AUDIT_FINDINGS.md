@@ -5,7 +5,7 @@
 | # | Issue | Details |
 |---|-------|---------|
 | 1 | **Missing `erc3009_events` table** | Goldsky pipeline sinks to this table but no migration creates it. Pipeline will fail at runtime. |
-| 2 | **Goldsky architecture mismatch** | Pipeline configured as Postgres sink, but ingest endpoint expects webhook POSTs. Either add a webhook sink config or create a polling job from erc3009_events → processor. |
+| 2 | **Goldsky architecture mismatch** | Pipeline now uses webhook sink delivering to TripWire's ingest endpoint. Verify pipeline YAML uses `type: webhook` sink config pointing to `/api/v1/ingest`. |
 | 3 | **CORS wildcard + credentials** | `allow_origins=["*"]` with `allow_credentials=True` in main.py is a security vulnerability (CSRF). Must restrict origins. |
 | 4 | **Convoy setup failures silently swallowed** | Endpoint creation returns 201 even when Convoy project/endpoint creation fails. Webhooks never work but user isn't told. endpoints.py lines 110-111. |
 | 5 | **No CI/CD** | No GitHub Actions, no automated tests on PR, no lint/type gates. |

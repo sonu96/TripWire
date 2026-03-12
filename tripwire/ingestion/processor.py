@@ -1,11 +1,21 @@
 """End-to-end ingestion pipeline orchestrator.
 
-Receives a raw Goldsky-decoded event and runs the full pipeline:
-  decode → nonce dedup → finality → identity → policy → dispatch
+Receives a raw onchain event and runs the full pipeline:
+  detect → decode → evaluate → dispatch
+
+The processor is event-type agnostic: it detects the event type from
+the raw log's topic signature and routes to the appropriate handler.
+Currently supported event types:
+  - erc3009_transfer: ERC-3009 TransferWithAuthorization payments
+
+New event types (DeFi pool state changes, whale alerts, etc.) can be
+added by implementing a new ``_process_<type>_event`` method and
+registering its topic signature(s) in ``_EVENT_SIGNATURES``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,7 +29,11 @@ from tripwire.db.repositories.events import EventRepository
 from tripwire.db.repositories.nonces import NonceRepository
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.identity.resolver import IdentityResolver
-from tripwire.ingestion.decoder import decode_transfer_event
+from tripwire.ingestion.decoder import (
+    AUTHORIZATION_USED_TOPIC,
+    TRANSFER_TOPIC,
+    decode_transfer_event,
+)
 from tripwire.ingestion.finality import check_finality
 from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.types.models import (
@@ -39,9 +53,31 @@ from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
 
+# ── Event Signature Registry ───────────────────────────────────
+# Maps known topic0 signatures to their canonical event type string.
+# To add a new event type, register its topic0 here and implement a
+# corresponding ``_process_<type>_event`` handler on EventProcessor.
+
+_EVENT_SIGNATURES: dict[str, str] = {
+    AUTHORIZATION_USED_TOPIC.lower(): "erc3009_transfer",
+    TRANSFER_TOPIC.lower(): "erc3009_transfer",
+}
+
+# ── Endpoint cache (Optimization 3) ─────────────────────────────
+# In-memory TTL cache for endpoint lookups. Endpoints change rarely
+# (only at registration time), so a 30s TTL is safe.
+_endpoint_cache: dict[str, tuple[float, list]] = {}
+ENDPOINT_CACHE_TTL = 30  # seconds
+
 
 class EventProcessor:
-    """Orchestrates the full ingestion→dispatch pipeline."""
+    """Orchestrates the full ingestion→dispatch pipeline.
+
+    The processor is generic: ``process_event`` detects the event type from
+    the raw log and delegates to the appropriate type-specific handler.
+    Generic stages (endpoint matching, policy evaluation, webhook dispatch,
+    identity enrichment) are shared across all event types.
+    """
 
     def __init__(
         self,
@@ -64,10 +100,115 @@ class EventProcessor:
         # Supabase client for subscription queries; falls back to endpoint_repo's client
         self._sb = supabase_client or getattr(endpoint_repo, "_sb", None)
 
-    async def process_event(self, raw_log: dict[str, Any]) -> dict[str, Any]:
-        """Process a single Goldsky-decoded event through the full pipeline.
+    # ── Public entry point ────────────────────────────────────────
 
-        Returns a summary dict with processing results.
+    async def process_event(self, raw_log: dict[str, Any]) -> dict[str, Any]:
+        """Process a single onchain event through the full pipeline.
+
+        Detects the event type from the raw log's topic signature, then
+        delegates to the appropriate type-specific handler.  Returns a
+        summary dict with processing results.
+        """
+        event_type = self._detect_event_type(raw_log)
+
+        if event_type == "erc3009_transfer":
+            return await self._process_erc3009_event(raw_log)
+        else:
+            logger.warning("unknown_event_type", event_type=event_type, raw_log=raw_log)
+            return {"status": "skipped", "reason": f"unknown_event_type: {event_type}"}
+
+    # ── Pre-confirmed (facilitator fast path) ────────────────────
+
+    async def process_pre_confirmed_event(
+        self, transfer: "ERC3009Transfer"
+    ) -> dict[str, Any]:
+        """Process a pre-confirmed payment from the x402 facilitator.
+
+        This is the fast path (~100ms target).  The facilitator has already
+        verified the ERC-3009 signature but the transaction is NOT yet onchain.
+        We skip decode (data is already structured) and finality (no tx yet)
+        but still run: nonce dedup, identity resolution, policy evaluation,
+        and dispatch.
+        """
+        from tripwire.types.models import ERC3009Transfer  # noqa: F811
+
+        pipeline_start = time.perf_counter()
+        timings: dict[str, float] = {}
+
+        chain_id = transfer.chain_id
+
+        structlog.contextvars.bind_contextvars(
+            tx_hash=transfer.tx_hash, chain_id=chain_id.value
+        )
+
+        logger.info(
+            "processing_pre_confirmed",
+            event_type="payment.pre_confirmed",
+            authorizer=transfer.authorizer,
+        )
+
+        # 1. Nonce deduplication
+        t0 = time.perf_counter()
+        try:
+            is_new = await asyncio.to_thread(
+                self._nonce_repo.record_nonce,
+                chain_id=chain_id.value,
+                nonce=transfer.nonce,
+                authorizer=transfer.authorizer,
+            )
+        except Exception:
+            logger.exception("nonce_dedup_failed", tx_hash=transfer.tx_hash)
+            return {"status": "error", "reason": "nonce_dedup_failed", "tx_hash": transfer.tx_hash}
+        timings["dedup_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        if not is_new:
+            logger.info("duplicate_nonce", tx_hash=transfer.tx_hash, nonce=transfer.nonce)
+            return {"status": "duplicate", "tx_hash": transfer.tx_hash}
+
+        # 2. Identity resolution (no finality check — tx not yet onchain)
+        t0 = time.perf_counter()
+        try:
+            identity = await self._resolver.resolve(
+                transfer.authorizer, chain_id.value
+            )
+        except Exception:
+            logger.warning("identity_resolve_failed", authorizer=transfer.authorizer)
+            identity = None
+        timings["identity_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        # 3. Dispatch through generic pipeline with pre_confirmed event type
+        #    finality=None signals no onchain confirmation yet.
+        return await self._dispatch_for_transfer(
+            transfer=transfer,
+            finality=None,
+            identity=identity,
+            timings=timings,
+            pipeline_start=pipeline_start,
+            event_type_override=WebhookEventType.PAYMENT_PRE_CONFIRMED,
+        )
+
+    # ── Event type detection ───────────────────────────────────────
+
+    def _detect_event_type(self, raw_log: dict[str, Any]) -> str:
+        """Identify the canonical event type from the raw log's topic0.
+
+        Checks the first topic against ``_EVENT_SIGNATURES``.  Returns a
+        human-readable event type string, or ``"unknown"`` if no match.
+        """
+        topics = raw_log.get("topics", [])
+        if not topics:
+            return "unknown"
+
+        topic0 = topics[0].lower()
+        return _EVENT_SIGNATURES.get(topic0, "unknown")
+
+    # ── ERC-3009 handler ───────────────────────────────────────────
+
+    async def _process_erc3009_event(self, raw_log: dict[str, Any]) -> dict[str, Any]:
+        """ERC-3009 TransferWithAuthorization handler.
+
+        Runs the type-specific stages (decode, nonce dedup, finality,
+        identity) and then hands off to the generic dispatch pipeline.
         """
         pipeline_start = time.perf_counter()
         timings: dict[str, float] = {}
@@ -91,13 +232,15 @@ class EventProcessor:
 
         logger.info(
             "processing_event",
+            event_type="erc3009_transfer",
             authorizer=transfer.authorizer,
         )
 
-        # 2. Nonce deduplication
+        # 2. Nonce deduplication (must run first — short-circuits on duplicates)
         t0 = time.perf_counter()
         try:
-            is_new = self._nonce_repo.record_nonce(
+            is_new = await asyncio.to_thread(
+                self._nonce_repo.record_nonce,
                 chain_id=chain_id.value,
                 nonce=transfer.nonce,
                 authorizer=transfer.authorizer,
@@ -111,38 +254,79 @@ class EventProcessor:
             logger.info("duplicate_nonce", tx_hash=tx_hash, nonce=transfer.nonce)
             return {"status": "duplicate", "tx_hash": tx_hash}
 
-        # 3. Finality check
+        # 3-4. Finality check and identity resolution
+        #       run in parallel — they have ZERO data dependencies on each other.
         t0 = time.perf_counter()
-        try:
-            finality = await check_finality(transfer)
-        except Exception:
-            logger.exception("finality_check_failed", tx_hash=tx_hash)
-            finality = None
-        timings["finality_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
-        # 4. Identity resolution
-        t0 = time.perf_counter()
-        identity = None
-        try:
-            identity = await self._resolver.resolve(
-                transfer.authorizer, chain_id.value
-            )
-        except Exception:
-            logger.warning("identity_resolve_failed", authorizer=transfer.authorizer)
-        timings["identity_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+        async def _do_finality():
+            try:
+                return await check_finality(transfer)
+            except Exception:
+                logger.exception("finality_check_failed", tx_hash=tx_hash)
+                return None
+
+        async def _do_identity():
+            try:
+                return await self._resolver.resolve(
+                    transfer.authorizer, chain_id.value
+                )
+            except Exception:
+                logger.warning("identity_resolve_failed", authorizer=transfer.authorizer)
+                return None
+
+        finality, identity = await asyncio.gather(
+            _do_finality(), _do_identity()
+        )
+        parallel_elapsed = time.perf_counter() - t0
+        timings["finality_ms"] = round(parallel_elapsed * 1000, 2)
+        timings["identity_ms"] = round(parallel_elapsed * 1000, 2)
+
+        # 5–8. Generic stages: endpoint matching → policy → dispatch
+        return await self._dispatch_for_transfer(
+            transfer=transfer,
+            finality=finality,
+            identity=identity,
+            timings=timings,
+            pipeline_start=pipeline_start,
+        )
+
+    # ── Generic dispatch pipeline (shared across event types) ──────
+
+    async def _dispatch_for_transfer(
+        self,
+        transfer,
+        finality,
+        identity,
+        timings: dict[str, float],
+        pipeline_start: float,
+        event_type_override: WebhookEventType | None = None,
+    ) -> dict[str, Any]:
+        """Run the generic stages shared across all transfer-like events.
+
+        Covers: endpoint matching, policy evaluation, event recording,
+        webhook dispatch, and realtime notification.
+
+        If *event_type_override* is provided it takes precedence over the
+        finality-based type derivation (used by the facilitator fast path).
+        """
+        tx_hash = transfer.tx_hash
 
         # 5. Match endpoints for this transfer's recipient + chain
         try:
-            endpoints = self._fetch_matching_endpoints(transfer)
+            endpoints = await asyncio.to_thread(self._fetch_matching_endpoints, transfer)
         except Exception:
+            logger.exception("endpoint_fetch_failed", tx_hash=tx_hash)
+            return {"status": "error", "reason": "endpoint_fetch_failed", "tx_hash": tx_hash}
+
+        if endpoints is None:
             logger.exception("endpoint_fetch_failed", tx_hash=tx_hash)
             return {"status": "error", "reason": "endpoint_fetch_failed", "tx_hash": tx_hash}
         if not endpoints:
             logger.info("no_matching_endpoints", tx_hash=tx_hash)
             # Still record the event even if no endpoints match
-            event_type = WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING
+            webhook_event_type = event_type_override or (WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING)
             event_id = self._record_event(
-                transfer, finality, identity, event_type=event_type
+                transfer, finality, identity, event_type=webhook_event_type
             )
             return {
                 "status": "no_endpoints",
@@ -153,9 +337,9 @@ class EventProcessor:
         matched = match_endpoints(transfer, endpoints)
         if not matched:
             logger.info("no_endpoints_matched_filters", tx_hash=tx_hash)
-            event_type = WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING
+            webhook_event_type = event_type_override or (WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING)
             event_id = self._record_event(
-                transfer, finality, identity, event_type=event_type
+                transfer, finality, identity, event_type=webhook_event_type
             )
             return {
                 "status": "no_match",
@@ -182,17 +366,19 @@ class EventProcessor:
                 )
         timings["policy_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
-        # Determine event type based on finality
-        if finality is None:
-            logger.warning("finality_unknown_defaulting_to_pending", tx_hash=tx_hash)
-        if finality and finality.is_finalized:
-            event_type = WebhookEventType.PAYMENT_CONFIRMED
+        # Determine event type based on finality (or use override)
+        if event_type_override:
+            webhook_event_type = event_type_override
+        elif finality and finality.is_finalized:
+            webhook_event_type = WebhookEventType.PAYMENT_CONFIRMED
         else:
-            event_type = WebhookEventType.PAYMENT_PENDING
+            if finality is None:
+                logger.warning("finality_unknown_defaulting_to_pending", tx_hash=tx_hash)
+            webhook_event_type = WebhookEventType.PAYMENT_PENDING
 
         # 7. Record the event (link to the first matched endpoint)
         first_endpoint_id = matched[0].id if matched else None
-        event_id = self._record_event(transfer, finality, identity, event_type, endpoint_id=first_endpoint_id)
+        event_id = self._record_event(transfer, finality, identity, webhook_event_type, endpoint_id=first_endpoint_id)
 
         # 8. Split approved endpoints by delivery mode
         execute_endpoints = [
@@ -211,7 +397,7 @@ class EventProcessor:
                     transfer=transfer,
                     matched_endpoints=execute_endpoints,
                     provider=self._webhook_provider,
-                    event_type=event_type,
+                    event_type=webhook_event_type,
                     finality=finality,
                     identity=identity,
                 )
@@ -255,7 +441,7 @@ class EventProcessor:
                 notify_event_ids = await self._realtime_notifier.notify_batch(
                     endpoints=notify_endpoints,
                     transfer=transfer,
-                    event_type=event_type,
+                    event_type=webhook_event_type,
                     finality=finality,
                     identity=identity,
                 )
@@ -291,22 +477,43 @@ class EventProcessor:
     async def process_batch(
         self, raw_logs: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Process a batch of Goldsky-decoded events."""
-        results = []
-        for raw_log in raw_logs:
-            try:
-                result = await self.process_event(raw_log)
-            except Exception:
-                logger.exception("batch_event_unexpected_failure", raw_log=raw_log)
-                result = {"status": "error", "reason": "unexpected_failure"}
-            results.append(result)
-        return results
+        """Process a batch of Goldsky-decoded events concurrently.
+
+        Uses a semaphore to bound concurrency and avoid overwhelming
+        downstream services (RPC nodes, Supabase, webhook targets).
+        """
+        sem = asyncio.Semaphore(10)
+
+        async def _bounded(raw_log: dict[str, Any]) -> dict[str, Any]:
+            async with sem:
+                try:
+                    return await self.process_event(raw_log)
+                except Exception:
+                    logger.exception("batch_event_unexpected_failure", raw_log=raw_log)
+                    return {"status": "error", "reason": "unexpected_failure"}
+
+        results = await asyncio.gather(*[_bounded(log) for log in raw_logs])
+        return list(results)
 
     # ── Internal helpers ────────────────────────────────────────
 
     def _fetch_matching_endpoints(self, transfer) -> list[Endpoint]:
-        """Fetch active endpoints whose recipient matches the transfer."""
-        return self._endpoint_repo.list_by_recipient(transfer.to_address)
+        """Fetch active endpoints whose recipient matches the transfer.
+
+        Uses an in-memory TTL cache to avoid hitting Supabase on every event.
+        Endpoints change rarely (only at registration time).
+        """
+        cache_key = transfer.to_address.lower()
+        now = time.monotonic()
+        cached = _endpoint_cache.get(cache_key)
+        if cached is not None:
+            expires_at, endpoints = cached
+            if now < expires_at:
+                return endpoints
+
+        endpoints = self._endpoint_repo.list_by_recipient(transfer.to_address)
+        _endpoint_cache[cache_key] = (now + ENDPOINT_CACHE_TTL, endpoints)
+        return endpoints
 
     def _fetch_subscriptions(self, endpoint_id: str) -> list[Subscription]:
         """Fetch active subscriptions for a given endpoint."""

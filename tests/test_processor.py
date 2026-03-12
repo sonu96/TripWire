@@ -35,6 +35,7 @@ def _raw_log() -> dict:
         "block_timestamp": 1700000000,
         "address": USDC_BASE,
         "chain_id": 8453,
+        "topics": ["0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5"],
         "decoded": {
             "authorizer": SENDER,
             "nonce": NONCE_HEX,
@@ -136,7 +137,7 @@ async def test_process_event_duplicate():
 @pytest.mark.asyncio
 async def test_process_event_decode_failure():
     processor = _make_processor()
-    bad_log: dict[str, Any] = {"garbage": True}
+    bad_log: dict[str, Any] = {"garbage": True, "topics": ["0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5"]}
     result = await processor.process_event(bad_log)
     assert result["status"] == "error"
     assert result["reason"] == "decode_failed"
@@ -183,6 +184,9 @@ async def test_nonce_dedup_failure_returns_error():
 @pytest.mark.asyncio
 async def test_endpoint_fetch_failure_returns_error():
     """Issue #10: endpoint fetch exception returns proper error dict."""
+    from tripwire.ingestion.processor import _endpoint_cache
+    _endpoint_cache.clear()
+
     processor = _make_processor()
     processor._endpoint_repo.list_by_recipient = MagicMock(
         side_effect=RuntimeError("db down")

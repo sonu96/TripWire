@@ -283,6 +283,7 @@ def _raw_log(
         "block_timestamp": 1700000000,
         "address": USDC_BASE,
         "chain_id": chain_id,
+        "topics": ["0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5"],
         "decoded": {
             "authorizer": sender,
             "nonce": nonce,
@@ -296,6 +297,15 @@ def _raw_log(
 
 
 # ── Tests ────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clear_endpoint_cache():
+    """Clear the module-level endpoint cache between tests to prevent pollution."""
+    from tripwire.ingestion.processor import _endpoint_cache
+    _endpoint_cache.clear()
+    yield
+    _endpoint_cache.clear()
 
 
 @pytest.mark.asyncio

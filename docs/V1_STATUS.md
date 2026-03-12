@@ -81,7 +81,7 @@ TripWire v1 is the complete x402 execution middleware — the infrastructure lay
 
 ### Pre-Launch (before first user)
 - [ ] **Run migrations on Supabase** — Execute 001-007 against production database
-- [ ] **Configure Goldsky pipeline** — Deploy the Mirror/Turbo pipeline config to stream USDC events into Supabase
+- [ ] **Configure Goldsky pipeline** — Deploy the Turbo pipeline config with webhook sink to deliver USDC events to TripWire's ingest endpoint
 - [ ] **Set production env vars** — SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, CONVOY_API_KEY, GOLDSKY_WEBHOOK_SECRET, RPC URLs
 - [ ] **Deploy to Railway** — Push Docker image, configure health check (`/ready`), set env vars
 - [ ] **Verify Convoy webhook delivery** — End-to-end test with a real endpoint receiving webhooks
@@ -104,7 +104,7 @@ TripWire v1 is the complete x402 execution middleware — the infrastructure lay
 ```
 L0  Chain          Base / Ethereum / Arbitrum (ERC-3009 transfers)
                             |
-L1  Indexing        Goldsky Mirror/Turbo → Supabase PostgreSQL
+L1  Indexing        Goldsky Turbo → Webhook POST to TripWire /ingest
                             |
 L2  Middleware       TripWire FastAPI
                      ├── Decode (ERC-3009)
@@ -150,7 +150,7 @@ tripwire/
 ├── ingestion/
 │   ├── decoder.py             # ERC-3009 event decoding
 │   ├── finality.py            # Block confirmation tracking
-│   ├── pipeline.py            # Goldsky Mirror config
+│   ├── pipeline.py            # Goldsky Turbo config
 │   └── processor.py           # Pipeline orchestrator
 ├── notify/
 │   └── realtime.py            # Supabase Realtime notifier
@@ -191,7 +191,7 @@ tests/                         # 67 tests
 | API | FastAPI + Uvicorn | HTTP framework |
 | Database | Supabase (PostgreSQL) | Managed DB + Auth + Realtime |
 | Webhooks | Convoy self-hosted | Delivery, retries, HMAC, DLQ |
-| Indexing | Goldsky Mirror/Turbo | Blockchain → Supabase streaming |
+| Indexing | Goldsky Turbo (webhook sink) | Blockchain → TripWire via webhooks |
 | RPC | httpx | Raw JSON-RPC to chains |
 | ABI | eth-abi | ERC-3009 event decoding |
 | Validation | Pydantic v2 | Input/output models |

@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">⚡ TripWire</h1>
-  <p align="center"><strong>x402 Execution Middleware</strong></p>
-  <p align="center">The infrastructure layer between onchain micropayments and application execution.<br/>Stripe Webhooks for the x402 protocol.</p>
+  <p align="center"><strong>Programmable Onchain Event Triggers for AI Agents</strong></p>
+  <p align="center">The infrastructure layer between onchain events and application execution.<br/>x402 payment webhooks are the first use case -- but any onchain event can trigger your workflows.</p>
 </p>
 
 <p align="center">
@@ -20,6 +20,8 @@ When a user pays for an API call via the [x402 protocol](https://www.x402.org/),
 
 Think of it as **Stripe Webhooks for crypto-native micropayments**: you register an endpoint, TripWire watches for payments to your address, and you get a verified `payment.confirmed` webhook with everything you need to execute.
 
+x402 payments are the first use case, but TripWire is designed as a **programmable onchain event trigger platform** -- any onchain event can be mapped to a webhook, policy-filtered, and delivered to your application or AI agent.
+
 ---
 
 ## ✨ Key Features
@@ -27,7 +29,7 @@ Think of it as **Stripe Webhooks for crypto-native micropayments**: you register
 - **Two Delivery Modes** -- *Notify* (Supabase Realtime push for lightweight listeners) and *Execute* (Convoy + direct httpx fast path with retries, HMAC signing, and dead-letter queue)
 - **Self-Hosted Webhook Delivery (Convoy + direct POST)** -- One API call gives you exponential-backoff retries, HMAC signature verification, delivery logs, and a DLQ -- fully self-hosted, no vendor lock-in
 - **ERC-8004 Agent Identity** -- Resolve onchain AI agent identities (agent class, deployer, capabilities, reputation score) and enrich every webhook payload
-- **Goldsky Indexing** -- Goldsky Mirror/Turbo streams ERC-3009 events directly into Supabase in real time -- no subgraph, no polling
+- **Goldsky Indexing** -- Goldsky Turbo streams ERC-3009 events via webhook directly to TripWire's ingest endpoint in real time -- no subgraph, no polling
 - **Policy Engine** -- Filter payments by min/max amount, sender allowlists/blocklists, required agent class, minimum reputation score, and custom finality depth
 - **Python SDK** -- Async client with full type safety, endpoint registration, subscription management, and webhook signature verification
 - **Multi-Chain** -- Base, Ethereum, and Arbitrum out of the box, with per-chain finality tracking
@@ -43,11 +45,11 @@ flowchart LR
     end
 
     subgraph L1["L1 -- Indexing"]
-        B[Goldsky Mirror/Turbo]
+        B[Goldsky Turbo<br/>Webhook Sink]
     end
 
     subgraph L2["L2 -- Middleware"]
-        C[TripWire FastAPI]
+        C[TripWire FastAPI<br/>Ingest Endpoint]
         C1[Verification & Dedup]
         C2[ERC-8004 Identity]
         C3[Policy Engine]
@@ -65,12 +67,12 @@ flowchart LR
     end
 
     A -- "ERC-3009 events" --> B
-    B -- "Stream into Supabase" --> C
+    B -- "Webhook POST to /ingest" --> C
     C3 -- "Dispatch webhook" --> D
     D1 -- "Signed POST" --> E
 ```
 
-**The flow**: An ERC-3009 `transferWithAuthorization` settles onchain (L0). Goldsky indexes it in real time and pipes the event into Supabase (L1). TripWire picks it up, verifies the transfer, deduplicates by nonce, resolves the payer's ERC-8004 identity, and evaluates policies (L2). If the payment passes, TripWire dispatches a signed webhook via Convoy self-hosted (L3), which handles retries and HMAC signing. The developer's application receives a `payment.confirmed` POST and executes business logic (L4).
+**The flow**: An ERC-3009 `transferWithAuthorization` settles onchain (L0). Goldsky Turbo indexes it in real time and delivers the event via webhook to TripWire's ingest endpoint (L1). TripWire verifies the transfer, deduplicates by nonce, resolves the payer's ERC-8004 identity, and evaluates policies (L2). If the payment passes, TripWire dispatches a signed webhook via Convoy self-hosted (L3), which handles retries and HMAC signing. The developer's application receives a `payment.confirmed` POST and executes business logic (L4).
 
 ---
 
@@ -291,7 +293,7 @@ All configuration is via environment variables (loaded from `.env`):
 | API Framework | FastAPI + Uvicorn | High performance async, auto-generated OpenAPI docs |
 | Database | Supabase (PostgreSQL) | Managed Postgres + Realtime subscriptions for Notify mode |
 | Webhook Delivery | Convoy self-hosted | Self-hosted retries, HMAC signing, DLQ -- full control, no vendor lock-in |
-| Chain Indexing | Goldsky Mirror/Turbo | Real-time event streaming, no subgraph maintenance |
+| Chain Indexing | Goldsky Turbo (webhook sink) | Real-time event streaming via webhooks, no subgraph maintenance |
 | Blockchain RPC | httpx | Lightweight raw JSON-RPC calls -- no web3.py dependency |
 | ABI Decoding | eth-abi | Minimal decoder for ERC-3009 event data |
 | Validation | Pydantic v2 | Runtime type safety for all inputs and outputs |
@@ -398,5 +400,5 @@ Proprietary. All Rights Reserved. See [LICENSE](LICENSE) for details.
 ---
 
 <p align="center">
-  Built for the x402 ecosystem. Payments settle onchain. TripWire makes them actionable.
+  Built for the agentic web. Events happen onchain. TripWire makes them actionable.
 </p>

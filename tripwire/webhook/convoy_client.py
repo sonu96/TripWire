@@ -77,11 +77,21 @@ def _build_signature(secret: str, timestamp: int, payload_json: str) -> str:
     return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
 
 
-def _signature_header(secret: str, payload_json: str) -> dict[str, str]:
-    """Build the ``X-TripWire-Signature`` header dict for a direct delivery."""
+def _signature_headers(secret: str, payload_json: str, message_id: str) -> dict[str, str]:
+    """Build the TripWire signature headers for a direct delivery.
+
+    Returns a dict with all three headers expected by verify.py:
+    - ``X-TripWire-Signature`` : ``t={ts},v1={hmac_hex}``
+    - ``X-TripWire-ID``        : unique message/event ID
+    - ``X-TripWire-Timestamp`` : unix timestamp (same value as in signature)
+    """
     ts = int(time.time())
     sig = _build_signature(secret, ts, payload_json)
-    return {"X-TripWire-Signature": f"t={ts},v1={sig}"}
+    return {
+        "X-TripWire-Signature": f"t={ts},v1={sig}",
+        "X-TripWire-ID": message_id,
+        "X-TripWire-Timestamp": str(ts),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -213,13 +223,19 @@ async def direct_deliver(url: str, payload: dict, secret: str) -> bool:
     posts with a 5-second timeout.  Returns ``True`` on any 2xx response,
     ``False`` otherwise.  Convoy handles retries when this returns ``False``.
     """
+    import uuid as _uuid
+
     client = _get_direct_client()
     payload_json = json.dumps(payload, separators=(",", ":"))
-    sig_headers = _signature_header(secret, payload_json)
+
+    # Use idempotency_key as the message ID when available, otherwise generate one
+    idem_key = payload.get("idempotency_key")
+    message_id = idem_key or str(_uuid.uuid4())
+
+    sig_headers = _signature_headers(secret, payload_json, message_id)
 
     # Include Idempotency-Key header when present in the payload
     extra_headers: dict[str, str] = {}
-    idem_key = payload.get("idempotency_key")
     if idem_key:
         extra_headers["Idempotency-Key"] = idem_key
 

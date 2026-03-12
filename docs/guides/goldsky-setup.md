@@ -1,6 +1,6 @@
 # Goldsky Pipeline Setup
 
-Goldsky Mirror streams raw ERC-3009 `AuthorizationUsed` events from Base, Ethereum, and Arbitrum directly into your Supabase PostgreSQL database. TripWire then reads from those tables to verify, enrich, and dispatch webhooks.
+Goldsky Turbo streams raw ERC-3009 `AuthorizationUsed` events from Base, Ethereum, and Arbitrum and delivers them via webhook directly to TripWire's ingest endpoint. TripWire then verifies, enriches, and dispatches webhooks to your application.
 
 ## Prerequisites
 
@@ -26,15 +26,15 @@ Authenticate:
 goldsky login
 ```
 
-## 2. Configure Your Supabase Secret
+## 2. Configure Your Webhook Secret
 
-Goldsky needs a PostgreSQL connection string to write into Supabase. Add it as a Goldsky secret:
+Goldsky needs a webhook URL and signing secret to deliver events to TripWire. Add the signing secret as a Goldsky secret:
 
 ```bash
-goldsky secret create SUPABASE_SECRET --value "postgresql://postgres.<ref>:<password>@db.<ref>.supabase.co:5432/postgres"
+goldsky secret create TRIPWIRE_WEBHOOK_SECRET --value "your_hmac_signing_secret"
 ```
 
-Find your connection string in Supabase under **Settings > Database > Connection string > URI**. Use the direct connection (port 5432), not the pooler.
+Your TripWire ingest endpoint URL will be `https://your-tripwire-host/api/v1/ingest`. The signing secret must match the `GOLDSKY_WEBHOOK_SECRET` configured in TripWire's environment.
 
 ## 3. Understand the Pipeline Config
 
@@ -83,15 +83,14 @@ transforms:
 
 ```yaml
 sinks:
-  supabase_sink:
-    type: postgres
-    table: erc3009_events
-    schema: public
-    secret_name: SUPABASE_SECRET
+  tripwire_webhook:
+    type: webhook
+    url: https://your-tripwire-host/api/v1/ingest
+    secret_name: TRIPWIRE_WEBHOOK_SECRET
     from: erc3009_decoded
 ```
 
-Decoded events are written to the `erc3009_events` table in your Supabase database. Goldsky handles reorg detection automatically.
+Decoded events are delivered via webhook POST to TripWire's ingest endpoint. Goldsky handles reorg detection automatically.
 
 ## 4. Generate Pipeline Config
 
@@ -121,13 +120,13 @@ Deploy one pipeline per chain:
 
 ```bash
 # Base (chain ID 8453)
-goldsky pipeline apply pipeline-base.yaml
+goldsky turbo apply pipeline-base.yaml
 
 # Ethereum (chain ID 1)
-goldsky pipeline apply pipeline-ethereum.yaml
+goldsky turbo apply pipeline-ethereum.yaml
 
 # Arbitrum (chain ID 42161)
-goldsky pipeline apply pipeline-arbitrum.yaml
+goldsky turbo apply pipeline-arbitrum.yaml
 ```
 
 Or deploy programmatically:
@@ -184,23 +183,20 @@ goldsky pipeline delete tripwire-base-erc3009
 
 ### Pipeline stuck in STARTING state
 
-This usually means the Supabase secret is invalid or the target table does not exist. Verify:
+This usually means the webhook secret is invalid or the TripWire ingest endpoint is unreachable. Verify:
 
-1. The `erc3009_events` table exists in your Supabase database.
-2. The connection string in `SUPABASE_SECRET` is correct (direct connection, not pooler).
-3. Your Supabase project is not paused.
+1. Your TripWire server is running and the `/api/v1/ingest` endpoint is accessible from the internet.
+2. The `TRIPWIRE_WEBHOOK_SECRET` in Goldsky matches the `GOLDSKY_WEBHOOK_SECRET` in TripWire's environment.
+3. Your TripWire host has a valid TLS certificate (Goldsky requires HTTPS for webhook delivery).
 
-### No events appearing in database
+### No events appearing in TripWire
 
 - Confirm the USDC contract address is correct and lowercased.
 - Check that `topic0` matches `AuthorizationUsed`. The hash is: `0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5`.
 - Verify the pipeline is in ACTIVE status.
+- Check TripWire server logs for incoming webhook requests from Goldsky.
 - Note: ERC-3009 `AuthorizationUsed` events only fire for `transferWithAuthorization` calls. If there are no x402 payments happening on that chain, there will be no events.
 
 ### Reorg handling
 
-Goldsky automatically detects chain reorgs and updates the sink accordingly. No TripWire-side configuration is needed. TripWire's finality tracking layer provides an additional safety check before dispatching webhooks.
-
-### Rate limits on Supabase
-
-If you see write errors, check your Supabase plan's connection limits. The free tier allows up to 60 connections. Goldsky typically uses 1-2 connections per pipeline.
+Goldsky automatically detects chain reorgs and delivers corrected events via webhook. TripWire's finality tracking layer provides an additional safety check before dispatching webhooks to your application.

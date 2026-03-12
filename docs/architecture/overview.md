@@ -2,9 +2,11 @@
 
 > "Stripe Webhooks for x402" -- the infrastructure layer between onchain micropayments and application execution.
 
-TripWire is an event-driven middleware that watches ERC-3009 `transferWithAuthorization` payments on EVM chains, verifies finality, resolves onchain AI agent identities via ERC-8004, evaluates developer-defined policies, and delivers structured webhook payloads through Convoy self-hosted.
+TripWire is a programmable onchain event trigger platform that watches ERC-3009 `transferWithAuthorization` payments on EVM chains, verifies finality, resolves onchain AI agent identities via ERC-8004, evaluates developer-defined policies, and delivers structured webhook payloads through Convoy self-hosted. x402 payments are the first use case, with the architecture designed to support arbitrary onchain event types.
 
 ---
+
+> **See also:** [ARCHITECTURE_DETAILED.md](./ARCHITECTURE_DETAILED.md) for the full hybrid architecture with latency maps, real-world examples (x402 payments, Aerodrome APR alerts, whale alerts), and the complete event trigger platform vision.
 
 ## Table of Contents
 
@@ -35,8 +37,7 @@ graph TB
     end
 
     subgraph L1["L1 -- Indexing Layer"]
-        GS["Goldsky Mirror/Turbo"]
-        SB_SINK["Supabase PostgreSQL<br/>(erc3009_events table)"]
+        GS["Goldsky Turbo<br/>(webhook sink)"]
     end
 
     subgraph L2["L2 -- TripWire Middleware"]
@@ -64,8 +65,7 @@ graph TB
     ETH --> GS
     BASE --> GS
     ARB --> GS
-    GS -->|"SQL transform + _gs_log_decode"| SB_SINK
-    SB_SINK --> API
+    GS -->|"SQL transform + _gs_log_decode + webhook POST"| API
     API --> DECODE
     DECODE --> DEDUP
     DEDUP --> FINALITY
@@ -77,7 +77,7 @@ graph TB
     CONVOY --> HMAC
     CONVOY --> DLQ
     CONVOY --> DEV_EXEC
-    SB_SINK -.->|"Supabase Realtime"| DEV_NOTIFY
+    DISPATCH -.->|"Supabase Realtime"| DEV_NOTIFY
 ```
 
 ### Technology Stack
@@ -87,7 +87,7 @@ graph TB
 | Runtime | Python 3.11+ | Async-first application runtime |
 | API Framework | FastAPI + Uvicorn | HTTP API server |
 | Database | Supabase (managed PostgreSQL) | Event storage, endpoint registry, nonce dedup |
-| Blockchain Indexing | Goldsky Mirror/Turbo | Stream raw logs from chains into Supabase |
+| Blockchain Indexing | Goldsky Turbo (webhook sink) | Stream raw logs from chains to TripWire via webhooks |
 | Webhook Delivery | Convoy self-hosted | Retries, HMAC signing, DLQ |
 | Blockchain RPC | httpx (raw JSON-RPC) | Finality checks, identity resolution |
 | ABI Decoding | eth-abi | Decode ERC-3009 event data |
@@ -116,7 +116,7 @@ When `transferWithAuthorization` is called on a USDC contract, two events are em
 
 ### L1 -- Goldsky Indexing Layer
 
-Goldsky Mirror/Turbo reads raw logs from each chain, applies a SQL transform that filters for `AuthorizationUsed` events on USDC contracts, decodes them using `_gs_log_decode()`, and sinks the decoded rows directly into Supabase PostgreSQL. This is a fully managed pipeline -- no TripWire server processes are involved in indexing.
+Goldsky Turbo reads raw logs from each chain, applies a SQL transform that filters for `AuthorizationUsed` events on USDC contracts, decodes them using `_gs_log_decode()`, and delivers the decoded events via webhook POST to TripWire's `/api/v1/ingest` endpoint. This is a fully managed pipeline -- Goldsky handles all chain indexing and delivers events directly to TripWire.
 
 ### L2 -- TripWire Middleware Layer
 
@@ -154,8 +154,7 @@ The complete journey of an x402 payment from chain settlement to developer deliv
 ```mermaid
 sequenceDiagram
     participant Chain as L0: EVM Chain
-    participant GS as L1: Goldsky
-    participant SB as Supabase
+    participant GS as L1: Goldsky Turbo
     participant TW as L2: TripWire
     participant Convoy as L3: Convoy
     participant Dev as L4: Developer App
@@ -166,11 +165,7 @@ sequenceDiagram
     GS->>Chain: Streams raw_logs dataset
     GS->>GS: SQL transform filters USDC + AuthorizationUsed topic
     GS->>GS: _gs_log_decode() extracts authorizer + nonce
-    GS->>SB: Sink decoded rows into erc3009_events table
-
-    SB-->>Dev: (Notify Mode) Supabase Realtime push
-
-    SB->>TW: TripWire reads new events
+    GS->>TW: Webhook POST decoded events to /api/v1/ingest
     TW->>TW: Decode ERC-3009 (combine Transfer + AuthorizationUsed)
     TW->>TW: Nonce deduplication (INSERT into nonces table)
 
@@ -202,9 +197,9 @@ sequenceDiagram
 ### Step-by-Step
 
 1. **Payment on chain**: A payer calls `transferWithAuthorization()` on a USDC contract. The transaction emits both a `Transfer` event and an `AuthorizationUsed` event.
-2. **Goldsky detects**: Goldsky's Mirror/Turbo pipeline streams `raw_logs` from the chain. A SQL transform filters for logs where `address = USDC_CONTRACT` and `topic0 = keccak256("AuthorizationUsed(address,bytes32)")`, then decodes the log using `_gs_log_decode()`.
-3. **Supabase stores**: Decoded rows are sunk into the `erc3009_events` table in Supabase PostgreSQL.
-4. **TripWire processes**: The middleware reads new events, decodes the full ERC-3009 transfer (correlating `Transfer` and `AuthorizationUsed` logs), and attempts nonce deduplication.
+2. **Goldsky detects**: Goldsky Turbo streams `raw_logs` from the chain. A SQL transform filters for logs where `address = USDC_CONTRACT` and `topic0 = keccak256("AuthorizationUsed(address,bytes32)")`, then decodes the log using `_gs_log_decode()`.
+3. **Goldsky delivers**: Decoded events are delivered via webhook POST to TripWire's `/api/v1/ingest` endpoint.
+4. **TripWire processes**: The middleware receives the events, decodes the full ERC-3009 transfer (correlating `Transfer` and `AuthorizationUsed` logs), and attempts nonce deduplication.
 5. **Finality check**: TripWire queries `eth_blockNumber` via JSON-RPC and computes confirmations. If below the required depth for the chain, the event is marked `payment.pending`; otherwise `payment.confirmed`.
 6. **Identity enrichment**: The sender's address is resolved against the ERC-8004 IdentityRegistry contract to retrieve agent class, capabilities, deployer, and reputation score.
 7. **Policy evaluation**: The transfer is checked against the endpoint's policies (amount bounds, sender allowlist/blocklist, required agent class, minimum reputation score).
@@ -215,11 +210,11 @@ sequenceDiagram
 
 ## Goldsky Pipeline
 
-Goldsky Mirror/Turbo is a managed blockchain indexing service that streams onchain data into external sinks. TripWire uses it to pipe ERC-3009 events from multiple chains into Supabase without running any indexing infrastructure.
+Goldsky Turbo is a managed blockchain indexing service that streams onchain data to external sinks including webhooks. TripWire uses it to receive ERC-3009 events from multiple chains via webhook without running any indexing infrastructure.
 
 ### Pipeline Configuration
 
-Each chain gets its own pipeline, generated programmatically by `tripwire/ingestion/pipeline.py`. The configuration follows the Goldsky Mirror YAML specification:
+Each chain gets its own pipeline, generated programmatically by `tripwire/ingestion/pipeline.py`. The configuration follows the Goldsky Turbo YAML specification:
 
 ```mermaid
 graph LR
@@ -230,9 +225,9 @@ graph LR
         SQL["SQL Transform<br/>Filter: USDC address + AuthorizationUsed topic<br/>Decode: _gs_log_decode()"]
     end
     subgraph Sink
-        PG["Supabase PostgreSQL<br/>Table: erc3009_events<br/>Schema: public"]
+        WH["Webhook POST<br/>TripWire /api/v1/ingest"]
     end
-    DS --> SQL --> PG
+    DS --> SQL --> WH
 ```
 
 #### Generated YAML Structure
@@ -257,20 +252,19 @@ transforms:
       WHERE address = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
         AND topic0 = '0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5'
 sinks:
-  supabase_sink:
-    type: postgres
-    table: erc3009_events
-    schema: public
-    secret_name: SUPABASE_SECRET
+  tripwire_webhook:
+    type: webhook
+    url: https://your-tripwire-host/api/v1/ingest
+    secret_name: TRIPWIRE_WEBHOOK_SECRET
     from: erc3009_decoded
 ```
 
 ### Key Design Decisions
 
-- **Filter at the source**: The SQL transform filters by USDC contract address and `AuthorizationUsed` topic0 hash *before* sinking, so only ERC-3009 events reach Supabase. This avoids storing millions of irrelevant Transfer logs.
+- **Filter at the source**: The SQL transform filters by USDC contract address and `AuthorizationUsed` topic0 hash *before* delivering via webhook, so only ERC-3009 events reach TripWire. This avoids processing millions of irrelevant Transfer logs.
 - **`_gs_log_decode()`**: Goldsky's built-in ABI decoder extracts `authorizer` and `nonce` from the raw `topics` and `data` fields inline in the SQL transform.
 - **One pipeline per chain**: Each supported chain (Ethereum, Base, Arbitrum) gets a separate pipeline (`tripwire-ethereum-erc3009`, `tripwire-base-erc3009`, `tripwire-arbitrum-erc3009`) with its own dataset source.
-- **Reorg handling**: Goldsky Mirror has built-in reorg detection. When a chain reorganization occurs, Goldsky replays the affected blocks and updates the sink accordingly. The `block_hash` field in the events table allows TripWire to detect and handle reorged events (emitting `payment.reorged` events).
+- **Reorg handling**: Goldsky Turbo has built-in reorg detection. When a chain reorganization occurs, Goldsky replays the affected blocks and delivers corrected events via webhook. The `block_hash` field in the events table allows TripWire to detect and handle reorged events (emitting `payment.reorged` events).
 
 ### Pipeline Lifecycle
 
@@ -278,7 +272,7 @@ The `pipeline.py` module provides CLI wrappers for the `goldsky` CLI:
 
 | Function | Command | Purpose |
 |----------|---------|---------|
-| `deploy_pipeline(chain_id)` | `goldsky pipeline apply <config.yaml>` | Deploy a new pipeline |
+| `deploy_pipeline(chain_id)` | `goldsky turbo apply <config.yaml>` | Deploy a new pipeline |
 | `get_pipeline_status(chain_id)` | `goldsky pipeline status <name>` | Check pipeline health |
 | `stop_pipeline(chain_id)` | `goldsky pipeline stop <name>` | Pause indexing |
 | `start_pipeline(chain_id)` | `goldsky pipeline start <name>` | Resume indexing |

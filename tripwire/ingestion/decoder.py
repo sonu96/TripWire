@@ -173,6 +173,13 @@ def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
         - address: USDC contract (if present)
         - chain_id: chain id (int)
     """
+    # Normalize Goldsky field names: _gs_log_decode produces "from"/"to" keys
+    # but downstream code expects "from_address"/"to_address"
+    if "from" in raw_log and "from_address" not in raw_log:
+        raw_log["from_address"] = raw_log["from"]
+    if "to" in raw_log and "to_address" not in raw_log:
+        raw_log["to_address"] = raw_log["to"]
+
     decoded = raw_log.get("decoded", {})
     transfer = raw_log.get("transfer", {})
     contract = raw_log.get("address", "").lower()

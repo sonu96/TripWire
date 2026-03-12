@@ -33,7 +33,7 @@ This creates the `endpoints`, `subscriptions`, `events`, `nonces`, `webhook_deli
 
 Follow the [Goldsky Setup Guide](./goldsky-setup.md) to deploy indexing pipelines for each chain you want to support.
 
-**Free tier includes**: Mirror pipelines with real-time streaming.
+**Free tier includes**: Turbo pipelines with real-time webhook streaming.
 
 ## Environment Variables
 
@@ -214,7 +214,7 @@ Starting from zero:
 |---|---|---|
 | **Supabase** | 500 MB database, 50k MAU | Pro: $25/mo (8 GB, 200 connections) |
 | **Convoy** | Self-hosted (no limits) | Infrastructure cost only |
-| **Goldsky** | Mirror pipelines | Growth: usage-based |
+| **Goldsky** | Turbo pipelines | Growth: usage-based |
 | **Hosting** | Railway free trial / Fly free tier | ~$5-10/mo for a small instance |
 | **Total** | **$0 to start** | **~$30-110/mo at scale** |
 

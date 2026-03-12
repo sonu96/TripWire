@@ -1,4 +1,4 @@
-"""Goldsky Mirror pipeline configuration for ERC-3009 event ingestion.
+"""Goldsky Turbo pipeline configuration for ERC-3009 event ingestion.
 
 ERC-3009's transferWithAuthorization is a *function*, not an event. The actual
 events emitted on-chain are:
@@ -7,7 +7,7 @@ events emitted on-chain are:
 
 We filter for AuthorizationUsed on USDC contracts to specifically track
 x402/ERC-3009 payments (vs regular transfers). The Goldsky pipeline uses a
-SQL transform to decode the logs and sinks decoded rows into Supabase.
+SQL transform to decode the logs and delivers decoded rows via webhook.
 """
 
 import subprocess
@@ -51,12 +51,12 @@ _DATASET_NAMES: dict[ChainId, str] = {
 
 
 def build_pipeline_config(chain_id: ChainId) -> dict:
-    """Build a Goldsky Mirror pipeline config for a given chain.
+    """Build a Goldsky Turbo pipeline config for a given chain.
 
     The pipeline uses the Goldsky dataset source (raw_logs) with a SQL
     transform that filters for AuthorizationUsed events on the USDC contract
-    and decodes them via _gs_log_decode. Results are sunk into Supabase
-    PostgreSQL with built-in reorg handling.
+    and decodes them via _gs_log_decode. Results are delivered via webhook
+    to the TripWire ingestion endpoint.
     """
     chain_name = CHAIN_NAMES[chain_id]
     usdc_address = USDC_CONTRACTS[chain_id].lower()
@@ -75,7 +75,10 @@ def build_pipeline_config(chain_id: ChainId) -> dict:
         f"auth.log_index, "
         f"auth.block_timestamp, "
         f"auth.address, "
+        f"{chain_id.value} AS chain_id, "
         f"_gs_log_decode('{_AUTHORIZATION_USED_ABI}', auth.topics, auth.data) AS decoded, "
+        f"_gs_log_decode('{_TRANSFER_ABI}', xfer.topics, xfer.data).\"from\" AS from_address, "
+        f"_gs_log_decode('{_TRANSFER_ABI}', xfer.topics, xfer.data).to AS to_address, "
         f"_gs_log_decode('{_TRANSFER_ABI}', xfer.topics, xfer.data) AS transfer "
         f"FROM {chain_name}_logs AS auth "
         f"INNER JOIN {chain_name}_logs AS xfer "
@@ -103,12 +106,15 @@ def build_pipeline_config(chain_id: ChainId) -> dict:
             }
         },
         "sinks": {
-            "supabase_sink": {
-                "type": "postgres",
-                "table": "erc3009_events",
-                "schema": "public",
-                "secret_name": "SUPABASE_SECRET",
+            "tripwire_webhook": {
+                "type": "webhook",
                 "from": "erc3009_decoded",
+                "url": f"{settings.app_base_url}/api/v1/ingest/goldsky",
+                "one_row_per_request": True,
+                "headers": {
+                    "Authorization": f"Bearer {settings.goldsky_webhook_secret}",
+                    "Content-Type": "application/json",
+                },
             }
         },
     }
@@ -155,7 +161,7 @@ def deploy_pipeline(chain_id: ChainId) -> str:
         config_path = f.name
 
     try:
-        result = _run_goldsky(["pipeline", "apply", config_path])
+        result = _run_goldsky(["turbo", "apply", config_path])
         if result.returncode != 0:
             logger.error(
                 "goldsky_deploy_failed",
@@ -173,7 +179,7 @@ def get_pipeline_status(chain_id: ChainId) -> str:
     """Get the status of a deployed pipeline."""
     chain_name = CHAIN_NAMES[chain_id]
     pipeline_name = f"tripwire-{chain_name}-erc3009"
-    result = _run_goldsky(["pipeline", "status", pipeline_name])
+    result = _run_goldsky(["turbo", "status", pipeline_name])
     return result.stdout if result.returncode == 0 else result.stderr
 
 
@@ -181,7 +187,7 @@ def stop_pipeline(chain_id: ChainId) -> str:
     """Stop a deployed pipeline."""
     chain_name = CHAIN_NAMES[chain_id]
     pipeline_name = f"tripwire-{chain_name}-erc3009"
-    result = _run_goldsky(["pipeline", "stop", pipeline_name])
+    result = _run_goldsky(["turbo", "stop", pipeline_name])
     if result.returncode != 0:
         logger.error("goldsky_stop_failed", chain=chain_name, stderr=result.stderr)
         raise RuntimeError(f"Goldsky stop failed: {result.stderr}")
@@ -193,7 +199,7 @@ def start_pipeline(chain_id: ChainId) -> str:
     """Start an existing (stopped) pipeline."""
     chain_name = CHAIN_NAMES[chain_id]
     pipeline_name = f"tripwire-{chain_name}-erc3009"
-    result = _run_goldsky(["pipeline", "start", pipeline_name])
+    result = _run_goldsky(["turbo", "start", pipeline_name])
     if result.returncode != 0:
         logger.error("goldsky_start_failed", chain=chain_name, stderr=result.stderr)
         raise RuntimeError(f"Goldsky start failed: {result.stderr}")

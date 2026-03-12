@@ -1,10 +1,12 @@
-# TripWire — Stripe Webhooks for x402
+# TripWire — Programmable Onchain Event Triggers for AI Agents
 
 ## Vision
 
 The agentic web is no longer a whiteboard sketch. AI agents are live on mainnet, transacting autonomously, settling payments in USDC over HTTP. The protocol powering those transactions is **x402** -- an HTTP-native micropayment standard that turns a `402 Payment Required` response into a gasless, authorized onchain transfer.
 
 x402 provides the rails. **TripWire provides the infrastructure.**
+
+x402 payment webhooks are the first use case, but TripWire is built as a **programmable onchain event trigger platform**. Any onchain event -- token transfers, contract interactions, governance votes, NFT mints -- can be mapped to a webhook, filtered through policies, and delivered to your application or AI agent. The same verification, identity enrichment, and delivery pipeline applies to any event type.
 
 Every API developer accepting x402 payments today faces the same problem: the payment settles onchain, but the application logic lives offchain. Between those two worlds sits a gap -- a gap filled with chain watchers, finality checks, replay protection, identity lookups, webhook delivery, and audit logging. Six distinct pieces of infrastructure that have nothing to do with your product.
 
@@ -57,7 +59,7 @@ async with TripwireClient(api_key="tw_...") as client:
 
 Register an endpoint. Define a policy. Receive verified, enriched payloads. Execute your business logic. That's it.
 
-TripWire handles the chain watching (Goldsky), the finality tracking (per-chain confirmation depths), the replay protection (nonce deduplication), the identity resolution (ERC-8004), the webhook delivery (Convoy self-hosted + direct httpx fast path), and the audit logging (Supabase) -- so you never have to.
+TripWire handles the chain watching (Goldsky Turbo via webhooks), the finality tracking (per-chain confirmation depths), the replay protection (nonce deduplication), the identity resolution (ERC-8004), the webhook delivery (Convoy self-hosted + direct httpx fast path), and the audit logging (Supabase) -- so you never have to.
 
 ---
 
@@ -223,7 +225,7 @@ Break-even lands at roughly **98,500 events per month** -- approximately 330 act
 ### Phase 1 -- Foundation (Current)
 
 Core infrastructure for x402 payment event processing:
-- Goldsky-powered chain indexing for ERC-3009 events on Base, Ethereum, and Arbitrum
+- Goldsky Turbo-powered chain indexing for ERC-3009 events on Base, Ethereum, and Arbitrum (webhook delivery to TripWire ingest endpoint)
 - Finality tracking with per-chain confirmation depths
 - Nonce-based replay protection
 - Notify mode (Supabase Realtime) and Execute mode (Convoy webhook delivery with direct httpx fast path)
@@ -259,7 +261,7 @@ Becoming the infrastructure standard for agentic commerce:
 ```
 L0  Chain         Base / Ethereum / Arbitrum (ERC-3009 transfers)
                           |
-L1  Indexing       Goldsky Mirror/Turbo --> Supabase
+L1  Indexing       Goldsky Turbo --> Webhook POST to TripWire /ingest
                           |
 L2  Middleware     TripWire (verify, deduplicate, identify, evaluate)
                           |
@@ -298,4 +300,4 @@ That is all it takes to go from "payments settle onchain" to "my application rea
 
 ---
 
-*TripWire is x402 execution middleware. We handle the chain. You handle the product.*
+*TripWire is a programmable onchain event trigger platform for AI agents. x402 payments are the first use case. We handle the chain. You handle the product.*

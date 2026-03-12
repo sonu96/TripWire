@@ -31,7 +31,7 @@ TripWire is configured via environment variables, loaded from a `.env` file by [
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GOLDSKY_API_KEY` | No | `""` (empty) | Goldsky API key for blockchain event indexing. Required for production to stream onchain events into Supabase. |
+| `GOLDSKY_API_KEY` | No | `""` (empty) | Goldsky API key for blockchain event indexing. Required for production to stream onchain events to TripWire via webhooks. |
 | `GOLDSKY_PROJECT_ID` | No | `""` (empty) | Goldsky project ID. |
 
 ### Blockchain RPC

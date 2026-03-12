@@ -1,7 +1,7 @@
-# TripWire — x402 Execution Middleware
+# TripWire — Programmable Onchain Event Triggers for AI Agents
 
 ## What This Is
-TripWire is "Stripe Webhooks for x402" — the infrastructure layer between x402 micropayments settling onchain and applications executing in response. Two modes: Notify (Supabase Realtime push) and Execute (Convoy webhook delivery).
+TripWire is a programmable onchain event trigger platform for AI agents — the infrastructure layer between onchain events and application execution. x402 payment webhooks are the first use case. Two modes: Notify (Supabase Realtime push) and Execute (Convoy webhook delivery).
 
 ## Final Architecture Stack
 - **Runtime**: Python 3.11+
@@ -9,7 +9,7 @@ TripWire is "Stripe Webhooks for x402" — the infrastructure layer between x402
 - **Database**: Supabase (managed PostgreSQL)
 - **Notify Mode**: Supabase Realtime (clients subscribe to DB changes)
 - **Webhook Delivery**: Convoy self-hosted + direct httpx fast path
-- **Blockchain Indexing**: Goldsky Mirror/Turbo → pipes directly into Supabase
+- **Blockchain Indexing**: Goldsky Turbo → delivers events via webhook to TripWire's ingest endpoint
 - **Blockchain RPC**: httpx (raw JSON-RPC calls, no web3.py)
 - **ABI Decoding**: eth-abi (lightweight, only if needed for raw data)
 - **Validation**: Pydantic v2
@@ -18,7 +18,7 @@ TripWire is "Stripe Webhooks for x402" — the infrastructure layer between x402
 
 ## Architecture Layers
 - L0 Chain: Base / Ethereum / Arbitrum (ERC-3009 transfers)
-- L1 Indexing: Goldsky Mirror/Turbo → streams events directly into Supabase tables
+- L1 Indexing: Goldsky Turbo → delivers events via webhook to TripWire's /ingest endpoint
 - L2 Middleware: TripWire FastAPI (verification, deduplication, identity, policy engine)
 - L3 Delivery: Convoy + direct POST (webhook delivery with retries, HMAC signing, DLQ)
 - L4 Application: Developer's API (executes business logic on verified webhook)
