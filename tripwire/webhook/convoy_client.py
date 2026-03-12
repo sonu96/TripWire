@@ -316,32 +316,6 @@ async def send_webhook(
 
 
 # ---------------------------------------------------------------------------
-# List events (replaces list_messages)
-# ---------------------------------------------------------------------------
-
-async def list_messages(app_id: str) -> list[dict[str, Any]]:
-    """List delivery history for a Convoy project.
-
-    Returns a list of raw event dicts from the Convoy API response.
-    """
-    client = _get_convoy_client()
-    try:
-        response = await client.get(f"/api/v1/projects/{app_id}/events")
-        response.raise_for_status()
-        data = response.json()
-        events: list[dict[str, Any]] = data.get("data", {}).get("content", [])
-        logger.debug(
-            "convoy_events_listed",
-            project_id=app_id,
-            count=len(events),
-        )
-        return events
-    except Exception:
-        logger.exception("convoy_events_list_failed", project_id=app_id)
-        raise
-
-
-# ---------------------------------------------------------------------------
 # Dead-letter queue helpers
 # ---------------------------------------------------------------------------
 

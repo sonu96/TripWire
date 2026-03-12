@@ -45,14 +45,3 @@ class NonceRepository:
             logger.debug("nonce_duplicate", chain_id=chain_id, nonce=nonce)
         return is_new
 
-    def exists(self, chain_id: int, nonce: str, authorizer: str) -> bool:
-        """Check whether a nonce has already been recorded."""
-        result = (
-            self._sb.table("nonces")
-            .select("nonce")
-            .eq("chain_id", chain_id)
-            .eq("nonce", nonce)
-            .eq("authorizer", authorizer.lower())
-            .execute()
-        )
-        return bool(result.data)

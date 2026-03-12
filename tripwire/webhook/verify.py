@@ -92,42 +92,6 @@ def _parse_signature_header(header_value: str) -> tuple[int, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def sign_payload(payload: str | bytes, secret: str) -> dict[str, str]:
-    """Generate TripWire webhook headers for *payload* signed with *secret*.
-
-    Primarily intended for testing and local development — lets you produce
-    valid signed requests without a running Convoy instance.
-
-    Args:
-        payload: The raw request body to sign (string or bytes).
-        secret:  The endpoint webhook secret.
-
-    Returns:
-        A dict containing the three TripWire signature headers::
-
-            {
-                "X-TripWire-ID":        "<uuid>",
-                "X-TripWire-Timestamp": "<unix_ts>",
-                "X-TripWire-Signature": "t=<unix_ts>,v1=<hex_hmac>",
-            }
-    """
-    import uuid
-
-    if isinstance(payload, str):
-        payload = payload.encode("utf-8")
-
-    ts = str(int(time.time()))
-    msg_id = str(uuid.uuid4())
-    signed_content = f"{ts}.".encode("utf-8") + payload
-    sig = _compute_hmac(secret, signed_content)
-
-    return {
-        "X-TripWire-ID": msg_id,
-        "X-TripWire-Timestamp": ts,
-        "X-TripWire-Signature": f"t={ts},v1={sig}",
-    }
-
-
 def verify_webhook(
     payload: str | bytes,
     headers: dict[str, str],

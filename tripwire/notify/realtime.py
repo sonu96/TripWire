@@ -17,25 +17,14 @@ from tripwire.types.models import (
     AgentIdentity,
     ERC3009Transfer,
     Endpoint,
-    FinalityData,
     FinalityStatus,
     TransferData,
     WebhookEventType,
+    build_finality_data,
 )
 from tripwire.webhook.dispatcher import build_transfer_data
 
 logger = structlog.get_logger(__name__)
-
-
-def _build_finality_data(finality: FinalityStatus | None) -> FinalityData | None:
-    """Build FinalityData from a FinalityStatus, if available."""
-    if finality is None:
-        return None
-    return FinalityData(
-        confirmations=finality.confirmations,
-        required_confirmations=finality.required_confirmations,
-        is_finalized=finality.is_finalized,
-    )
 
 
 class RealtimeNotifier:
@@ -60,7 +49,7 @@ class RealtimeNotifier:
 
         # Build the same payload structure used by the webhook dispatcher
         transfer_data: TransferData = build_transfer_data(transfer)
-        finality_data = _build_finality_data(finality)
+        finality_data = build_finality_data(finality)
 
         data: dict = {
             "transfer": transfer_data.model_dump(),
@@ -117,7 +106,7 @@ class RealtimeNotifier:
 
         # Build the shared payload once (same for all endpoints)
         transfer_data: TransferData = build_transfer_data(transfer)
-        finality_data = _build_finality_data(finality)
+        finality_data = build_finality_data(finality)
 
         data: dict = {
             "transfer": transfer_data.model_dump(),

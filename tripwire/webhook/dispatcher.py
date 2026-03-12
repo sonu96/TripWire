@@ -14,13 +14,13 @@ from tripwire.types.models import (
     ERC3009Transfer,
     Endpoint,
     EndpointMode,
-    FinalityData,
     FinalityStatus,
     Subscription,
     TransferData,
     WebhookData,
     WebhookEventType,
     WebhookPayload,
+    build_finality_data,
 )
 from tripwire.webhook.provider import WebhookProvider
 
@@ -54,17 +54,6 @@ def build_transfer_data(transfer: ERC3009Transfer) -> TransferData:
     )
 
 
-def _build_finality_data(finality: FinalityStatus | None) -> FinalityData | None:
-    """Build FinalityData from a FinalityStatus, if available."""
-    if finality is None:
-        return None
-    return FinalityData(
-        confirmations=finality.confirmations,
-        required_confirmations=finality.required_confirmations,
-        is_finalized=finality.is_finalized,
-    )
-
-
 def _build_payload(
     transfer: ERC3009Transfer,
     event_type: WebhookEventType,
@@ -89,7 +78,7 @@ def _build_payload(
         timestamp=int(time.time()),
         data=WebhookData(
             transfer=build_transfer_data(transfer),
-            finality=_build_finality_data(finality),
+            finality=build_finality_data(finality),
             identity=identity,
         ),
     )

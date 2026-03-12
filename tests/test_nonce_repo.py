@@ -93,12 +93,3 @@ def test_record_nonce_duplicate():
     assert second is False
 
 
-def test_exists():
-    sb = MockSupabase()
-    repo = NonceRepository(sb)
-
-    assert repo.exists(CHAIN_ID, NONCE, AUTHORIZER) is False
-
-    repo.record_nonce(CHAIN_ID, NONCE, AUTHORIZER)
-
-    assert repo.exists(CHAIN_ID, NONCE, AUTHORIZER) is True

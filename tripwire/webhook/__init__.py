@@ -7,7 +7,6 @@ from tripwire.webhook.convoy_client import (
     force_resend,
     init_convoy,
     list_failed_deliveries,
-    list_messages,
     retry_message,
     send_webhook,
 )
@@ -37,7 +36,6 @@ __all__ = [
     "create_endpoint",
     "send_webhook",
     "direct_deliver",
-    "list_messages",
     "retry_message",
     "list_failed_deliveries",
     "force_resend",

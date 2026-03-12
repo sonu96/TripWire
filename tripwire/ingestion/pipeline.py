@@ -18,21 +18,10 @@ import structlog
 import yaml
 
 from tripwire.config.settings import settings
+from tripwire.ingestion.decoder import AUTHORIZATION_USED_TOPIC, TRANSFER_TOPIC
 from tripwire.types.models import CHAIN_NAMES, USDC_CONTRACTS, ChainId
 
 logger = structlog.get_logger(__name__)
-
-# keccak256("AuthorizationUsed(address,bytes32)")
-AUTHORIZATION_USED_TOPIC = (
-    "0x98de503528ee59b575ef0c0a2576a82497bfc029"
-    "a5685b209e9ec333479b10a5"
-)
-
-# keccak256("Transfer(address,address,uint256)")
-TRANSFER_TOPIC = (
-    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f1"
-    "63c4a11628f55a4df523b3ef"
-)
 
 # ABI fragments for _gs_log_decode
 _AUTHORIZATION_USED_ABI = (

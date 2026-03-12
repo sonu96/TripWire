@@ -62,11 +62,6 @@ class Settings(BaseSettings):
     base_ws_url: str = ""
     arbitrum_ws_url: str = ""
 
-    # USDC Contracts
-    usdc_base: str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    usdc_ethereum: str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-    usdc_arbitrum: str = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
-
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

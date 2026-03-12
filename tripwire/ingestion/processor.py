@@ -63,7 +63,7 @@ _EVENT_SIGNATURES: dict[str, str] = {
     TRANSFER_TOPIC.lower(): "erc3009_transfer",
 }
 
-# ── Endpoint cache (Optimization 3) ─────────────────────────────
+# ── Endpoint cache ───────────────────────────────────────────────
 # In-memory TTL cache for endpoint lookups. Endpoints change rarely
 # (only at registration time), so a 30s TTL is safe.
 _endpoint_cache: dict[str, tuple[float, list]] = {}

@@ -153,6 +153,17 @@ class FinalityData(BaseModel):
     is_finalized: bool
 
 
+def build_finality_data(finality: "FinalityStatus | None") -> "FinalityData | None":
+    """Build FinalityData from a FinalityStatus, if available."""
+    if finality is None:
+        return None
+    return FinalityData(
+        confirmations=finality.confirmations,
+        required_confirmations=finality.required_confirmations,
+        is_finalized=finality.is_finalized,
+    )
+
+
 class WebhookData(BaseModel):
     transfer: TransferData
     finality: FinalityData | None = None

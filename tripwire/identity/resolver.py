@@ -295,12 +295,6 @@ class MockResolver:
     async def resolve(self, address: str, chain_id: int) -> AgentIdentity | None:
         return self._identities.get(address.lower())
 
-    def add_identity(self, identity: AgentIdentity) -> None:
-        self._identities[identity.address.lower()] = identity
-
-    def remove_identity(self, address: str) -> bool:
-        return self._identities.pop(address.lower(), None) is not None
-
 
 # ── Factory ──────────────────────────────────────────────────────
 

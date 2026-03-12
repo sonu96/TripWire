@@ -21,7 +21,6 @@ class WebhookDeliveryRepository:
         event_id: str,
         provider_message_id: str | None = None,
         status: str = "pending",
-        delivery_method: str = "convoy",
     ) -> dict:
         """Record a new webhook delivery attempt."""
         delivery_id = nanoid(size=21)
@@ -54,45 +53,6 @@ class WebhookDeliveryRepository:
             logger.info("webhook_delivery_status_updated", delivery_id=delivery_id, status=status)
             return result.data[0]
         return None
-
-    def set_provider_message_id(self, delivery_id: str, provider_message_id: str) -> dict | None:
-        """Set the provider message ID after a successful send."""
-        result = (
-            self._sb.table("webhook_deliveries")
-            .update({"provider_message_id": provider_message_id, "status": "sent"})
-            .eq("id", delivery_id)
-            .execute()
-        )
-        return result.data[0] if result.data else None
-
-    def get_by_event(self, event_id: str) -> list[dict]:
-        """Get all delivery records for a given event."""
-        result = (
-            self._sb.table("webhook_deliveries")
-            .select("*")
-            .eq("event_id", event_id)
-            .order("created_at", desc=True)
-            .execute()
-        )
-        return result.data
-
-    def get_by_endpoint(
-        self,
-        endpoint_id: str,
-        *,
-        limit: int = 50,
-        status: str | None = None,
-    ) -> list[dict]:
-        """Get recent deliveries for an endpoint, optionally filtered by status."""
-        query = (
-            self._sb.table("webhook_deliveries")
-            .select("*")
-            .eq("endpoint_id", endpoint_id)
-        )
-        if status is not None:
-            query = query.eq("status", status)
-        query = query.order("created_at", desc=True).limit(limit)
-        return query.execute().data
 
     def get_by_id(self, delivery_id: str) -> dict | None:
         """Get a single delivery by ID."""
