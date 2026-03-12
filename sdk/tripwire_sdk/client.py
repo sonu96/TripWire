@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
+import json as json_mod
+import logging
+import warnings
 from typing import Any
 
 import httpx
+from eth_account import Account
+from eth_account.signers.local import LocalAccount
 
+logger = logging.getLogger(__name__)
+
+from tripwire_sdk.errors import (
+    TripWireAuthError,
+    TripWireError,
+    TripWireNotFoundError,
+    TripWireRateLimitError,
+    TripWireServerError,
+)
+from tripwire_sdk.signer import make_auth_headers
 from tripwire_sdk.types import (
     Endpoint,
     EndpointMode,
@@ -17,21 +32,17 @@ from tripwire_sdk.types import (
 )
 
 
-class TripwireAPIError(Exception):
-    """Raised when the TripWire API returns an error response."""
-
-    def __init__(self, status_code: int, detail: str) -> None:
-        self.status_code = status_code
-        self.detail = detail
-        super().__init__(f"TripWire API error {status_code}: {detail}")
-
-
 class TripwireClient:
     """Async client for interacting with the TripWire REST API.
 
-    Usage::
+    Authenticates every request by signing a SIWE message with the caller's
+    Ethereum private key (EIP-191).  A fresh nonce is fetched from the server
+    before each request to prevent replay attacks.
 
-        async with TripwireClient(api_key="tw_...") as client:
+    **Must** be used as an async context manager::
+
+        async with TripwireClient(private_key="0x...") as client:
+            print(client.wallet_address)
             ep = await client.register_endpoint(
                 url="https://example.com/webhook",
                 mode="execute",
@@ -42,24 +53,58 @@ class TripwireClient:
 
     def __init__(
         self,
-        api_key: str,
-        base_url: str = "https://api.tripwire.xyz",
+        private_key: str,
+        base_url: str = "https://tripwire-production.up.railway.app",
+        enable_x402: bool = True,
     ) -> None:
-        self._api_key = api_key
+        self._account: LocalAccount = Account.from_key(private_key)
         self._base_url = base_url.rstrip("/")
+        self._address: str = self._account.address
+        self._enable_x402 = enable_x402
         self._http: httpx.AsyncClient | None = None
+
+    # ── Properties ─────────────────────────────────────────────
+
+    @property
+    def wallet_address(self) -> str:
+        """The checksummed Ethereum address derived from the private key."""
+        return self._address
+
+    def __repr__(self) -> str:
+        return (
+            f"TripwireClient(address={self._address!r}, "
+            f"base_url={self._base_url!r})"
+        )
 
     # ── Context manager ───────────────────────────────────────
 
     async def __aenter__(self) -> TripwireClient:
-        self._http = httpx.AsyncClient(
-            base_url=self._base_url,
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=30.0,
-        )
+        client_kwargs: dict[str, Any] = {
+            "base_url": self._base_url,
+            "headers": {"Content-Type": "application/json"},
+            "timeout": 30.0,
+        }
+
+        if self._enable_x402:
+            try:
+                from x402.client import x402Client
+
+                self._http = x402Client(
+                    wallet=self._account,
+                    **client_kwargs,
+                )
+                logger.debug("x402 payment handling enabled")
+            except ImportError:
+                warnings.warn(
+                    "x402 package is not installed — HTTP 402 Payment Required "
+                    "responses will not be auto-handled. Install with: "
+                    "pip install tripwire-sdk[x402]",
+                    stacklevel=2,
+                )
+                self._http = httpx.AsyncClient(**client_kwargs)
+        else:
+            self._http = httpx.AsyncClient(**client_kwargs)
+
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -74,15 +119,56 @@ class TripwireClient:
 
     def _client(self) -> httpx.AsyncClient:
         if self._http is None:
-            self._http = httpx.AsyncClient(
-                base_url=self._base_url,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=30.0,
+            raise RuntimeError(
+                "TripwireClient must be used as an async context manager: "
+                "async with TripwireClient(...) as client:"
             )
         return self._http
+
+    @staticmethod
+    def _raise_for_status(resp: httpx.Response) -> None:
+        """Map HTTP error status codes to typed TripWire exceptions."""
+        if resp.status_code < 400:
+            return
+
+        detail = resp.text
+        try:
+            body = resp.json()
+            detail = body.get("detail", detail)
+        except Exception:
+            pass
+
+        status = resp.status_code
+
+        if status in (401, 403):
+            raise TripWireAuthError(status, detail)
+        if status == 404:
+            raise TripWireNotFoundError(status, detail)
+        if status == 429:
+            retry_after_raw = resp.headers.get("Retry-After")
+            retry_after: float | None = None
+            if retry_after_raw is not None:
+                try:
+                    retry_after = float(retry_after_raw)
+                except ValueError:
+                    pass
+            raise TripWireRateLimitError(status, detail, retry_after=retry_after)
+        if 500 <= status < 600:
+            raise TripWireServerError(status, detail)
+
+        raise TripWireError(status, detail)
+
+    async def get_nonce(self) -> str:
+        """Fetch a fresh one-time nonce from the server for SIWE authentication."""
+        try:
+            resp = await self._client().get("/auth/nonce")
+        except httpx.TimeoutException as exc:
+            raise TripWireError(0, f"Request timed out: {exc}") from exc
+        except httpx.ConnectError as exc:
+            raise TripWireError(0, f"Connection failed: {exc}") from exc
+
+        self._raise_for_status(resp)
+        return resp.json()["nonce"]
 
     async def _request(
         self,
@@ -92,15 +178,40 @@ class TripwireClient:
         json: dict | None = None,
         params: dict | None = None,
     ) -> Any:
-        resp = await self._client().request(method, path, json=json, params=params)
-        if resp.status_code >= 400:
-            detail = resp.text
-            try:
-                body = resp.json()
-                detail = body.get("detail", detail)
-            except Exception:
-                pass
-            raise TripwireAPIError(resp.status_code, detail)
+        # Serialize body to bytes for signing (deterministic encoding)
+        if json is not None:
+            body_bytes = json_mod.dumps(json, separators=(",", ":"), sort_keys=True).encode()
+        else:
+            body_bytes = b""
+
+        # Fetch a fresh nonce before each authenticated request
+        nonce = await self.get_nonce()
+
+        auth_headers = make_auth_headers(
+            self._account,
+            self._address,
+            path,
+            nonce=nonce,
+            method=method.upper(),
+            body_bytes=body_bytes,
+        )
+        try:
+            # Send pre-serialized body bytes so the wire payload matches
+            # the exact bytes that were hashed for the SIWE signature.
+            resp = await self._client().request(
+                method,
+                path,
+                content=body_bytes if body_bytes else None,
+                params=params,
+                headers=auth_headers,
+            )
+        except httpx.TimeoutException as exc:
+            raise TripWireError(0, f"Request timed out: {exc}") from exc
+        except httpx.ConnectError as exc:
+            raise TripWireError(0, f"Connection failed: {exc}") from exc
+
+        self._raise_for_status(resp)
+
         if resp.status_code == 204:
             return None
         return resp.json()

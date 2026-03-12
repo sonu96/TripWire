@@ -33,15 +33,6 @@ class WebhookProvider(Protocol):
         """Register a webhook endpoint URL. Returns the provider endpoint ID."""
         ...
 
-    async def direct_deliver(self, url: str, payload: dict, secret: str) -> bool:
-        """Directly deliver a webhook payload to a URL via the fast httpx path.
-
-        Signs the payload with the given secret and POSTs directly to the URL,
-        bypassing the managed Convoy queue. Returns True on success.
-        """
-        ...
-
-
 class ConvoyProvider:
     """WebhookProvider backed by Convoy self-hosted."""
 
@@ -100,14 +91,6 @@ class ConvoyProvider:
             secret=secret or "",
         )
 
-    async def direct_deliver(self, url: str, payload: dict, secret: str) -> bool:
-        """Directly deliver payload to ``url`` via the httpx fast path in convoy_client."""
-        await self._ensure_initialized()
-        from tripwire.webhook.convoy_client import direct_deliver as _direct_deliver
-
-        return await _direct_deliver(url=url, payload=payload, secret=secret)
-
-
 class LogOnlyProvider:
     """WebhookProvider that only logs — for development and testing."""
 
@@ -136,21 +119,11 @@ class LogOnlyProvider:
         )
         return endpoint_id
 
-    async def direct_deliver(self, url: str, payload: dict, secret: str) -> bool:
-        logger.info(
-            "log_only_direct_deliver",
-            url=url,
-            payload_keys=list(payload.keys()),
-            has_secret=bool(secret),
-        )
-        return True
-
-
 def create_webhook_provider(settings: Settings) -> WebhookProvider:
     """Factory: build the appropriate WebhookProvider for the current environment."""
-    if settings.convoy_api_key:
+    if settings.convoy_api_key.get_secret_value():
         logger.info("using_convoy_webhook_provider", convoy_url=settings.convoy_url)
-        return ConvoyProvider(api_key=settings.convoy_api_key, convoy_url=settings.convoy_url)
+        return ConvoyProvider(api_key=settings.convoy_api_key.get_secret_value(), convoy_url=settings.convoy_url)
 
     logger.warning(
         "using_log_only_webhook_provider",

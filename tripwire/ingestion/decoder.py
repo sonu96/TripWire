@@ -13,6 +13,7 @@ a single ERC3009Transfer model when given a full transaction's logs.
 
 from typing import Any
 
+import httpx
 import structlog
 from eth_abi import decode
 
@@ -148,30 +149,110 @@ def decode_erc3009_from_logs(
     return result
 
 
+def _parse_topics(raw_topics: Any) -> list[str]:
+    """Normalise topics from various Goldsky formats into a list of hex strings.
+
+    Goldsky Mirror sends topics as a JSON array (list).
+    Goldsky Turbo sends topics as a comma-separated string:
+      "0xabc...,0xdef...,0x123..."
+    """
+    if isinstance(raw_topics, list):
+        return raw_topics
+    if isinstance(raw_topics, str):
+        return [t.strip() for t in raw_topics.split(",") if t.strip()]
+    return []
+
+
+async def enrich_from_receipt(
+    transfer: ERC3009Transfer,
+    rpc_client: httpx.AsyncClient,
+    rpc_url: str,
+) -> ERC3009Transfer:
+    """Fetch the tx receipt via RPC and extract Transfer event data.
+
+    When the Turbo pipeline only sends the AuthorizationUsed event,
+    we need to look up the Transfer event from the same transaction
+    to get from_address, to_address, and value.
+
+    Mutates and returns the same transfer object with enriched fields.
+    """
+    if transfer.to_address:
+        return transfer  # already has Transfer data, skip
+
+    tx_hash = transfer.tx_hash
+    if not tx_hash:
+        return transfer
+
+    try:
+        resp = await rpc_client.post(
+            rpc_url,
+            json={
+                "jsonrpc": "2.0",
+                "method": "eth_getTransactionReceipt",
+                "params": [tx_hash],
+                "id": 1,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "error" in data or data.get("result") is None:
+            logger.warning("rpc_receipt_error", tx_hash=tx_hash, error=data.get("error"))
+            return transfer
+
+        receipt = data["result"]
+        contract = transfer.token.lower()
+
+        for log in receipt.get("logs", []):
+            log_address = log.get("address", "").lower()
+            topics = log.get("topics", [])
+
+            if (
+                log_address == contract
+                and len(topics) >= 3
+                and topics[0].lower() == TRANSFER_TOPIC.lower()
+            ):
+                from_addr = _address_from_topic(topics[1])
+                to_addr = _address_from_topic(topics[2])
+                log_data = log.get("data", "0x")
+                data_bytes = bytes.fromhex(log_data.removeprefix("0x"))
+                (value,) = decode(["uint256"], data_bytes)
+
+                transfer.from_address = from_addr
+                transfer.to_address = to_addr
+                transfer.value = str(value)
+
+                logger.info(
+                    "rpc_enriched_transfer",
+                    tx_hash=tx_hash,
+                    from_addr=from_addr,
+                    to_addr=to_addr,
+                    value=str(value),
+                )
+                return transfer
+
+        logger.warning("rpc_no_transfer_in_receipt", tx_hash=tx_hash)
+
+    except Exception:
+        logger.exception("rpc_enrich_failed", tx_hash=tx_hash)
+
+    return transfer
+
+
 def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
-    """Decode a Goldsky-decoded row into an ERC3009Transfer.
+    """Decode a Goldsky row into an ERC3009Transfer.
 
-    This handles rows produced by the Goldsky pipeline SQL transform, which
-    JOINs Transfer and AuthorizationUsed events from the same transaction.
-    The row includes:
-      - decoded: dict with authorizer, nonce (from AuthorizationUsed)
-      - transfer: dict with from_address, to_address, value (from Transfer)
+    Supports two payload formats:
 
-    If the ``transfer`` key is missing (legacy rows or AuthorizationUsed-only
-    pipelines), falls back to empty to_address/value with a warning.
+    1. **Pre-decoded** (Mirror with _gs_log_decode JOIN): row contains
+       ``decoded`` dict (authorizer, nonce) and ``transfer`` dict
+       (from_address, to_address, value).
 
-    For raw undecoded logs, use decode_erc3009_from_logs() instead.
-
-    Expected raw_log keys (from Goldsky decoded output):
-        - transaction_hash: tx hash
-        - block_number: int
-        - block_hash: block hash
-        - log_index: int
-        - block_timestamp: int
-        - decoded: dict with authorizer, nonce
-        - transfer: dict with from_address, to_address, value (optional)
-        - address: USDC contract (if present)
-        - chain_id: chain id (int)
+    2. **Raw** (Turbo): row contains ``topics`` (comma-separated string)
+       and ``data`` (hex). AuthorizationUsed is decoded from topics:
+         - topics[1] → authorizer (address, zero-padded)
+         - topics[2] → nonce (bytes32)
+       Transfer data is NOT available in this format (single-event row).
     """
     # Normalize Goldsky field names: _gs_log_decode produces "from"/"to" keys
     # but downstream code expects "from_address"/"to_address"
@@ -180,8 +261,6 @@ def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
     if "to" in raw_log and "to_address" not in raw_log:
         raw_log["to_address"] = raw_log["to"]
 
-    decoded = raw_log.get("decoded", {})
-    transfer = raw_log.get("transfer", {})
     contract = raw_log.get("address", "").lower()
     chain_id = _resolve_chain_id(raw_log, contract)
 
@@ -192,13 +271,60 @@ def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:
     log_index = _to_int(raw_log.get("log_index", 0))
     timestamp = _to_int(raw_log.get("block_timestamp", 0))
 
-    authorizer = decoded.get("authorizer", "")
-    nonce = decoded.get("nonce", "0x" + "00" * 32)
+    # Check if this is a pre-decoded payload (Mirror) or raw (Turbo)
+    decoded = raw_log.get("decoded", {})
+    transfer = raw_log.get("transfer", {})
 
-    # Extract Transfer fields from the joined row when available
-    from_address = transfer.get("from_address", "") or authorizer
-    to_address = transfer.get("to_address", "")
-    value = str(transfer.get("value", "0"))
+    # Parse raw topics to determine event type
+    topics = _parse_topics(raw_log.get("topics", []))
+    topic0 = topics[0].lower() if topics else ""
+    is_transfer_event = topic0 == TRANSFER_TOPIC.lower()
+
+    if decoded:
+        # Pre-decoded path (Mirror with _gs_log_decode)
+        authorizer = decoded.get("authorizer", "")
+        nonce = decoded.get("nonce", "0x" + "00" * 32)
+    elif is_transfer_event:
+        # Raw Transfer event: topics[1]=from, topics[2]=to, data=value
+        authorizer = ""
+        nonce = "0x" + "00" * 32
+    else:
+        # Raw AuthorizationUsed event: topics[1]=authorizer, topics[2]=nonce
+        if len(topics) >= 3:
+            authorizer = _address_from_topic(topics[1])
+            nonce = topics[2]
+        elif len(topics) >= 2:
+            authorizer = _address_from_topic(topics[1])
+            nonce = "0x" + "00" * 32
+        else:
+            authorizer = ""
+            nonce = "0x" + "00" * 32
+            logger.warning(
+                "raw_log_insufficient_topics",
+                tx_hash=raw_log.get("transaction_hash", ""),
+                topic_count=len(topics),
+            )
+
+    # Extract Transfer fields: from joined row, or from raw Transfer topics
+    if is_transfer_event and len(topics) >= 3:
+        from_address = _address_from_topic(topics[1])
+        to_address = _address_from_topic(topics[2])
+        # Decode value from data field (uint256)
+        raw_data = raw_log.get("data", "0x")
+        if raw_data and raw_data != "0x":
+            try:
+                data_bytes = bytes.fromhex(raw_data.removeprefix("0x"))
+                (val,) = decode(["uint256"], data_bytes)
+                value = str(val)
+            except Exception:
+                value = "0"
+                logger.warning("transfer_data_decode_failed", tx_hash=raw_log.get("transaction_hash", ""))
+        else:
+            value = "0"
+    else:
+        from_address = transfer.get("from_address", "") or authorizer
+        to_address = transfer.get("to_address", "")
+        value = str(transfer.get("value", "0"))
 
     if not to_address:
         logger.warning(

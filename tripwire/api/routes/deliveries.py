@@ -5,14 +5,34 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from tripwire.api import get_supabase
-from tripwire.api.auth import require_api_key
+from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.webhook.convoy_client import retry_message
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["deliveries"], dependencies=[Depends(require_api_key)])
+router = APIRouter(tags=["deliveries"])
+
+
+# ── Helper: verify endpoint ownership ────────────────────────
+
+
+def _verify_endpoint_ownership(endpoint_row: dict, wallet_address: str) -> None:
+    """Raise 403 if the endpoint does not belong to the authenticated wallet."""
+    if endpoint_row.get("owner_address", "").lower() != wallet_address.lower():
+        raise HTTPException(status_code=403, detail="Not authorized to access this endpoint")
+
+
+def _get_wallet_endpoint_ids(sb, wallet_address: str) -> list[str]:
+    """Return all endpoint IDs owned by the given wallet address."""
+    result = (
+        sb.table("endpoints")
+        .select("id")
+        .eq("owner_address", wallet_address)
+        .execute()
+    )
+    return [row["id"] for row in result.data]
 
 
 # ── Response models ──────────────────────────────────────────
@@ -55,17 +75,53 @@ async def list_deliveries(
     status: str | None = Query(None, description="Filter by status"),
     cursor: str | None = Query(None, description="Cursor for pagination (delivery id)"),
     limit: int = Query(50, ge=1, le=200),
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
     sb=Depends(get_supabase),
 ):
-    """List deliveries with optional filters and cursor pagination."""
-    repo = WebhookDeliveryRepository(sb)
-    rows = repo.list_paginated(
-        endpoint_id=endpoint_id,
-        event_id=event_id,
-        status=status,
-        cursor=cursor,
-        limit=limit,
+    """List deliveries with optional filters and cursor pagination.
+
+    Only returns deliveries belonging to the authenticated wallet's endpoints.
+    """
+
+    # If a specific endpoint_id is provided, verify ownership
+    if endpoint_id:
+        ep = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
+        if not ep.data:
+            raise HTTPException(status_code=404, detail="Endpoint not found")
+        _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
+
+    # Scope deliveries to wallet's endpoints
+    wallet_endpoint_ids = _get_wallet_endpoint_ids(sb, wallet_auth.wallet_address)
+    if not wallet_endpoint_ids:
+        return DeliveryListResponse(data=[], cursor=None, has_more=False)
+
+    # Build the query manually to add the in_ filter for ownership
+    query = (
+        sb.table("webhook_deliveries")
+        .select("*")
+        .in_("endpoint_id", wallet_endpoint_ids)
+        .order("created_at", desc=True)
+        .limit(limit + 1)
     )
+
+    if cursor:
+        cursor_row = (
+            sb.table("webhook_deliveries")
+            .select("created_at")
+            .eq("id", cursor)
+            .execute()
+        )
+        if cursor_row.data:
+            query = query.lt("created_at", cursor_row.data[0]["created_at"])
+
+    if endpoint_id:
+        query = query.eq("endpoint_id", endpoint_id)
+    if event_id:
+        query = query.eq("event_id", event_id)
+    if status:
+        query = query.eq("status", status)
+
+    rows = query.execute().data
 
     has_more = len(rows) > limit
     if has_more:
@@ -77,12 +133,24 @@ async def list_deliveries(
 
 @router.get("/deliveries/{delivery_id}", response_model=DeliveryResponse)
 @limiter.limit(CRUD_LIMIT)
-async def get_delivery(request: Request, delivery_id: str, sb=Depends(get_supabase)):
-    """Get a single delivery by ID."""
+async def get_delivery(
+    request: Request,
+    delivery_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
+    """Get a single delivery by ID (must belong to an endpoint owned by the authenticated wallet)."""
     repo = WebhookDeliveryRepository(sb)
     row = repo.get_by_id(delivery_id)
     if not row:
         raise HTTPException(status_code=404, detail="Delivery not found")
+
+    # Verify ownership through the parent endpoint
+    ep = sb.table("endpoints").select("*").eq("id", row["endpoint_id"]).execute()
+    if not ep.data:
+        raise HTTPException(status_code=404, detail="Parent endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
+
     return DeliveryResponse(**row)
 
 
@@ -94,13 +162,15 @@ async def list_endpoint_deliveries(
     status: str | None = Query(None, description="Filter by status"),
     cursor: str | None = Query(None, description="Cursor for pagination (delivery id)"),
     limit: int = Query(50, ge=1, le=200),
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
     sb=Depends(get_supabase),
 ):
-    """List deliveries for a specific endpoint."""
-    # Verify endpoint exists
-    ep = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()
+    """List deliveries for a specific endpoint (must belong to authenticated wallet)."""
+    # Verify endpoint exists and ownership
+    ep = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not ep.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
 
     repo = WebhookDeliveryRepository(sb)
     rows = repo.list_paginated(
@@ -123,13 +193,15 @@ async def list_endpoint_deliveries(
 async def get_delivery_stats(
     request: Request,
     endpoint_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
     sb=Depends(get_supabase),
 ):
     """Get delivery stats (counts by status, success rate) for an endpoint."""
-    # Verify endpoint exists
-    ep = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()
+    # Verify endpoint exists and ownership
+    ep = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not ep.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
 
     repo = WebhookDeliveryRepository(sb)
     stats = repo.get_stats_for_endpoint(endpoint_id)
@@ -138,22 +210,32 @@ async def get_delivery_stats(
 
 @router.post("/deliveries/{delivery_id}/retry", status_code=202)
 @limiter.limit(CRUD_LIMIT)
-async def retry_delivery(request: Request, delivery_id: str, sb=Depends(get_supabase)):
-    """Retry a failed delivery via Convoy."""
+async def retry_delivery(
+    request: Request,
+    delivery_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
+    """Retry a failed delivery via Convoy (must belong to an endpoint owned by the authenticated wallet)."""
     repo = WebhookDeliveryRepository(sb)
     delivery = repo.get_by_id(delivery_id)
     if not delivery:
         raise HTTPException(status_code=404, detail="Delivery not found")
 
+    # Verify ownership through the parent endpoint
+    ep = sb.table("endpoints").select("*").eq("id", delivery["endpoint_id"]).execute()
+    if not ep.data:
+        raise HTTPException(status_code=404, detail="Parent endpoint not found")
+    _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
+
     if delivery["status"] not in ("failed",):
         raise HTTPException(status_code=400, detail="Only failed deliveries can be retried")
 
     # Look up the endpoint to get the convoy_project_id
-    endpoint = sb.table("endpoints").select("convoy_project_id").eq("id", delivery["endpoint_id"]).execute()
-    if not endpoint.data or not endpoint.data[0].get("convoy_project_id"):
+    if not ep.data[0].get("convoy_project_id"):
         raise HTTPException(status_code=400, detail="Endpoint has no Convoy project configured")
 
-    convoy_project_id = endpoint.data[0]["convoy_project_id"]
+    convoy_project_id = ep.data[0]["convoy_project_id"]
 
     # Use the provider_message_id as the Convoy event delivery ID for retry
     provider_message_id = delivery.get("provider_message_id")

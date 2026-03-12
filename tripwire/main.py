@@ -24,6 +24,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from tripwire import __version__
 from tripwire.api.middleware import RequestLoggingMiddleware
 from tripwire.api.ratelimit import limiter, rate_limit_exceeded_handler
+from tripwire.api.routes.auth import router as auth_router
 from tripwire.api.routes.deliveries import router as deliveries_router
 from tripwire.api.routes.endpoints import router as endpoints_router
 from tripwire.api.routes.events import router as events_router
@@ -33,7 +34,9 @@ from tripwire.api.routes.stats import router as stats_router
 from tripwire.api.routes.subscriptions import router as subscriptions_router
 from tripwire.config.logging import setup_logging
 from tripwire.config.settings import settings
+from tripwire.observability.tracing import setup_tracing, shutdown_tracing
 from tripwire.db.client import get_supabase_client
+from tripwire.observability.audit import AuditLogger
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.events import EventRepository
 from tripwire.db.repositories.nonces import NonceRepository
@@ -44,12 +47,26 @@ from tripwire.ingestion.processor import EventProcessor
 from tripwire.ingestion.ws_subscriber import WebSocketSubscriberManager
 from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.webhook.dlq_handler import DLQHandler
+from tripwire.api.redis import get_redis
+from tripwire.observability.health import health_registry
+from tripwire.observability.metrics import tripwire_build_info
 from tripwire.webhook.provider import create_webhook_provider
 
 # Configure structlog BEFORE any logger is created
 setup_logging(log_level=settings.log_level, app_env=settings.app_env)
 
 logger = structlog.get_logger(__name__)
+
+# Initialize Sentry early to catch startup errors
+if settings.sentry_dsn.get_secret_value():
+    from tripwire.observability.error_tracking import setup_sentry
+
+    setup_sentry(
+        dsn=settings.sentry_dsn.get_secret_value(),
+        environment=settings.app_env,
+        version=__version__,
+        traces_sample_rate=settings.sentry_traces_sample_rate,
+    )
 
 
 # ── Lifespan ──────────────────────────────────────────────────
@@ -60,6 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Startup / shutdown lifecycle for the FastAPI application."""
 
     # -- Startup -------------------------------------------------
+
     logger.info(
         "tripwire_starting",
         version=__version__,
@@ -67,10 +85,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         port=settings.app_port,
     )
 
+    # Optional OpenTelemetry distributed tracing (must be early so all spans are captured)
+    if settings.otel_enabled:
+        setup_tracing(
+            service_name=settings.otel_service_name,
+            version=__version__,
+            environment=settings.app_env,
+            otlp_endpoint=settings.otel_endpoint,
+        )
+
     # Supabase client
     supabase = get_supabase_client()
     app.state.supabase = supabase
     logger.info("supabase_ready")
+
+    # Audit logger (fire-and-forget writes to audit_log table)
+    audit_logger = AuditLogger(supabase)
+    app.state.audit_logger = audit_logger
+    logger.info("audit_logger_ready")
 
     # Webhook provider (Convoy in production, LogOnly in dev without key)
     webhook_provider = create_webhook_provider(settings)
@@ -78,7 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("webhook_provider_ready")
 
     # Warn if Goldsky webhook secret is missing in non-development environments
-    if settings.app_env != "development" and not settings.goldsky_webhook_secret:
+    if settings.app_env != "development" and not settings.goldsky_webhook_secret.get_secret_value():
         logger.warning(
             "goldsky_webhook_secret_missing",
             env=settings.app_env,
@@ -121,7 +153,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Dead Letter Queue handler (background poller for failed Convoy deliveries)
     dlq_handler: DLQHandler | None = None
-    if settings.dlq_enabled and settings.convoy_api_key:
+    if settings.dlq_enabled and settings.convoy_api_key.get_secret_value():
         dlq_handler = DLQHandler(
             endpoint_repo=endpoint_repo,
             delivery_repo=delivery_repo,
@@ -134,7 +166,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info(
             "dlq_handler_skipped",
             dlq_enabled=settings.dlq_enabled,
-            convoy_configured=bool(settings.convoy_api_key),
+            convoy_configured=bool(settings.convoy_api_key.get_secret_value()),
         )
 
     # Finality poller (background task for confirming pending events & reorg detection)
@@ -166,6 +198,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ws_subscriber_enabled=settings.ws_subscriber_enabled,
         )
 
+    # Set Prometheus build info
+    tripwire_build_info.info({"version": __version__, "env": settings.app_env})
+
     # Mark application as ready for traffic
     app.state.ready = True
     app.state.started_at = time.time()
@@ -189,6 +224,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Close identity resolver HTTP client if it has one
     if hasattr(resolver, "close"):
         await resolver.close()
+
+    # Flush and shut down OTel tracing (no-op if never initialised)
+    shutdown_tracing()
 
     logger.info("tripwire_shutting_down")
 
@@ -282,9 +320,55 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # x402 payment gating (only enabled when treasury address is configured)
+    if settings.tripwire_treasury_address:
+        try:
+            from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
+            from x402.http.middleware.fastapi import PaymentMiddlewareASGI
+            from x402.http.types import RouteConfig
+            from x402.mechanisms.evm.exact import ExactEvmServerScheme
+            from x402.server import x402ResourceServer
+
+            x402_server = x402ResourceServer(
+                HTTPFacilitatorClient(
+                    FacilitatorConfig(url=settings.x402_facilitator_url)
+                )
+            )
+            x402_server.register(settings.x402_network, ExactEvmServerScheme())
+
+            x402_routes = {
+                "POST /api/v1/endpoints": RouteConfig(
+                    accepts=[
+                        PaymentOption(
+                            scheme="exact",
+                            price=settings.x402_registration_price,
+                            network=settings.x402_network,
+                            pay_to=settings.tripwire_treasury_address,
+                        )
+                    ]
+                ),
+            }
+            app.add_middleware(PaymentMiddlewareASGI, routes=x402_routes, server=x402_server)
+            logger.info(
+                "x402_payment_gating_enabled",
+                network=settings.x402_network,
+                price=settings.x402_registration_price,
+                pay_to=settings.tripwire_treasury_address,
+            )
+        except ImportError:
+            logger.warning(
+                "x402_payment_gating_unavailable",
+                reason="x402 package not installed; run: pip install x402[fastapi,evm]",
+            )
+    else:
+        logger.warning("x402_payment_gating_disabled", reason="tripwire_treasury_address is empty")
+
     # Global error handler
     @app.exception_handler(Exception)
     async def global_exception_handler(request: Request, exc: Exception):
+        from tripwire.observability.error_tracking import capture_exception
+
+        capture_exception(exc)
         logger.error(
             "unhandled_exception",
             path=request.url.path,
@@ -298,6 +382,7 @@ def create_app() -> FastAPI:
         )
 
     # Mount route groups
+    app.include_router(auth_router)
     app.include_router(deliveries_router, prefix="/api/v1")
     app.include_router(endpoints_router, prefix="/api/v1")
     app.include_router(subscriptions_router, prefix="/api/v1")
@@ -305,6 +390,29 @@ def create_app() -> FastAPI:
     app.include_router(ingest_router, prefix="/api/v1")
     app.include_router(facilitator_router, prefix="/api/v1")
     app.include_router(stats_router, prefix="/api/v1")
+
+    # ── Prometheus metrics endpoint ──────────────────────────────
+    from prometheus_client import make_asgi_app as _make_metrics_app
+    from starlette.responses import PlainTextResponse
+
+    metrics_asgi = _make_metrics_app()
+
+    if settings.metrics_bearer_token:
+        _expected_auth = f"Bearer {settings.metrics_bearer_token}"
+
+        async def _metrics_with_auth(scope, receive, send):
+            if scope["type"] == "http":
+                headers = dict(scope.get("headers", []))
+                auth = headers.get(b"authorization", b"").decode()
+                if auth != _expected_auth:
+                    response = PlainTextResponse("Unauthorized", status_code=401)
+                    await response(scope, receive, send)
+                    return
+            await metrics_asgi(scope, receive, send)
+
+        app.mount("/metrics", _metrics_with_auth)
+    else:
+        app.mount("/metrics", metrics_asgi)
 
     # ── Operational endpoints (not business logic) ─────────────
 
@@ -336,6 +444,14 @@ def create_app() -> FastAPI:
         except Exception as exc:
             components["webhook_provider"] = {"status": "unhealthy", "error": str(exc)}
 
+        # Check Redis connectivity
+        try:
+            r = get_redis()
+            await r.ping()
+            components["redis"] = {"status": "healthy"}
+        except Exception as exc:
+            components["redis"] = {"status": "unhealthy", "error": str(exc)}
+
         # Check identity resolver status
         try:
             resolver = request.app.state.identity_resolver
@@ -344,8 +460,38 @@ def create_app() -> FastAPI:
         except Exception as exc:
             components["identity_resolver"] = {"status": "unhealthy", "error": str(exc)}
 
+        # Check background task health
+        now = time.time()
+        stale_threshold = 300  # 5 minutes
+        bg_tasks = health_registry.get_all()
+        bg_components: dict[str, dict] = {}
+        for task_name, task_health in bg_tasks.items():
+            if task_health.last_run_at is None:
+                task_status = "unhealthy"
+                seconds_since_last_run = None
+            else:
+                seconds_since_last_run = round(now - task_health.last_run_at, 1)
+                task_status = (
+                    "unhealthy" if seconds_since_last_run > stale_threshold else "healthy"
+                )
+            bg_components[task_name] = {
+                "status": task_status,
+                "running": task_health.running,
+                "seconds_since_last_run": seconds_since_last_run,
+                "error_count": task_health.error_count,
+                "last_error": task_health.last_error,
+            }
+        components["background_tasks"] = bg_components
+
         # Determine overall status
-        statuses = [c["status"] for c in components.values()]
+        statuses: list[str] = []
+        for key, value in components.items():
+            if key == "background_tasks":
+                for bt in value.values():
+                    statuses.append(bt["status"])
+            else:
+                statuses.append(value["status"])
+
         if all(s == "healthy" for s in statuses):
             overall = "healthy"
         elif any(s == "unhealthy" for s in statuses):

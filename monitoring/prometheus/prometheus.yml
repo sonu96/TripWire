@@ -1,0 +1,76 @@
+# TripWire Prometheus Configuration
+# ---
+# Production notes:
+#   - Replace localhost:3402 with your TripWire service hostname/IP.
+#   - For Supabase metrics, replace <SUPABASE_REF> with your project ref
+#     and set the bearer token to your service_role key.
+#   - In Kubernetes, use service discovery (kubernetes_sd_configs) instead
+#     of static_configs.
+#   - For high-availability, run two Prometheus replicas with identical
+#     config and use Thanos or Cortex for long-term storage.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+# Alert rules file
+rule_files:
+  - "alerts.yml"
+
+# Alertmanager configuration.
+# If you are not running a standalone Alertmanager, you can use Grafana Alerting
+# as an alternative (enable it in Grafana under Alerting > Notification policies).
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  # -- TripWire application metrics --
+  # The app exposes Prometheus metrics at /metrics on port 3402.
+  # In Docker Compose, use the service name "tripwire" as the host.
+  - job_name: "tripwire"
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "tripwire:3402"
+        labels:
+          service: "tripwire"
+          env: "production"
+    # If METRICS_BEARER_TOKEN is set on the TripWire instance, uncomment
+    # the authorization block below so Prometheus can authenticate:
+    # authorization:
+    #   type: Bearer
+    #   credentials: "<METRICS_BEARER_TOKEN>"
+
+  # -- Supabase built-in metrics --
+  # Supabase exposes Postgres and API metrics at a privileged endpoint.
+  # Requires the service_role key as a bearer token.
+  # Replace <SUPABASE_REF> with your actual project reference.
+  - job_name: "supabase"
+    scrape_interval: 60s
+    metrics_path: /customer/v1/privileged/metrics
+    scheme: https
+    static_configs:
+      - targets:
+          - "<SUPABASE_REF>.supabase.co"
+        labels:
+          service: "supabase"
+    authorization:
+      type: Bearer
+      # The credentials_file should contain your Supabase service_role key (plain text, no newline).
+      # It is mounted into the container via docker-compose at /etc/prometheus/supabase_token.
+      credentials_file: /etc/prometheus/supabase_token
+    # TLS is required for the Supabase endpoint
+    tls_config:
+      insecure_skip_verify: false
+
+  # -- Prometheus self-monitoring --
+  - job_name: "prometheus"
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - "localhost:9090"

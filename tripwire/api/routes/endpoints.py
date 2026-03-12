@@ -11,7 +11,7 @@ from pydantic import BaseModel, field_validator
 from postgrest.exceptions import APIError as PostgrestAPIError
 
 from tripwire.api import get_supabase
-from tripwire.api.auth import generate_api_key, hash_api_key, require_api_key
+from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.types.models import (
     Endpoint,
@@ -19,22 +19,17 @@ from tripwire.types.models import (
     EndpointPolicies,
     RegisterEndpointRequest,
 )
+from tripwire.observability.audit import fire_and_forget
 from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(prefix="/endpoints", tags=["endpoints"], dependencies=[Depends(require_api_key)])
+router = APIRouter(prefix="/endpoints", tags=["endpoints"])
 
 
 class EndpointListResponse(BaseModel):
     data: list[Endpoint]
     count: int
-
-
-class RotateKeyResponse(BaseModel):
-    endpoint_id: str
-    api_key: str  # New plaintext key (shown once)
-    rotated_at: str
 
 
 class UpdateEndpointRequest(BaseModel):
@@ -54,20 +49,34 @@ class UpdateEndpointRequest(BaseModel):
         return validate_endpoint_url(v)
 
 
+# ── Helper: verify endpoint ownership ────────────────────────
+
+
+def _verify_ownership(endpoint_row: dict, wallet_address: str) -> None:
+    """Raise 403 if the endpoint does not belong to the authenticated wallet."""
+    if endpoint_row.get("owner_address", "").lower() != wallet_address.lower():
+        raise HTTPException(status_code=403, detail="Not authorized to access this endpoint")
+
+
+# ── Routes ────────────────────────────────────────────────────
+
+
 @router.post("", response_model=Endpoint, status_code=201)
 @limiter.limit(CRUD_LIMIT)
-async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=Depends(get_supabase)):
+async def register_endpoint(
+    request: Request,
+    body: RegisterEndpointRequest,
+    wallet: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
     """Register a new webhook endpoint.
 
+    The caller's verified wallet address becomes the owner_address.
     Also creates a corresponding Convoy application and endpoint so that
     webhook delivery is ready as soon as the endpoint is registered.
     """
     now = datetime.now(timezone.utc).isoformat()
     endpoint_id = nanoid(size=21)
-
-    # Generate API key — store hash, return plaintext once
-    api_key = generate_api_key()
-    api_key_hash_value = hash_api_key(api_key)
 
     row = {
         "id": endpoint_id,
@@ -75,8 +84,8 @@ async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=
         "mode": body.mode.value,
         "chains": body.chains,
         "recipient": body.recipient,
+        "owner_address": wallet.wallet_address,
         "policies": (body.policies or EndpointPolicies()).model_dump(),
-        "api_key_hash": api_key_hash_value,
         "active": True,
         "created_at": now,
         "updated_at": now,
@@ -89,8 +98,23 @@ async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=
             raise HTTPException(status_code=409, detail="Endpoint already exists")
         raise
     endpoint = Endpoint(**result.data[0])
-    # Attach plaintext key — only shown on creation
-    endpoint.api_key = api_key
+
+    # Persist x402 payment details if the middleware verified a payment
+    payment_tx_hash = getattr(request.state, "payment_tx_hash", None)
+    payment_chain_id = getattr(request.state, "payment_chain_id", None)
+    if payment_tx_hash:
+        sb.table("endpoints").update({
+            "registration_tx_hash": payment_tx_hash,
+            "registration_chain_id": payment_chain_id,
+        }).eq("id", endpoint_id).execute()
+        endpoint.registration_tx_hash = payment_tx_hash
+        endpoint.registration_chain_id = payment_chain_id
+        logger.info(
+            "x402_payment_recorded",
+            endpoint_id=endpoint_id,
+            tx_hash=payment_tx_hash,
+            chain_id=payment_chain_id,
+        )
 
     # Create webhook provider application + endpoint for delivery
     if body.mode == EndpointMode.EXECUTE:
@@ -126,73 +150,69 @@ async def register_endpoint(request: Request, body: RegisterEndpointRequest, sb=
         except Exception:
             logger.exception("webhook_provider_setup_failed", endpoint_id=endpoint_id)
 
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="endpoint.created",
+        actor=wallet.wallet_address,
+        resource_type="endpoint",
+        resource_id=endpoint_id,
+        details={"url": body.url, "mode": body.mode.value},
+        ip_address=request.client.host if request.client else None,
+    ))
     return endpoint
-
-
-@router.post("/{endpoint_id}/rotate-key", response_model=RotateKeyResponse)
-@limiter.limit(CRUD_LIMIT)
-async def rotate_key(request: Request, endpoint_id: str, sb=Depends(get_supabase)):
-    """Rotate the API key for an endpoint.
-
-    Generates a new API key and moves the current hash to old_api_key_hash
-    so both keys work during the grace period (default 24h).
-    Returns the new plaintext key (shown once).
-    """
-    # Verify endpoint exists and is active
-    existing = sb.table("endpoints").select("id, api_key_hash").eq("id", endpoint_id).eq("active", True).execute()
-    if not existing.data:
-        raise HTTPException(status_code=404, detail="Endpoint not found")
-
-    old_hash = existing.data[0]["api_key_hash"]
-    now = datetime.now(timezone.utc)
-
-    # Generate new key
-    new_key = generate_api_key()
-    new_hash = hash_api_key(new_key)
-
-    sb.table("endpoints").update({
-        "api_key_hash": new_hash,
-        "old_api_key_hash": old_hash,
-        "key_rotated_at": now.isoformat(),
-        "updated_at": now.isoformat(),
-    }).eq("id", endpoint_id).execute()
-
-    logger.info("api_key_rotated", endpoint_id=endpoint_id)
-
-    return RotateKeyResponse(
-        endpoint_id=endpoint_id,
-        api_key=new_key,
-        rotated_at=now.isoformat(),
-    )
 
 
 @router.get("", response_model=EndpointListResponse)
 @limiter.limit(CRUD_LIMIT)
-async def list_endpoints(request: Request, sb=Depends(get_supabase)):
-    """List all registered endpoints."""
-    result = sb.table("endpoints").select("*").eq("active", True).execute()
+async def list_endpoints(
+    request: Request,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
+    """List all registered endpoints belonging to the authenticated wallet."""
+    result = (
+        sb.table("endpoints")
+        .select("*")
+        .eq("active", True)
+        .eq("owner_address", wallet_auth.wallet_address)
+        .execute()
+    )
     return EndpointListResponse(data=result.data, count=len(result.data))
 
 
 @router.get("/{endpoint_id}", response_model=Endpoint)
 @limiter.limit(CRUD_LIMIT)
-async def get_endpoint(request: Request, endpoint_id: str, sb=Depends(get_supabase)):
-    """Get endpoint details."""
+async def get_endpoint(
+    request: Request,
+    endpoint_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
+    """Get endpoint details (must belong to authenticated wallet)."""
     result = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    _verify_ownership(result.data[0], wallet_auth.wallet_address)
     return Endpoint(**result.data[0])
 
 
 @router.patch("/{endpoint_id}", response_model=Endpoint)
 @limiter.limit(CRUD_LIMIT)
-async def update_endpoint(request: Request, endpoint_id: str, body: UpdateEndpointRequest, sb=Depends(get_supabase)):
-    """Update an endpoint."""
+async def update_endpoint(
+    request: Request,
+    endpoint_id: str,
+    body: UpdateEndpointRequest,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
+    """Update an endpoint (must belong to authenticated wallet)."""
 
-    # Verify exists
-    existing = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()
+    # Verify exists and ownership
+    existing = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    _verify_ownership(existing.data[0], wallet_auth.wallet_address)
 
     updates = body.model_dump(exclude_none=True)
     if not updates:
@@ -206,19 +226,41 @@ async def update_endpoint(request: Request, endpoint_id: str, body: UpdateEndpoi
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     result = sb.table("endpoints").update(updates).eq("id", endpoint_id).execute()
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="endpoint.updated",
+        actor=wallet_auth.wallet_address,
+        resource_type="endpoint",
+        resource_id=endpoint_id,
+        details={"fields": list(updates.keys())},
+        ip_address=request.client.host if request.client else None,
+    ))
     return Endpoint(**result.data[0])
 
 
 @router.delete("/{endpoint_id}", status_code=204)
 @limiter.limit(CRUD_LIMIT)
-async def deactivate_endpoint(request: Request, endpoint_id: str, sb=Depends(get_supabase)):
-    """Deactivate (soft-delete) an endpoint."""
+async def deactivate_endpoint(
+    request: Request,
+    endpoint_id: str,
+    wallet_auth: WalletAuthContext = Depends(require_wallet_auth),
+    sb=Depends(get_supabase),
+):
+    """Deactivate (soft-delete) an endpoint (must belong to authenticated wallet)."""
 
-    existing = sb.table("endpoints").select("id").eq("id", endpoint_id).execute()
+    existing = sb.table("endpoints").select("*").eq("id", endpoint_id).execute()
     if not existing.data:
         raise HTTPException(status_code=404, detail="Endpoint not found")
+
+    _verify_ownership(existing.data[0], wallet_auth.wallet_address)
 
     sb.table("endpoints").update({
         "active": False,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", endpoint_id).execute()
+    fire_and_forget(request.app.state.audit_logger.log(
+        action="endpoint.deleted",
+        actor=wallet_auth.wallet_address,
+        resource_type="endpoint",
+        resource_id=endpoint_id,
+        ip_address=request.client.host if request.client else None,
+    ))

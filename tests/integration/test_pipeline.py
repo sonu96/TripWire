@@ -16,15 +16,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from eth_account import Account
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 
+from tripwire.api.auth import WalletAuthContext, require_wallet_auth
 from tripwire.api.middleware import RequestLoggingMiddleware
 from tripwire.api.ratelimit import limiter, rate_limit_exceeded_handler
 from tripwire.api.routes.endpoints import router as endpoints_router
-from tripwire.api.routes.ingest import router as ingest_router
+from tripwire.api.routes.ingest import router as ingest_router, _verify_goldsky_request
 from tripwire.api.routes.subscriptions import router as subscriptions_router
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.events import EventRepository
@@ -35,11 +37,15 @@ from tripwire.ingestion.processor import EventProcessor
 from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.webhook.provider import LogOnlyProvider
 
+from tests._wallet_helpers import TEST_PRIVATE_KEY, make_auth_headers, MockRedis
+
 # ── Constants ────────────────────────────────────────────────
 
 USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
 RECIPIENT = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"
 SENDER = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_TEST_WALLET = Account.from_key(TEST_PRIVATE_KEY)
+TEST_OWNER_ADDRESS = _TEST_WALLET.address
 TX_HASH = "0x" + "ff" * 32
 BLOCK_HASH = "0x" + "ee" * 32
 NONCE_HEX = "0x" + "ab" * 32
@@ -259,6 +265,20 @@ def _create_integration_app() -> tuple[FastAPI, StatefulMockSupabase]:
     )
     app.state.processor = processor
 
+    # Override wallet auth so tests don't need to sign every request
+    _test_wallet = Account.from_key(TEST_PRIVATE_KEY)
+
+    async def _override_auth():
+        return WalletAuthContext(wallet_address=_test_wallet.address)
+
+    app.dependency_overrides[require_wallet_auth] = _override_auth
+
+    # Override Goldsky auth so ingest routes work in testing env
+    async def _override_goldsky():
+        return None
+
+    app.dependency_overrides[_verify_goldsky_request] = _override_goldsky
+
     # Mark ready
     app.state.ready = True
     app.state.started_at = time.time()
@@ -326,6 +346,7 @@ async def test_register_then_ingest_event():
                 "mode": "execute",
                 "chains": [8453],
                 "recipient": RECIPIENT,
+                "owner_address": TEST_OWNER_ADDRESS,
             })
             assert reg_resp.status_code == 201
             endpoint = reg_resp.json()
@@ -369,6 +390,7 @@ async def test_duplicate_nonce_dedup():
                 "mode": "execute",
                 "chains": [8453],
                 "recipient": RECIPIENT,
+                "owner_address": TEST_OWNER_ADDRESS,
             })
 
             raw = _raw_log(recipient=RECIPIENT, nonce=NONCE_HEX)
@@ -389,36 +411,59 @@ async def test_duplicate_nonce_dedup():
 
 
 @pytest.mark.asyncio
-async def test_auth_roundtrip():
-    """Scenario 3: Create endpoint (get API key), use that key to list endpoints."""
+async def test_wallet_auth_roundtrip():
+    """Scenario 3: Register endpoint with real wallet auth, then list using signed headers."""
+    import json as _json
+
     app, mock_sb = _create_integration_app()
+
+    # Remove the default auth override so we exercise real wallet auth
+    app.dependency_overrides.pop(require_wallet_auth, None)
+
+    _test_acct = Account.from_key(TEST_PRIVATE_KEY)
+    mock_redis = MockRedis()
     transport = httpx.ASGITransport(app=app)
 
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        # Step 1: Register endpoint (no auth required in dev mode)
-        reg_resp = await client.post("/api/v1/endpoints", json={
-            "url": "https://myapp.example.com/webhook",
-            "mode": "execute",
-            "chains": [8453],
-            "recipient": RECIPIENT,
-        })
-        assert reg_resp.status_code == 201
-        body = reg_resp.json()
-        api_key = body.get("api_key")
-        assert api_key is not None
-        assert api_key.startswith("tw_")
+    with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            # Step 1: Register endpoint with real wallet auth headers
+            reg_body = _json.dumps({
+                "url": "https://myapp.example.com/webhook",
+                "mode": "execute",
+                "chains": [8453],
+                "recipient": RECIPIENT,
+                "owner_address": TEST_OWNER_ADDRESS,
+            }, separators=(",", ":")).encode()
+            reg_headers = make_auth_headers(
+                _test_acct, method="POST", path="/api/v1/endpoints", body=reg_body,
+            )
+            mock_redis.seed_nonce(reg_headers["X-TripWire-Nonce"])
+            reg_headers["Content-Type"] = "application/json"
 
-        # Step 2: Use that API key to list endpoints
-        list_resp = await client.get(
-            "/api/v1/endpoints",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        assert list_resp.status_code == 200
-        data = list_resp.json()
-        assert data["count"] >= 1
-        # The endpoint we created should be in the list
-        ids = [ep["id"] for ep in data["data"]]
-        assert body["id"] in ids
+            reg_resp = await client.post(
+                "/api/v1/endpoints",
+                content=reg_body,
+                headers=reg_headers,
+            )
+            assert reg_resp.status_code == 201
+            body = reg_resp.json()
+            assert body["owner_address"].lower() == _test_acct.address.lower()
+
+            # Step 2: List endpoints with real wallet auth headers
+            list_headers = make_auth_headers(
+                _test_acct, method="GET", path="/api/v1/endpoints",
+            )
+            mock_redis.seed_nonce(list_headers["X-TripWire-Nonce"])
+
+            list_resp = await client.get(
+                "/api/v1/endpoints",
+                headers=list_headers,
+            )
+            assert list_resp.status_code == 200
+            data = list_resp.json()
+            assert data["count"] >= 1
+            ids = [ep["id"] for ep in data["data"]]
+            assert body["id"] in ids
 
 
 @pytest.mark.asyncio
@@ -439,6 +484,7 @@ async def test_policy_rejection_min_amount():
                 "mode": "execute",
                 "chains": [8453],
                 "recipient": RECIPIENT,
+                "owner_address": TEST_OWNER_ADDRESS,
                 "policies": {
                     "min_amount": "10000000",
                 },
@@ -485,6 +531,7 @@ async def test_notify_mode_with_subscription():
                 "mode": "notify",
                 "chains": [8453],
                 "recipient": RECIPIENT,
+                "owner_address": TEST_OWNER_ADDRESS,
             })
             assert reg_resp.status_code == 201
             endpoint = reg_resp.json()

@@ -30,7 +30,7 @@ async def _verify_goldsky_request(request: Request) -> None:
     If ``settings.goldsky_webhook_secret`` is empty the check is
     skipped (convenient during local development).
     """
-    secret = settings.goldsky_webhook_secret
+    secret = settings.goldsky_webhook_secret.get_secret_value()
     if not secret:
         if settings.app_env != "development":
             raise HTTPException(

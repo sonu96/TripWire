@@ -1,24 +1,24 @@
 """Convoy REST API wrapper for TripWire webhook delivery.
 
-Architecture:
-- Primary fast path: Direct async POST via httpx to the developer's webhook URL (lowest latency).
-- Secondary reliable path: Queue via Convoy REST API (handles retries, DLQ, delivery logs).
-
-Both paths fire simultaneously — fast path for speed, Convoy for guaranteed delivery.
+All webhook deliveries are routed through Convoy for reliable delivery with
+retries, DLQ, and delivery logs.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
-import time
 from typing import Any
+
+import time
 
 import httpx
 import structlog
 
 from tripwire.config.settings import settings
+from tripwire.observability.metrics import (
+    tripwire_webhook_delivery_duration_seconds,
+    tripwire_webhooks_sent_total,
+)
+from tripwire.observability.tracing import tracer, StatusCode
 
 logger = structlog.get_logger(__name__)
 
@@ -29,16 +29,12 @@ logger = structlog.get_logger(__name__)
 # Convoy API client (long-lived, reused across requests)
 _convoy_client: httpx.AsyncClient | None = None
 
-# Direct delivery client (separate pool, short timeouts)
-_direct_client: httpx.AsyncClient | None = None
-
-
 def _get_convoy_client() -> httpx.AsyncClient:
     """Return the module-level Convoy API httpx client, initializing lazily."""
     global _convoy_client
     if _convoy_client is None:
         base_url = getattr(settings, "convoy_url", "http://localhost:5005")
-        api_key = getattr(settings, "convoy_api_key", "")
+        api_key = settings.convoy_api_key.get_secret_value()
         _convoy_client = httpx.AsyncClient(
             base_url=base_url,
             headers={
@@ -50,48 +46,6 @@ def _get_convoy_client() -> httpx.AsyncClient:
         )
         logger.info("convoy_client_initialized", base_url=base_url)
     return _convoy_client
-
-
-def _get_direct_client() -> httpx.AsyncClient:
-    """Return the module-level direct-delivery httpx client, initializing lazily."""
-    global _direct_client
-    if _direct_client is None:
-        _direct_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(5.0),
-        )
-        logger.info("direct_delivery_client_initialized")
-    return _direct_client
-
-
-# ---------------------------------------------------------------------------
-# HMAC signing — Convoy-compatible format
-# ---------------------------------------------------------------------------
-
-def _build_signature(secret: str, timestamp: int, payload_json: str) -> str:
-    """Return a hex HMAC-SHA256 signature over '{timestamp}.{payload_json}'.
-
-    This matches the Convoy signing format so consumers can verify with a
-    single shared secret regardless of which delivery path arrived first.
-    """
-    message = f"{timestamp}.{payload_json}".encode()
-    return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
-
-
-def _signature_headers(secret: str, payload_json: str, message_id: str) -> dict[str, str]:
-    """Build the TripWire signature headers for a direct delivery.
-
-    Returns a dict with all three headers expected by verify.py:
-    - ``X-TripWire-Signature`` : ``t={ts},v1={hmac_hex}``
-    - ``X-TripWire-ID``        : unique message/event ID
-    - ``X-TripWire-Timestamp`` : unix timestamp (same value as in signature)
-    """
-    ts = int(time.time())
-    sig = _build_signature(secret, ts, payload_json)
-    return {
-        "X-TripWire-Signature": f"t={ts},v1={sig}",
-        "X-TripWire-ID": message_id,
-        "X-TripWire-Timestamp": str(ts),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +62,7 @@ async def init_convoy(api_key: str | None = None, base_url: str | None = None) -
     """
     global _convoy_client
     base_url = base_url or getattr(settings, "convoy_url", "http://localhost:5005")
-    key = api_key or getattr(settings, "convoy_api_key", "")
+    key = api_key or settings.convoy_api_key.get_secret_value()
     _convoy_client = httpx.AsyncClient(
         base_url=base_url,
         headers={
@@ -136,9 +90,9 @@ async def create_application(developer_id: str, name: str) -> str:
         "type": "outgoing",
         "config": {
             "strategy": {
-                "type": "linear",
-                "duration": 60,
-                "retry_count": 5,
+                "type": "exponential",
+                "duration": 10,
+                "retry_count": 10,
             }
         },
     }
@@ -181,12 +135,14 @@ async def create_endpoint(
     Returns the Convoy endpoint ID.
     """
     client = _get_convoy_client()
+    if not secret:
+        raise ValueError("secret is required — never let Convoy auto-generate")
     body: dict[str, Any] = {
+        "name": description or f"endpoint-{url}",
         "url": url,
         "description": description or "",
+        "secret": secret,
     }
-    if secret:
-        body["secret"] = secret
 
     try:
         response = await client.post(
@@ -213,56 +169,6 @@ async def create_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Fast path — direct delivery
-# ---------------------------------------------------------------------------
-
-async def direct_deliver(url: str, payload: dict, secret: str) -> bool:
-    """Fire-and-forget POST directly to the developer's webhook URL.
-
-    Signs the payload with HMAC-SHA256 (``X-TripWire-Signature`` header) and
-    posts with a 5-second timeout.  Returns ``True`` on any 2xx response,
-    ``False`` otherwise.  Convoy handles retries when this returns ``False``.
-    """
-    import uuid as _uuid
-
-    client = _get_direct_client()
-    payload_json = json.dumps(payload, separators=(",", ":"))
-
-    # Use idempotency_key as the message ID when available, otherwise generate one
-    idem_key = payload.get("idempotency_key")
-    message_id = idem_key or str(_uuid.uuid4())
-
-    sig_headers = _signature_headers(secret, payload_json, message_id)
-
-    # Include Idempotency-Key header when present in the payload
-    extra_headers: dict[str, str] = {}
-    if idem_key:
-        extra_headers["Idempotency-Key"] = idem_key
-
-    try:
-        response = await client.post(
-            url,
-            content=payload_json,
-            headers={
-                "Content-Type": "application/json",
-                **sig_headers,
-                **extra_headers,
-            },
-        )
-        success = response.is_success
-        logger.info(
-            "direct_delivery_attempted",
-            url=url,
-            status_code=response.status_code,
-            success=success,
-        )
-        return success
-    except Exception:
-        logger.exception("direct_delivery_failed", url=url)
-        return False
-
-
-# ---------------------------------------------------------------------------
 # Convoy event (send webhook)
 # ---------------------------------------------------------------------------
 
@@ -281,38 +187,57 @@ async def send_webhook(
 
     Returns the Convoy event ID.
     """
-    client = _get_convoy_client()
-    body: dict[str, Any] = {
-        "event_type": event_type,
-        "data": payload,
-    }
-    if endpoint_id:
-        body["endpoint_id"] = endpoint_id
-    if idempotency_key:
-        body["idempotency_key"] = idempotency_key
+    with tracer.start_as_current_span("convoy_send_webhook") as span:
+        span.set_attribute("convoy.project_id", app_id)
+        span.set_attribute("convoy.event_type", event_type)
+        if endpoint_id:
+            span.set_attribute("convoy.endpoint_id", endpoint_id)
 
-    try:
-        response = await client.post(
-            f"/api/v1/projects/{app_id}/events",
-            json=body,
-        )
-        response.raise_for_status()
-        data = response.json()
-        event_id: str = data["data"]["uid"]
-        logger.info(
-            "convoy_webhook_sent",
-            project_id=app_id,
-            event_type=event_type,
-            event_id=event_id,
-        )
-        return event_id
-    except Exception:
-        logger.exception(
-            "convoy_webhook_send_failed",
-            project_id=app_id,
-            event_type=event_type,
-        )
-        raise
+        client = _get_convoy_client()
+        body: dict[str, Any] = {
+            "event_type": event_type,
+            "data": payload,
+        }
+        if endpoint_id:
+            body["endpoint_id"] = endpoint_id
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key
+
+        send_start = time.perf_counter()
+        try:
+            response = await client.post(
+                f"/api/v1/projects/{app_id}/events",
+                json=body,
+            )
+            response.raise_for_status()
+            tripwire_webhook_delivery_duration_seconds.observe(
+                time.perf_counter() - send_start
+            )
+            data = response.json()
+            event_id: str = data["data"]["uid"]
+            tripwire_webhooks_sent_total.labels(status="success", mode="execute").inc()
+            span.set_attribute("convoy.status", "success")
+            logger.info(
+                "convoy_webhook_sent",
+                project_id=app_id,
+                event_type=event_type,
+                event_id=event_id,
+            )
+            return event_id
+        except Exception as exc:
+            tripwire_webhook_delivery_duration_seconds.observe(
+                time.perf_counter() - send_start
+            )
+            tripwire_webhooks_sent_total.labels(status="failed", mode="execute").inc()
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            span.set_attribute("convoy.status", "failed")
+            logger.exception(
+                "convoy_webhook_send_failed",
+                project_id=app_id,
+                event_type=event_type,
+            )
+            raise
 
 
 # ---------------------------------------------------------------------------

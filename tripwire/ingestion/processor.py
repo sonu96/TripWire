@@ -23,6 +23,7 @@ from typing import Any
 
 import structlog
 
+from tripwire.observability.tracing import tracer, StatusCode
 from tripwire.api.policies.engine import evaluate_policy
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.events import EventRepository
@@ -32,7 +33,9 @@ from tripwire.identity.resolver import IdentityResolver
 from tripwire.ingestion.decoder import (
     AUTHORIZATION_USED_TOPIC,
     TRANSFER_TOPIC,
+    _parse_topics,
     decode_transfer_event,
+    enrich_from_receipt,
 )
 from tripwire.ingestion.finality import check_finality
 from tripwire.notify.realtime import RealtimeNotifier
@@ -49,6 +52,7 @@ from tripwire.webhook.dispatcher import (
     match_endpoints,
     match_subscriptions,
 )
+from tripwire.observability.metrics import record_pipeline_timing
 from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
@@ -109,13 +113,20 @@ class EventProcessor:
         delegates to the appropriate type-specific handler.  Returns a
         summary dict with processing results.
         """
-        event_type = self._detect_event_type(raw_log)
+        with tracer.start_as_current_span("process_event") as span:
+            event_type = self._detect_event_type(raw_log)
+            span.set_attribute("event.type", event_type)
 
-        if event_type == "erc3009_transfer":
-            return await self._process_erc3009_event(raw_log)
-        else:
-            logger.warning("unknown_event_type", event_type=event_type, raw_log=raw_log)
-            return {"status": "skipped", "reason": f"unknown_event_type: {event_type}"}
+            if event_type == "erc3009_transfer":
+                result = await self._process_erc3009_event(raw_log)
+            else:
+                logger.warning("unknown_event_type", event_type=event_type, raw_log=raw_log)
+                result = {"status": "skipped", "reason": f"unknown_event_type: {event_type}"}
+
+            span.set_attribute("event.status", result.get("status", "unknown"))
+            if "tx_hash" in result:
+                span.set_attribute("event.tx_hash", result["tx_hash"])
+            return result
 
     # ── Pre-confirmed (facilitator fast path) ────────────────────
 
@@ -192,10 +203,11 @@ class EventProcessor:
     def _detect_event_type(self, raw_log: dict[str, Any]) -> str:
         """Identify the canonical event type from the raw log's topic0.
 
-        Checks the first topic against ``_EVENT_SIGNATURES``.  Returns a
-        human-readable event type string, or ``"unknown"`` if no match.
+        Checks the first topic against ``_EVENT_SIGNATURES``.  Handles both
+        list topics (Mirror) and comma-separated string topics (Turbo).
+        Returns a human-readable event type string, or ``"unknown"`` if no match.
         """
-        topics = raw_log.get("topics", [])
+        topics = _parse_topics(raw_log.get("topics", []))
         if not topics:
             return "unknown"
 
@@ -215,11 +227,16 @@ class EventProcessor:
 
         # 1. Decode the raw event into an ERC3009Transfer
         t0 = time.perf_counter()
-        try:
-            transfer = decode_transfer_event(raw_log)
-        except Exception:
-            logger.exception("decode_failed", raw_log=raw_log)
-            return {"status": "error", "reason": "decode_failed"}
+        with tracer.start_as_current_span("decode") as decode_span:
+            try:
+                transfer = decode_transfer_event(raw_log)
+            except Exception as exc:
+                logger.exception("decode_failed", raw_log=raw_log)
+                decode_span.record_exception(exc)
+                decode_span.set_status(StatusCode.ERROR, str(exc))
+                decode_span.set_attribute("decode.status", "error")
+                return {"status": "error", "reason": "decode_failed"}
+            decode_span.set_attribute("decode.status", "ok")
         timings["decode_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         tx_hash = transfer.tx_hash
@@ -230,20 +247,37 @@ class EventProcessor:
             tx_hash=tx_hash, chain_id=chain_id.value
         )
 
+        # RPC enrichment: fetch Transfer data if missing (Turbo raw payloads)
+        if not transfer.to_address:
+            from tripwire.ingestion.finality import _get_rpc_client, _RPC_URLS
+
+            t0 = time.perf_counter()
+            rpc_url = _RPC_URLS.get(chain_id)
+            if rpc_url:
+                transfer = await enrich_from_receipt(
+                    transfer, _get_rpc_client(), rpc_url
+                )
+            timings["enrich_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
         logger.info(
             "processing_event",
             event_type="erc3009_transfer",
             authorizer=transfer.authorizer,
         )
 
-        # 2. Nonce deduplication (must run first — short-circuits on duplicates)
+        # 2. Deduplication
+        #    ERC-3009: use authorizer + nonce (unique per authorization)
+        #    Plain Transfer: use tx_hash + log_index (no meaningful nonce)
         t0 = time.perf_counter()
+        is_plain_transfer = not transfer.authorizer
+        dedup_nonce = transfer.nonce if not is_plain_transfer else f"{tx_hash}:{transfer.log_index}"
+        dedup_authorizer = transfer.authorizer if not is_plain_transfer else "transfer"
         try:
             is_new = await asyncio.to_thread(
                 self._nonce_repo.record_nonce,
                 chain_id=chain_id.value,
-                nonce=transfer.nonce,
-                authorizer=transfer.authorizer,
+                nonce=dedup_nonce,
+                authorizer=dedup_authorizer,
             )
         except Exception:
             logger.exception("nonce_dedup_failed", tx_hash=tx_hash)
@@ -251,7 +285,7 @@ class EventProcessor:
         timings["dedup_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         if not is_new:
-            logger.info("duplicate_nonce", tx_hash=tx_hash, nonce=transfer.nonce)
+            logger.info("duplicate_nonce", tx_hash=tx_hash, nonce=dedup_nonce)
             return {"status": "duplicate", "tx_hash": tx_hash}
 
         # 3-4. Finality check and identity resolution
@@ -266,13 +300,19 @@ class EventProcessor:
                 return None
 
         async def _do_identity():
-            try:
-                return await self._resolver.resolve(
-                    transfer.authorizer, chain_id.value
-                )
-            except Exception:
-                logger.warning("identity_resolve_failed", authorizer=transfer.authorizer)
-                return None
+            with tracer.start_as_current_span("identity") as id_span:
+                try:
+                    result = await self._resolver.resolve(
+                        transfer.authorizer, chain_id.value
+                    )
+                    id_span.set_attribute("identity.status", "ok" if result else "empty")
+                    return result
+                except Exception as exc:
+                    logger.warning("identity_resolve_failed", authorizer=transfer.authorizer)
+                    id_span.record_exception(exc)
+                    id_span.set_status(StatusCode.ERROR, str(exc))
+                    id_span.set_attribute("identity.status", "error")
+                    return None
 
         finality, identity = await asyncio.gather(
             _do_finality(), _do_identity()
@@ -349,21 +389,24 @@ class EventProcessor:
 
         # 6. Policy evaluation — filter out endpoints that fail policy
         t0 = time.perf_counter()
-        transfer_data = build_transfer_data(transfer)
-        approved_endpoints: list[Endpoint] = []
+        with tracer.start_as_current_span("policy") as policy_span:
+            transfer_data = build_transfer_data(transfer)
+            approved_endpoints: list[Endpoint] = []
 
-        for ep in matched:
-            policies = ep.policies or EndpointPolicies()
-            allowed, reason = evaluate_policy(transfer_data, identity, policies)
-            if allowed:
-                approved_endpoints.append(ep)
-            else:
-                logger.info(
-                    "policy_rejected",
-                    endpoint_id=ep.id,
-                    tx_hash=tx_hash,
-                    reason=reason,
-                )
+            for ep in matched:
+                policies = ep.policies or EndpointPolicies()
+                allowed, reason = evaluate_policy(transfer_data, identity, policies)
+                if allowed:
+                    approved_endpoints.append(ep)
+                else:
+                    logger.info(
+                        "policy_rejected",
+                        endpoint_id=ep.id,
+                        tx_hash=tx_hash,
+                        reason=reason,
+                    )
+            policy_span.set_attribute("policy.matched", len(matched))
+            policy_span.set_attribute("policy.approved", len(approved_endpoints))
         timings["policy_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # Determine event type based on finality (or use override)
@@ -392,26 +435,32 @@ class EventProcessor:
         t0 = time.perf_counter()
         message_ids: list[str] = []
         if execute_endpoints:
-            try:
-                message_ids = await dispatch_event(
-                    transfer=transfer,
-                    matched_endpoints=execute_endpoints,
-                    provider=self._webhook_provider,
-                    event_type=webhook_event_type,
-                    finality=finality,
-                    identity=identity,
-                )
-            except Exception:
-                logger.exception("dispatch_failed", tx_hash=tx_hash)
+            with tracer.start_as_current_span("dispatch") as dispatch_span:
+                dispatch_span.set_attribute("dispatch.endpoint_count", len(execute_endpoints))
+                try:
+                    message_ids = await dispatch_event(
+                        transfer=transfer,
+                        matched_endpoints=execute_endpoints,
+                        provider=self._webhook_provider,
+                        event_type=webhook_event_type,
+                        finality=finality,
+                        identity=identity,
+                    )
+                    dispatch_span.set_attribute("dispatch.status", "ok")
+                except Exception as exc:
+                    logger.exception("dispatch_failed", tx_hash=tx_hash)
+                    dispatch_span.record_exception(exc)
+                    dispatch_span.set_status(StatusCode.ERROR, str(exc))
+                    dispatch_span.set_attribute("dispatch.status", "error")
 
-            # Record webhook deliveries
-            for i, ep in enumerate(execute_endpoints):
-                msg_id = message_ids[i] if i < len(message_ids) else None
-                self._record_delivery(
-                    endpoint_id=ep.id,
-                    event_id=event_id,
-                    provider_message_id=msg_id,
-                )
+                # Record webhook deliveries
+                for i, ep in enumerate(execute_endpoints):
+                    msg_id = message_ids[i] if i < len(message_ids) else None
+                    self._record_delivery(
+                        endpoint_id=ep.id,
+                        event_id=event_id,
+                        provider_message_id=msg_id,
+                    )
 
         # 8b. Push via Supabase Realtime for Notify-mode endpoints
         #     Filter through subscription matching first
@@ -450,6 +499,13 @@ class EventProcessor:
         timings["dispatch_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         timings["total_ms"] = round((time.perf_counter() - pipeline_start) * 1000, 2)
+
+        # Record Prometheus pipeline metrics
+        record_pipeline_timing(
+            timings,
+            chain_id=transfer.chain_id.value,
+            status="processed",
+        )
 
         logger.info(
             "event_processed",

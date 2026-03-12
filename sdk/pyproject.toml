@@ -1,15 +1,17 @@
 [project]
 name = "tripwire-sdk"
 version = "0.1.0"
-description = "Python SDK for TripWire x402 execution middleware"
+description = "Python SDK for TripWire — programmable onchain event triggers for AI agents"
 requires-python = ">=3.11"
 dependencies = [
+    "eth-account>=0.13.0",
     "httpx>=0.28.0",
     "pydantic>=2.10.0",
 ]
 
 [project.optional-dependencies]
 webhook = []  # No extra deps — verification uses stdlib hmac/hashlib
+x402 = ["x402[httpx,evm]>=2.3.0"]
 
 [build-system]
 requires = ["hatchling"]
