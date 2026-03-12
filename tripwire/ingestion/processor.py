@@ -33,7 +33,9 @@ from tripwire.identity.resolver import IdentityResolver
 from tripwire.ingestion.decoder import (
     AUTHORIZATION_USED_TOPIC,
     TRANSFER_TOPIC,
+    _parse_topics,
     decode_transfer_event,
+    enrich_from_receipt,
 )
 from tripwire.ingestion.finality import check_finality
 from tripwire.notify.realtime import RealtimeNotifier
@@ -201,10 +203,11 @@ class EventProcessor:
     def _detect_event_type(self, raw_log: dict[str, Any]) -> str:
         """Identify the canonical event type from the raw log's topic0.
 
-        Checks the first topic against ``_EVENT_SIGNATURES``.  Returns a
-        human-readable event type string, or ``"unknown"`` if no match.
+        Checks the first topic against ``_EVENT_SIGNATURES``.  Handles both
+        list topics (Mirror) and comma-separated string topics (Turbo).
+        Returns a human-readable event type string, or ``"unknown"`` if no match.
         """
-        topics = raw_log.get("topics", [])
+        topics = _parse_topics(raw_log.get("topics", []))
         if not topics:
             return "unknown"
 
@@ -243,6 +246,18 @@ class EventProcessor:
         structlog.contextvars.bind_contextvars(
             tx_hash=tx_hash, chain_id=chain_id.value
         )
+
+        # RPC enrichment: fetch Transfer data if missing (Turbo raw payloads)
+        if not transfer.to_address:
+            from tripwire.ingestion.finality import _get_rpc_client, _RPC_URLS
+
+            t0 = time.perf_counter()
+            rpc_url = _RPC_URLS.get(chain_id)
+            if rpc_url:
+                transfer = await enrich_from_receipt(
+                    transfer, _get_rpc_client(), rpc_url
+                )
+            timings["enrich_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         logger.info(
             "processing_event",
