@@ -32,6 +32,7 @@ from tripwire.api.routes.facilitator import router as facilitator_router
 from tripwire.api.routes.ingest import router as ingest_router
 from tripwire.api.routes.stats import router as stats_router
 from tripwire.api.routes.subscriptions import router as subscriptions_router
+from tripwire.api.routes.well_known import router as well_known_router
 from tripwire.config.logging import setup_logging
 from tripwire.config.settings import settings
 from tripwire.observability.tracing import setup_tracing, shutdown_tracing
@@ -49,6 +50,7 @@ from tripwire.webhook.dlq_handler import DLQHandler
 from tripwire.api.redis import get_redis
 from tripwire.observability.health import health_registry
 from tripwire.observability.metrics import tripwire_build_info
+from tripwire.mcp.server import create_mcp_app
 from tripwire.webhook.provider import create_webhook_provider
 
 # Configure structlog BEFORE any logger is created
@@ -372,6 +374,12 @@ def create_app() -> FastAPI:
     app.include_router(ingest_router, prefix="/api/v1")
     app.include_router(facilitator_router, prefix="/api/v1")
     app.include_router(stats_router, prefix="/api/v1")
+    app.include_router(well_known_router)
+
+    # ── MCP server (Model Context Protocol for AI agents) ───────
+    mcp_sub_app = create_mcp_app()
+    mcp_sub_app.state.parent_app = app
+    app.mount("/mcp", mcp_sub_app)
 
     # ── Prometheus metrics endpoint ──────────────────────────────
     from prometheus_client import make_asgi_app as _make_metrics_app
