@@ -10,19 +10,24 @@ This document is the definitive reference for TripWire webhook delivery. It cove
 2. [Event Types](#2-event-types)
 3. [Payload Schema](#3-payload-schema)
 4. [Per-Event JSON Examples](#4-per-event-json-examples)
-5. [Delivery Modes](#5-delivery-modes)
-6. [HMAC Signature Verification](#6-hmac-signature-verification)
-7. [Retry Policy](#7-retry-policy)
-8. [Dead Letter Queue](#8-dead-letter-queue)
-9. [Idempotency](#9-idempotency)
-10. [Endpoint Policies](#10-endpoint-policies)
-11. [Example Webhook Handler](#11-example-webhook-handler)
-12. [Testing Webhooks](#12-testing-webhooks)
-13. [Best Practices](#13-best-practices)
+5. [Dynamic Trigger Webhooks](#5-dynamic-trigger-webhooks)
+6. [Delivery Modes](#6-delivery-modes)
+7. [HMAC Signature Verification](#7-hmac-signature-verification)
+8. [Retry Policy](#8-retry-policy)
+9. [Dead Letter Queue](#9-dead-letter-queue)
+10. [Idempotency](#10-idempotency)
+11. [Endpoint Policies](#11-endpoint-policies)
+12. [Example Webhook Handler](#12-example-webhook-handler)
+13. [Testing Webhooks](#13-testing-webhooks)
+14. [Best Practices](#14-best-practices)
 
 ---
 
 ## 1. Overview
+
+TripWire generates webhooks from two sources: **payment events** (ERC-3009 USDC transfers) and **dynamic triggers** (custom onchain event monitors created via the MCP server or API).
+
+### Payment event pipeline
 
 When a USDC transfer is detected on a monitored chain (Ethereum, Base, or Arbitrum), TripWire runs the following pipeline and delivers an event to your registered endpoint:
 
@@ -36,6 +41,17 @@ When a USDC transfer is detected on a monitored chain (Ethereum, Base, or Arbitr
 
 The fast path for pre-confirmed payments (submitted through the x402 facilitator before the transaction lands on-chain) targets a sub-100 ms end-to-end latency and fires a `payment.pre_confirmed` event immediately.
 
+### Dynamic trigger pipeline
+
+Triggers are the primary way to monitor arbitrary onchain events beyond USDC payments. The recommended way to create triggers is through the **MCP server** (mounted at `/mcp`), which exposes tools like `create_trigger` and `list_triggers` for AI agents. Triggers can also be created via the REST API or instantiated from x402 Bazaar templates.
+
+1. A trigger definition specifies a contract address, event signature, chain, and optional filter conditions.
+2. TripWire registers a Goldsky pipeline (or uses an existing one) to watch the specified contract and event.
+3. When a matching onchain event is detected, it is decoded using the trigger's ABI fragment.
+4. The decoded event is delivered as a `trigger.{name}` webhook to all subscribed endpoints.
+
+See [Section 5](#5-dynamic-trigger-webhooks) for the full payload format.
+
 ---
 
 ## 2. Event Types
@@ -47,6 +63,7 @@ The fast path for pre-confirmed payments (submitted through the x402 facilitator
 | `payment.confirmed` | The transaction has reached the required finality depth and is considered irreversible. This is the primary event for triggering business logic. |
 | `payment.failed` | The transaction failed or was reverted on-chain. |
 | `payment.reorged` | A previously confirmed transaction was removed during a chain reorganization. If you acted on a `payment.confirmed` event you must reverse the action. |
+| `trigger.{name}` | A dynamic trigger matched an onchain event. The `{name}` portion is the trigger's registered name (e.g., `trigger.large_swap`, `trigger.nft_mint`). See [Section 5](#5-dynamic-trigger-webhooks). |
 
 ### Finality depths by chain
 
@@ -56,7 +73,7 @@ The fast path for pre-confirmed payments (submitted through the x402 facilitator
 | Base | 8453 | 3 |
 | Arbitrum | 42161 | 1 |
 
-These are the system defaults. Per-endpoint overrides are configured via the `finality_depth` policy field (see [Section 10](#10-endpoint-policies)).
+These are the system defaults. Per-endpoint overrides are configured via the `finality_depth` policy field (see [Section 11](#11-endpoint-policies)).
 
 ---
 
@@ -69,7 +86,7 @@ Every webhook delivers a single `WebhookPayload` JSON object as the HTTP request
 | Field | Type | Always present | Description |
 |---|---|---|---|
 | `id` | `string` | Yes | Unique UUID for this webhook delivery. |
-| `idempotency_key` | `string` | Yes | Stable key for deduplication across retries (see [Section 9](#9-idempotency)). |
+| `idempotency_key` | `string` | Yes | Stable key for deduplication across retries (see [Section 10](#10-idempotency)). |
 | `type` | `string` | Yes | One of the event types in [Section 2](#2-event-types). |
 | `mode` | `string` | Yes | `"execute"` or `"notify"` — the delivery mode of the receiving endpoint. |
 | `timestamp` | `integer` | Yes | Unix timestamp (seconds) at which TripWire created this payload. |
@@ -294,7 +311,107 @@ Fired when a chain reorganization removes a block that contained a previously re
 
 ---
 
-## 5. Delivery Modes
+## 5. Dynamic Trigger Webhooks
+
+Dynamic triggers let you monitor arbitrary onchain events beyond the built-in ERC-3009 payment pipeline. When a trigger fires, TripWire delivers a webhook with type `trigger.{name}` instead of the `payment.*` types used for USDC transfers.
+
+### Creating triggers
+
+The primary way to create triggers is through the **MCP server** (mounted at `/mcp`), which exposes tools that AI agents can call directly:
+
+- `create_trigger` -- define a new trigger with contract address, event signature, chain ID, and optional filter conditions.
+- `list_triggers` -- enumerate existing triggers for the authenticated wallet.
+- `delete_trigger` -- remove a trigger and its associated Goldsky pipeline.
+
+Triggers can also be created via the REST API (`POST /api/v1/triggers`) or instantiated from **x402 Bazaar templates** (pre-built trigger configurations for common patterns like large swaps, NFT mints, or governance votes).
+
+### Bazaar template triggers
+
+Bazaar templates are published in the x402 manifest (`/.well-known/x402-manifest.json`). When a user instantiates a Bazaar template, the resulting trigger behaves identically to a custom trigger -- it generates the same `trigger.{name}` webhook format and follows the same delivery pipeline.
+
+### Webhook payload format
+
+Dynamic trigger webhooks use the same top-level `WebhookPayload` structure as payment events, but with a different `type` and `data` shape.
+
+| Field | Type | Always present | Description |
+|---|---|---|---|
+| `id` | `string` | Yes | Unique UUID for this webhook delivery. |
+| `idempotency_key` | `string` | Yes | Stable key for deduplication across retries. |
+| `type` | `string` | Yes | `trigger.{name}` where `{name}` is the trigger's registered name. |
+| `mode` | `string` | Yes | `"execute"` or `"notify"`. |
+| `timestamp` | `integer` | Yes | Unix timestamp (seconds) at which TripWire created this payload. |
+| `data` | `object` | Yes | Trigger event data. Contains `trigger`, `event`, and optionally `identity`. |
+
+#### `data.trigger` (TriggerMetadata)
+
+| Field | Type | Description |
+|---|---|---|
+| `trigger_id` | `string` | UUID of the trigger definition that matched this event. |
+| `trigger_name` | `string` | Human-readable trigger name (matches the `{name}` in the event type). |
+| `contract_address` | `string` | The contract address being monitored (`0x`-prefixed, checksummed). |
+| `event_signature` | `string` | The Solidity event signature (e.g., `Transfer(address,address,uint256)`). |
+
+#### `data.event` (DecodedEvent)
+
+| Field | Type | Description |
+|---|---|---|
+| `chain_id` | `integer` | Chain where the event occurred. |
+| `tx_hash` | `string` | Transaction hash (`0x`-prefixed, 66 characters). |
+| `block_number` | `integer` | Block number containing the event. |
+| `log_index` | `integer` | Log index within the transaction. |
+| `decoded_fields` | `object` | Key-value map of decoded event parameters. Keys are the Solidity parameter names, values are strings (addresses are checksummed, integers are decimal strings). |
+
+#### `data.identity` (AgentIdentity)
+
+Optional. Same schema as payment webhook identity (see [Section 3](#3-payload-schema)). Present when the transaction sender has a registered ERC-8004 identity.
+
+### Example: `trigger.large_swap`
+
+```json
+{
+  "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "idempotency_key": "idem_t8f7e6d5c4b3a29018f7e6d5c4b3a290",
+  "type": "trigger.large_swap",
+  "mode": "execute",
+  "timestamp": 1741738000,
+  "data": {
+    "trigger": {
+      "trigger_id": "trig_abc123def456",
+      "trigger_name": "large_swap",
+      "contract_address": "0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD",
+      "event_signature": "Swap(address,address,int256,int256,uint160,uint128,int24)"
+    },
+    "event": {
+      "chain_id": 8453,
+      "tx_hash": "0x5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b",
+      "block_number": 23457000,
+      "log_index": 3,
+      "decoded_fields": {
+        "sender": "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+        "recipient": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8",
+        "amount0": "-5000000000",
+        "amount1": "2500000000000000000",
+        "sqrtPriceX96": "1234567890123456789",
+        "liquidity": "9876543210",
+        "tick": "-20100"
+      }
+    },
+    "identity": null
+  }
+}
+```
+
+### Idempotency for trigger webhooks
+
+Trigger webhook idempotency keys follow the same pattern as payment webhooks but include the trigger ID:
+
+```
+idempotency_key = "idem_" + sha256("{chain_id}:{tx_hash_lower}:{log_index}:{trigger_id}:{endpoint_id}")[:32]
+```
+
+---
+
+## 6. Delivery Modes
 
 Each endpoint is registered in exactly one mode. The mode is reflected in every payload's top-level `mode` field.
 
@@ -303,9 +420,9 @@ Each endpoint is registered in exactly one mode. The mode is reflected in every 
 The default mode. TripWire posts the signed `WebhookPayload` JSON to your registered URL via Convoy. Convoy owns reliability: it tracks each delivery attempt, retries on non-2xx responses, and maintains a dead-letter queue.
 
 - Transport: HTTP POST with `Content-Type: application/json`.
-- Authentication: HMAC-SHA256 signature (see [Section 6](#6-hmac-signature-verification)).
-- Retry: Exponential backoff, up to 10 attempts (see [Section 7](#7-retry-policy)).
-- Dead-letter: Yes (see [Section 8](#8-dead-letter-queue)).
+- Authentication: HMAC-SHA256 signature (see [Section 7](#7-hmac-signature-verification)).
+- Retry: Exponential backoff, up to 10 attempts (see [Section 8](#8-retry-policy)).
+- Dead-letter: Yes (see [Section 9](#9-dead-letter-queue)).
 - Expected response: Any `2xx` status code within 30 seconds.
 
 Use Execute mode when your server must take action in response to payment events (fulfill an order, credit an account, trigger a downstream workflow).
@@ -349,7 +466,7 @@ HMAC signature verification does not apply to Notify mode because the data is de
 
 ---
 
-## 6. HMAC Signature Verification
+## 7. HMAC Signature Verification
 
 Every Execute-mode webhook request carries three TripWire-specific headers:
 
@@ -469,7 +586,7 @@ def verify_tripwire_signature(raw_body: bytes, headers: dict, secret: str) -> No
 
 ---
 
-## 7. Retry Policy
+## 8. Retry Policy
 
 TripWire configures Convoy with the following delivery strategy when creating a project for your endpoint:
 
@@ -487,7 +604,7 @@ After all 10 attempts are exhausted the delivery is marked `Failed` in Convoy an
 
 ---
 
-## 8. Dead Letter Queue
+## 9. Dead Letter Queue
 
 ### How deliveries enter the DLQ
 
@@ -542,7 +659,7 @@ POST /api/v1/projects/{project_id}/eventdeliveries/batchretry
 
 ---
 
-## 9. Idempotency
+## 10. Idempotency
 
 ### Idempotency key structure
 
@@ -588,7 +705,7 @@ Recommendations:
 
 ---
 
-## 10. Endpoint Policies
+## 11. Endpoint Policies
 
 Policies filter which payments trigger webhooks before Convoy even attempts delivery. They are configured during endpoint registration in the `policies` field.
 
@@ -624,7 +741,7 @@ Example endpoint registration with policies:
 
 ---
 
-## 11. Example Webhook Handler
+## 12. Example Webhook Handler
 
 ### Full FastAPI handler with idempotency
 
@@ -788,7 +905,7 @@ def verify_tripwire_signature(raw_body: bytes, headers: dict, secret: str) -> No
 
 ---
 
-## 12. Testing Webhooks
+## 13. Testing Webhooks
 
 ### Local development
 
@@ -861,7 +978,7 @@ assert verify_webhook_signature(payload, headers, secret) is True
 
 ---
 
-## 13. Best Practices
+## 14. Best Practices
 
 ### Respond fast, process asynchronously
 

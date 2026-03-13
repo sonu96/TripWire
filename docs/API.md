@@ -2,26 +2,574 @@
 
 TripWire is an x402 execution middleware that monitors ERC-3009 USDC transfers on-chain and delivers structured webhook payloads to registered endpoints. This document is the authoritative reference for the TripWire HTTP API.
 
+The **MCP API** is the primary interface for AI agents. The REST API documented in later sections is used for human-facing dashboards and server-to-server integrations.
+
 ---
 
 ## Table of Contents
 
-1. [Base URL](#base-url)
-2. [Authentication](#authentication)
-3. [Error Responses](#error-responses)
-4. [Pagination](#pagination)
-5. [Rate Limiting](#rate-limiting)
-6. [Data Types and Enumerations](#data-types-and-enumerations)
-7. [Auth](#auth)
-8. [Endpoints](#endpoints)
-9. [Subscriptions](#subscriptions)
-10. [Events](#events)
-11. [Deliveries](#deliveries)
-12. [Stats](#stats)
-13. [Ingest](#ingest)
-14. [Facilitator](#facilitator)
-15. [Health](#health)
-16. [Webhook Payload Reference](#webhook-payload-reference)
+1. [MCP API (AI Agent Interface)](#mcp-api-ai-agent-interface)
+2. [Base URL](#base-url)
+3. [Authentication](#authentication)
+4. [Error Responses](#error-responses)
+5. [Pagination](#pagination)
+6. [Rate Limiting](#rate-limiting)
+7. [Data Types and Enumerations](#data-types-and-enumerations)
+8. [Auth](#auth)
+9. [Endpoints](#endpoints)
+10. [Subscriptions](#subscriptions)
+11. [Events](#events)
+12. [Deliveries](#deliveries)
+13. [Stats](#stats)
+14. [Ingest](#ingest)
+15. [Facilitator](#facilitator)
+16. [Health](#health)
+17. [Webhook Payload Reference](#webhook-payload-reference)
+
+---
+
+## MCP API (AI Agent Interface)
+
+The Model Context Protocol (MCP) server is the primary way AI agents interact with TripWire. It exposes 8 tools over a JSON-RPC 2.0 transport that let agents register middleware, create and manage triggers, browse the Bazaar template catalog, and query events -- all in a single protocol that LLM tool-calling understands natively.
+
+---
+
+### Connection
+
+**Endpoint:** `POST /mcp/`
+
+**Transport:** Streamable HTTP (JSON-RPC 2.0 over HTTP POST)
+
+Every request is a single JSON-RPC 2.0 envelope:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "register_middleware",
+    "arguments": { "url": "https://my-agent.example.com/webhook" }
+  }
+}
+```
+
+**Supported methods:**
+
+| Method | Description |
+|---|---|
+| `initialize` | Handshake; returns protocol version (`2024-11-05`), server info, and capabilities |
+| `tools/list` | Returns the schema for all 8 tools |
+| `tools/call` | Executes a tool (requires authentication) |
+
+All responses use HTTP 200 with JSON-RPC success or error payloads -- the HTTP status code is always 200; check the `result` or `error` field in the JSON body.
+
+---
+
+### Authentication
+
+All `tools/call` invocations require an `Authorization` header:
+
+```
+Authorization: Bearer <ethereum_address>
+```
+
+The value is the agent's Ethereum address in hex (`0x` + 40 hex characters). The server normalizes it to lowercase.
+
+**MVP auth** -- the bearer token is the raw address. Full SIWE verification is planned for a future release.
+
+**ERC-8004 Identity Resolution:** When a tool has a non-zero `min_reputation` threshold, the server resolves the agent's ERC-8004 identity on Base (chain 8453) and checks `reputation_score` against the threshold. If the agent is unregistered or below threshold, the call is rejected with error code `-32001`.
+
+**Reputation gating summary:**
+
+| Minimum Reputation | Tools |
+|---|---|
+| 0.0 (any agent) | `list_triggers`, `list_templates`, `get_trigger_status`, `search_events` |
+| 0.3 | `register_middleware`, `create_trigger`, `activate_template` |
+| 0.5 | `delete_trigger` |
+
+---
+
+### Tools
+
+#### 1. register_middleware
+
+Register TripWire as middleware for your API. Creates an endpoint and optionally instantiates triggers from Bazaar template slugs or custom definitions.
+
+**Minimum reputation:** 0.3
+
+**Input schema:**
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `url` | `string` | Yes | -- | Your webhook/callback URL |
+| `mode` | `string` | No | `"execute"` | Delivery mode: `"notify"` (Supabase Realtime) or `"execute"` (webhook POST) |
+| `chains` | `integer[]` | No | `[8453]` | Chain IDs to monitor |
+| `recipient` | `string` | No | Agent address | Recipient address to watch |
+| `policies` | `object` | No | `{}` | Endpoint policies (`min_amount`, `max_amount`, `allowed_senders`, `blocked_senders`, `required_agent_class`, `min_reputation_score`, `finality_depth`) |
+| `template_slugs` | `string[]` | No | `[]` | Bazaar template slugs to instantiate as triggers |
+| `custom_triggers` | `object[]` | No | `[]` | Custom trigger definitions (see below) |
+
+**custom_triggers item schema:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `event_signature` | `string` | Yes | Solidity event signature (e.g. `Transfer(address,address,uint256)`) |
+| `name` | `string` | No | Human-readable trigger name |
+| `abi` | `array` | No | ABI fragment for the event |
+| `contract_address` | `string` | No | Contract to watch (null for any) |
+| `chain_ids` | `integer[]` | No | Chain IDs to monitor (defaults to endpoint chains) |
+| `filter_rules` | `array` | No | Filter predicates on decoded event fields |
+| `webhook_event_type` | `string` | No | Event type string (default: `"payment.confirmed"`) |
+
+**Output:**
+
+```json
+{
+  "endpoint_id": "abc123xyz...",
+  "webhook_secret": "hex-encoded-64-char-secret",
+  "trigger_ids": ["trig1", "trig2"],
+  "mode": "execute",
+  "url": "https://my-agent.example.com/webhook"
+}
+```
+
+The `webhook_secret` is returned exactly once. Store it immediately for HMAC verification of incoming webhooks.
+
+---
+
+#### 2. create_trigger
+
+Create a custom trigger for an existing endpoint.
+
+**Minimum reputation:** 0.3
+
+**Input schema:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `endpoint_id` | `string` | Yes | Target endpoint ID |
+| `event_signature` | `string` | Yes | Solidity event signature (e.g. `Transfer(address,address,uint256)`) |
+| `name` | `string` | No | Human-readable trigger name |
+| `abi` | `array` | No | ABI fragment for the event |
+| `contract_address` | `string` | No | Contract to watch (null for any) |
+| `chain_ids` | `integer[]` | No | Chain IDs to monitor (defaults to endpoint's chains) |
+| `filter_rules` | `array` | No | Filter predicates on decoded event fields |
+| `webhook_event_type` | `string` | No | Event type string |
+| `reputation_threshold` | `number` | No | Min reputation for senders to pass this trigger |
+
+**Output:**
+
+```json
+{
+  "trigger_id": "trig_abc123",
+  "endpoint_id": "ep_xyz789",
+  "event_signature": "Transfer(address,address,uint256)",
+  "active": true
+}
+```
+
+---
+
+#### 3. list_triggers
+
+List all triggers owned by the calling agent.
+
+**Minimum reputation:** 0.0
+
+**Input schema:**
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `active_only` | `boolean` | No | `true` | Only return active triggers |
+
+**Output:**
+
+```json
+{
+  "triggers": [
+    {
+      "id": "trig_abc123",
+      "name": "USDC Transfer Monitor",
+      "endpoint_id": "ep_xyz789",
+      "event_signature": "Transfer(address,address,uint256)",
+      "chain_ids": [8453],
+      "active": true,
+      "created_at": "2026-03-01T00:00:00+00:00"
+    }
+  ],
+  "count": 1
+}
+```
+
+---
+
+#### 4. delete_trigger
+
+Deactivate a trigger (soft delete). The agent must own the trigger.
+
+**Minimum reputation:** 0.5
+
+**Input schema:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `trigger_id` | `string` | Yes | Trigger ID to deactivate |
+
+**Output:**
+
+```json
+{
+  "trigger_id": "trig_abc123",
+  "active": false
+}
+```
+
+---
+
+#### 5. list_templates
+
+Browse available trigger templates from the Bazaar catalog.
+
+**Minimum reputation:** 0.0
+
+**Input schema:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `category` | `string` | No | Filter by category (e.g. `"defi"`, `"payments"`, `"nft"`) |
+
+**Output:**
+
+```json
+{
+  "templates": [
+    {
+      "slug": "usdc-transfer",
+      "name": "USDC Transfer",
+      "description": "Monitor ERC-3009 USDC transferWithAuthorization events",
+      "category": "payments",
+      "event_signature": "AuthorizationUsed(address,bytes32)",
+      "default_chains": [8453],
+      "parameter_schema": {},
+      "reputation_threshold": 0.0,
+      "install_count": 42
+    }
+  ],
+  "count": 1
+}
+```
+
+---
+
+#### 6. activate_template
+
+Instantiate a Bazaar template with custom parameters for an existing endpoint.
+
+**Minimum reputation:** 0.3
+
+**Input schema:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `slug` | `string` | Yes | Template slug from the Bazaar |
+| `endpoint_id` | `string` | Yes | Target endpoint ID (must be owned by caller) |
+| `params` | `object` | No | Custom parameters: `chain_ids`, `contract_address`, `filter_rules` |
+
+**Output:**
+
+```json
+{
+  "trigger_id": "trig_tmpl_abc",
+  "template_slug": "usdc-transfer",
+  "endpoint_id": "ep_xyz789",
+  "event_signature": "AuthorizationUsed(address,bytes32)",
+  "active": true
+}
+```
+
+---
+
+#### 7. get_trigger_status
+
+Check trigger health, configuration, and event count.
+
+**Minimum reputation:** 0.0
+
+**Input schema:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `trigger_id` | `string` | Yes | Trigger ID to check (must be owned by caller) |
+
+**Output:**
+
+```json
+{
+  "trigger_id": "trig_abc123",
+  "name": "USDC Transfer Monitor",
+  "event_signature": "Transfer(address,address,uint256)",
+  "chain_ids": [8453],
+  "active": true,
+  "event_count": 157,
+  "created_at": "2026-03-01T00:00:00+00:00"
+}
+```
+
+`event_count` is `-1` if the count query fails.
+
+---
+
+#### 8. search_events
+
+Query recent events across all of the agent's endpoints.
+
+**Minimum reputation:** 0.0
+
+**Input schema:**
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | `integer` | No | `50` | Max results (1--100) |
+| `status` | `string` | No | -- | Filter by event status (e.g. `"confirmed"`, `"pending"`) |
+| `chain_id` | `integer` | No | -- | Filter by chain ID |
+
+**Output:**
+
+```json
+{
+  "events": [
+    {
+      "id": "evt_abc123",
+      "endpoint_id": "ep_xyz789",
+      "tx_hash": "0x...",
+      "chain_id": 8453,
+      "status": "confirmed",
+      "block_number": 12345678,
+      "created_at": "2026-03-13T00:00:00Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+---
+
+### x402 Bazaar Manifest
+
+```
+GET /.well-known/x402-manifest.json
+```
+
+**Authentication:** None required.
+
+Returns the x402 service manifest for Bazaar discovery. AI agents and x402 facilitators use this endpoint to discover TripWire's MCP tools and pricing.
+
+**Response:**
+
+```json
+{
+  "@context": "https://x402.org/context",
+  "name": "TripWire",
+  "description": "Programmable onchain event triggers for AI agents",
+  "version": "1.0.0",
+  "identity": {
+    "protocol": "ERC-8004",
+    "registry": "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
+  },
+  "mcp": {
+    "endpoint": "/mcp",
+    "transport": "streamable-http",
+    "tools": [
+      "register_middleware", "create_trigger", "list_triggers",
+      "delete_trigger", "list_templates", "activate_template",
+      "get_trigger_status", "search_events"
+    ]
+  },
+  "services": [
+    { "name": "register_middleware", "price": "$0.003", "network": "eip155:8453" },
+    { "name": "create_trigger", "price": "$0.003", "network": "eip155:8453" },
+    { "name": "activate_template", "price": "$0.001", "network": "eip155:8453" }
+  ],
+  "supported_chains": [
+    { "chain_id": 8453, "name": "Base" },
+    { "chain_id": 1, "name": "Ethereum" },
+    { "chain_id": 42161, "name": "Arbitrum" }
+  ]
+}
+```
+
+---
+
+### MCP Error Codes
+
+All errors are returned inside the JSON-RPC `error` object. The HTTP status is always `200`.
+
+| Code | Constant | Description |
+|---|---|---|
+| `-32700` | Parse error | Malformed JSON body |
+| `-32600` | Invalid request | Missing `jsonrpc: "2.0"` or `method` field |
+| `-32601` | Method not found | Unknown JSON-RPC method or unknown tool name |
+| `-32602` | Invalid params | Missing required tool parameters |
+| `-32603` | Internal error | Unhandled exception during tool execution |
+| `-32000` | Auth required | Missing or invalid `Authorization: Bearer <address>` header |
+| `-32001` | Reputation too low | Agent's ERC-8004 reputation score is below the tool's `min_reputation` threshold |
+
+**Application-level error codes** are returned in the tool result (inside `content[0].text`) when the operation fails logically rather than at the protocol level:
+
+| `code` field | Meaning |
+|---|---|
+| `NOT_FOUND` | Trigger, endpoint, or template not found |
+| `FORBIDDEN` | Agent does not own the requested resource |
+| `INTERNAL` | Unexpected failure during tool execution |
+
+When a tool returns an error, `isError` is `true` in the response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"error\": \"Trigger not found\", \"code\": \"NOT_FOUND\"}"
+      }
+    ],
+    "isError": true
+  }
+}
+```
+
+---
+
+### Example Flows
+
+#### Complete: Register middleware with a Bazaar template
+
+This flow registers TripWire as middleware, creates an endpoint in `execute` mode on Base, and activates the `usdc-transfer` template in a single call.
+
+**1. Initialize the MCP session:**
+
+```json
+POST /mcp/
+Authorization: Bearer 0xAgentAddress1234567890abcdef1234567890ab
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "initialize",
+  "params": {}
+}
+```
+
+Response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "protocolVersion": "2024-11-05",
+    "capabilities": { "tools": { "listChanged": false } },
+    "serverInfo": { "name": "tripwire-mcp", "version": "1.0.0" }
+  }
+}
+```
+
+**2. Register middleware with a template:**
+
+```json
+POST /mcp/
+Authorization: Bearer 0xAgentAddress1234567890abcdef1234567890ab
+
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "register_middleware",
+    "arguments": {
+      "url": "https://my-agent.example.com/webhook",
+      "mode": "execute",
+      "chains": [8453],
+      "template_slugs": ["usdc-transfer"],
+      "policies": {
+        "min_amount": "1000000",
+        "finality_depth": 5
+      }
+    }
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"endpoint_id\": \"ep_abc123\", \"webhook_secret\": \"a1b2c3...64hex\", \"trigger_ids\": [\"trig_xyz\"], \"mode\": \"execute\", \"url\": \"https://my-agent.example.com/webhook\"}"
+      }
+    ],
+    "isError": false
+  }
+}
+```
+
+Store the `webhook_secret` -- it is not returned again. TripWire will POST signed webhooks to your URL when matching onchain events are detected.
+
+---
+
+#### Create a custom trigger for Uniswap V3 swaps
+
+This flow creates a custom trigger that watches for Uniswap V3 Swap events on a specific pool contract.
+
+```json
+POST /mcp/
+Authorization: Bearer 0xAgentAddress1234567890abcdef1234567890ab
+
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "method": "tools/call",
+  "params": {
+    "name": "create_trigger",
+    "arguments": {
+      "endpoint_id": "ep_abc123",
+      "event_signature": "Swap(address,address,int256,int256,uint160,uint128,int24)",
+      "name": "USDC/ETH Pool Swaps",
+      "contract_address": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+      "chain_ids": [1],
+      "filter_rules": [
+        { "field": "amount0", "op": "gt", "value": "1000000000" }
+      ]
+    }
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"trigger_id\": \"trig_swap1\", \"endpoint_id\": \"ep_abc123\", \"event_signature\": \"Swap(address,address,int256,int256,uint160,uint128,int24)\", \"active\": true}"
+      }
+    ],
+    "isError": false
+  }
+}
+```
 
 ---
 

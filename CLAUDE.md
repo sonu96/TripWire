@@ -22,6 +22,7 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - L2 Middleware: TripWire FastAPI (verification, deduplication, identity, policy engine)
 - L3 Delivery: Convoy + direct POST (webhook delivery with retries, HMAC signing, DLQ)
 - L4 Application: Developer's API (executes business logic on verified webhook)
+- L5 MCP: Agent interface (MCP tools for trigger management, middleware registration)
 
 ## Key Directories
 - `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking
@@ -31,6 +32,7 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - `tripwire/db/` — Supabase client, repositories, SQL migrations
 - `tripwire/types/` — Shared Pydantic models
 - `tripwire/config/` — Settings via pydantic-settings
+- `tripwire/mcp/` — MCP server, tool handlers, agent middleware registration
 - `sdk/` — tripwire-sdk Python package
 - `tests/` — Unit and integration tests
 
@@ -38,6 +40,8 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - **x402**: HTTP 402 micropayment protocol using ERC-3009 transferWithAuthorization
 - **ERC-3009**: transferWithAuthorization standard for gasless USDC transfers
 - **ERC-8004**: Onchain AI agent identity registry (went mainnet Jan 29 2026)
+- **Trigger Registry**: Dynamic trigger system — create triggers for any EVM event via MCP or API, no deploy needed
+- **x402 Bazaar**: Agent service discovery via /.well-known/x402-manifest.json
 
 ## Webhook Delivery (Convoy + direct httpx fast path)
 - Dual-path architecture: direct httpx POST for low-latency fast path; Convoy for managed delivery with retries, HMAC signing, and DLQ
@@ -59,3 +63,4 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - All amounts in smallest unit (USDC = 6 decimals)
 - structlog for structured JSON logging
 - No web3.py — use httpx for raw JSON-RPC + eth-abi for decoding
+- MCP tools follow the Model Context Protocol spec — mounted at /mcp

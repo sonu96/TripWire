@@ -138,6 +138,7 @@ Run each migration file from `tripwire/db/migrations/` sequentially:
 2. **`002_add_event_type_data.sql`** through **`009_performance_indexes.sql`** -- Incremental schema evolution (event types, realtime, endpoint_id FK on events, Svix-to-Convoy migration, performance indexes).
 3. **`010_wallet_auth.sql`** -- Adds `owner_address`, `registration_tx_hash`, `registration_chain_id` to endpoints. Removes legacy API key columns.
 4. **`011_rls_policies.sql`** -- Enables Row Level Security on all tables. Creates the `set_wallet_context()` RPC function and per-table isolation policies using `app.current_wallet` session variable.
+5. **`013_trigger_registry.sql`** -- Creates the `triggers` table for dynamic trigger definitions (contract address, event signature, chain ID, filter conditions, owner wallet). Required for the MCP trigger creation flow and x402 Bazaar templates.
 
 ### Running Migrations
 
@@ -149,6 +150,7 @@ Run each migration file from `tripwire/db/migrations/` sequentially:
 psql "$SUPABASE_DB_URL" -f tripwire/db/migrations/001_initial.sql
 psql "$SUPABASE_DB_URL" -f tripwire/db/migrations/010_wallet_auth.sql
 psql "$SUPABASE_DB_URL" -f tripwire/db/migrations/011_rls_policies.sql
+psql "$SUPABASE_DB_URL" -f tripwire/db/migrations/013_trigger_registry.sql
 # ... and all migrations in between
 ```
 
@@ -248,6 +250,60 @@ The pipeline should deliver decoded log data including:
 
 ---
 
+## MCP Server
+
+TripWire includes a built-in MCP (Model Context Protocol) server mounted at `/mcp`. It requires no separate deployment -- it starts automatically as part of the main FastAPI application.
+
+### What it provides
+
+The MCP server exposes TripWire's trigger management capabilities as tools that AI agents can call directly:
+
+- `create_trigger` -- register a new onchain event trigger (contract address, event signature, chain, filters).
+- `list_triggers` -- enumerate triggers owned by the authenticated wallet.
+- `delete_trigger` -- remove a trigger and clean up its Goldsky pipeline.
+- `get_trigger` -- retrieve details for a specific trigger by ID.
+
+### Configuration
+
+No additional environment variables are needed beyond the standard TripWire configuration. The MCP server uses the same Supabase connection, wallet authentication, and Goldsky credentials as the rest of the application.
+
+### Connecting an AI agent
+
+Point your MCP-compatible client (e.g., Claude Desktop, Cursor, or a custom agent) at:
+
+```
+https://your-domain/mcp
+```
+
+The MCP server handles SSE transport and tool discovery automatically.
+
+---
+
+## x402 Bazaar
+
+The x402 Bazaar provides a catalog of pre-built trigger templates that users can instantiate with a single MCP tool call or API request.
+
+### Manifest endpoint
+
+The Bazaar manifest is served automatically at:
+
+```
+GET /.well-known/x402-manifest.json
+```
+
+This endpoint requires no authentication and returns the list of available templates with their descriptions, required parameters, and pricing.
+
+### How it works
+
+1. An AI agent discovers available templates via the manifest or the MCP `list_bazaar_templates` tool.
+2. The agent instantiates a template by providing the required parameters (e.g., contract address, threshold values).
+3. TripWire creates a trigger from the template and registers the corresponding Goldsky pipeline.
+4. Webhooks from Bazaar-instantiated triggers use the same `trigger.{name}` format as custom triggers.
+
+No separate deployment is needed -- the Bazaar endpoints are part of the main TripWire application.
+
+---
+
 ## Health Checks
 
 TripWire exposes three operational endpoints (not behind auth):
@@ -300,6 +356,7 @@ TripWire uses `structlog` for all logging. Logs are structured JSON in productio
 | `tripwire_shutting_down` | INFO | Graceful shutdown in progress. |
 | `supabase_ready` | INFO | Supabase client connected. |
 | `webhook_provider_ready` | INFO | Convoy (or LogOnly fallback) initialized. |
+| `mcp_server_ready` | INFO | MCP server mounted at `/mcp`, ready for tool calls. |
 | `dlq_handler_ready` | INFO | Dead letter queue poller started. |
 | `finality_poller_ready` | INFO | Block finality confirmation poller started. |
 | `goldsky_webhook_secret_missing` | WARNING | Goldsky secret is empty in non-dev environment; ingest will reject all requests. |

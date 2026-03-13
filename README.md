@@ -1,69 +1,67 @@
 # TripWire
 
-**x402 Execution Middleware for AI Agents**
+**Middleware + Event Trigger Platform for AI Agents**
 
-Programmable onchain event triggers that watch ERC-3009 USDC transfers on Base, Ethereum, and Arbitrum -- and deliver verified webhooks so your application can execute.
+Programmable onchain event triggers for AI agents. Watch any onchain event -- ERC-3009 payments, ERC-20 transfers, DeFi swaps, NFT mints -- across Base, Ethereum, and Arbitrum. Define triggers via MCP tools or the REST API, and TripWire decodes, filters, enriches, and delivers verified webhooks so your application can execute. x402 payment webhooks are the flagship use case.
 
 ---
 
 ## What is TripWire?
 
-When a user pays for an API call via the [x402 protocol](https://www.x402.org/), an ERC-3009 `transferWithAuthorization` settles onchain -- but nothing tells the application to _execute_. TripWire fills that gap.
+TripWire is a **middleware + event trigger platform for AI agents** -- the infrastructure layer between onchain events and application execution.
 
-TripWire watches for ERC-3009 (USDC) transfer events across Base, Ethereum, and Arbitrum. When a payment lands, TripWire decodes the event, deduplicates by nonce, resolves the payer's onchain identity via [ERC-8004](https://github.com/ethereum/ERCs/pull/8004), evaluates developer-defined policies, and delivers a signed webhook to your application so it can fulfill the request.
+Any onchain event can be a trigger. Define what you care about (an ERC-3009 payment, a Uniswap swap, an NFT mint, a governance vote), and TripWire watches for it, decodes it with the right ABI, applies your filter rules, resolves the sender's onchain identity via [ERC-8004](https://github.com/ethereum/ERCs/pull/8004), evaluates your policies, and delivers a signed webhook so your application can execute.
 
-Think of it as **Stripe Webhooks for x402**: register an endpoint, TripWire watches for payments to your address, and you get a verified `payment.confirmed` webhook with transfer data, finality status, and agent identity -- everything you need to execute.
+**x402 payment webhooks are the flagship use case.** When a user pays for an API call via the [x402 protocol](https://www.x402.org/), an ERC-3009 `transferWithAuthorization` settles onchain -- but nothing tells the application to _execute_. TripWire fills that gap. Think of it as **Stripe Webhooks for x402**.
 
-Built on x402 + ERC-8004. Three ingestion paths from sub-second to real-time. Convoy-backed delivery with exponential retry and dead-letter queue. SIWE wallet authentication with no API keys.
+**Beyond payments**, the Trigger Registry lets you define custom triggers for any event signature. The Bazaar provides pre-built templates (USDC transfers, Uniswap swaps, Aave liquidations) that you can activate with a single MCP tool call.
+
+Built on x402 + ERC-8004. MCP-native (8 tools for AI agent self-service). Convoy-backed delivery with exponential retry and dead-letter queue. SIWE wallet authentication with no API keys.
 
 ---
 
 ## Architecture
 
 ```
-                          INGESTION                          PROCESSING                       DELIVERY
-                     (three parallel paths)              (single pipeline)
+  INGESTION               PROCESSING (generic pipeline)                         DELIVERY
 
-  +---------------------+
-  |   Goldsky Turbo      |  2-4s
-  |   (webhook sink)     |------+
-  +---------------------+      |
-                                |     +--------+   +--------+   +----------+   +--------+   +----------+
-  +---------------------+      +---->|        |   |        |   |          |   |        |   |          |
-  |  x402 Facilitator    |  ~100ms   | Decode +-->+ Nonce  +-->+ Identity +-->+ Policy +-->+ Dispatch |
-  |  (pre-settlement)    |---------->|        |   | Dedup  |   | ERC-8004 |   | Engine |   |          |
-  +---------------------+      +--->|        |   |        |   |          |   |        |   +----+-----+
-                                |     +--------+   +--------+   +----------+   +--------+        |
-  +---------------------+      |                                                                  |
-  |  WebSocket RPC       |  real-time                                                            |
-  |  (log subscription)  |------+                                                                 |
-  +---------------------+                                                                        |
-                                                                                                  v
-                                                                                    +-------------+-------------+
-                                                                                    |                           |
-                                                                              +-----v------+          +--------v--------+
-                                                                              |   Convoy    |          | Supabase        |
-                                                                              |   Webhook   |          | Realtime        |
-                                                                              | (execute)   |          | (notify)        |
-                                                                              +-----+------+          +--------+--------+
-                                                                                    |                           |
-                                                                                    v                           v
-                                                                              +-----------+            +-----------+
-                                                                              | Your API  |            | Your App  |
-                                                                              | (HMAC     |            | (push     |
-                                                                              |  signed)  |            |  events)  |
-                                                                              +-----------+            +-----------+
+  +------------------+
+  |  Goldsky Turbo   |    +----------+   +---------+   +----------+   +--------+   +----------+
+  |  (webhook sink)  |--->|          |   |         |   |          |   |        |   |          |
+  +------------------+    | Generic  |   | Filter  |   | Identity |   | Policy |   |          |
+                          | Decoder  +-->+ Engine  +-->+ ERC-8004 +-->+ Engine +-->+ Dispatch |
+  +------------------+    | (ABI-    |   | (per-   |   |          |   |        |   |          |
+  | x402 Facilitator |--->| driven)  |   | trigger |   |          |   |        |   +----+-----+
+  | (pre-settlement) |    |          |   |  rules) |   |          |   |        |        |
+  +------------------+    +-----^----+   +---------+   +----------+   +--------+        |
+                                |                                                        v
+                          +-----+------+                                   +-------------+-------------+
+                          |  Trigger   |                                   |                           |
+                          |  Registry  |                             +-----v------+          +--------v--------+
+                          | (dynamic   |                             |   Convoy    |          | Supabase        |
+                          |  triggers  |                             |   Webhook   |          | Realtime        |
+                          |  + Bazaar  |                             | (execute)   |          | (notify)        |
+                          |  templates)|                             +-----+------+          +--------+--------+
+                          +------------+                                   |                           |
+                                                                           v                           v
+  +------------------+                                               +-----------+            +-----------+
+  |   MCP Server     |  AI agents register triggers,                 | Your API  |            | Your App  |
+  |  (8 tools via    |  browse templates, search events              | (HMAC     |            | (push     |
+  |   JSON-RPC)      |  via MCP tool calls                           |  signed)  |            |  events)  |
+  +------------------+                                               +-----------+            +-----------+
 
   AUTH: SIWE (EIP-4361) wallet signatures -- nonce-based replay prevention -- body hash binding
+  MCP:  Bearer <eth_address> (MVP) -- SIWE verification planned
 ```
 
-**Three ingestion paths, one pipeline:**
+**Pipeline flow:** Goldsky Turbo delivers raw logs. The Generic Decoder resolves the event type -- first checking hardcoded signatures (ERC-3009), then the dynamic Trigger Registry. Events are decoded with the trigger's ABI, run through the Filter Engine, enriched with ERC-8004 identity, evaluated against endpoint policies, and dispatched.
+
+**Two ingestion paths, one pipeline:**
 
 | Path | Latency | Source | Use Case |
 |------|---------|--------|----------|
 | Goldsky Turbo | 2-4s | Webhook sink from indexed chain data | Primary production path, reliable batch delivery |
 | x402 Facilitator | ~100ms | Pre-settlement hook from facilitator | Fast path -- payment detected before tx is onchain |
-| WebSocket RPC | Real-time | `eth_subscribe` log subscription | Opt-in medium-speed path for direct RPC watchers |
 
 **Two delivery modes:**
 
@@ -185,6 +183,147 @@ def handle_webhook(request):
 
 ---
 
+## MCP Server (AI Agent Interface)
+
+TripWire exposes a **Model Context Protocol (MCP)** server at `/mcp/` over HTTP (JSON-RPC 2.0). AI agents can discover TripWire, register it as middleware, create triggers, and query events -- all through standard MCP tool calls.
+
+**8 tools available:**
+
+| Tool | Description |
+|------|-------------|
+| `register_middleware` | Register TripWire as middleware for your API. Creates an endpoint + triggers from templates or custom definitions. |
+| `create_trigger` | Create a custom trigger for an existing endpoint (any event signature). |
+| `list_triggers` | List your active triggers. |
+| `delete_trigger` | Deactivate a trigger (soft delete). |
+| `list_templates` | Browse available trigger templates from the Bazaar. |
+| `activate_template` | Instantiate a Bazaar template with custom params for an endpoint. |
+| `get_trigger_status` | Check trigger health and event count. |
+| `search_events` | Query recent events for your triggers and endpoints. |
+
+**Authentication:** Bearer token containing the agent's Ethereum address (`Authorization: Bearer 0xYourAddress`).
+
+**Example -- register_middleware via MCP:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "register_middleware",
+    "arguments": {
+      "url": "https://my-agent.com/webhook",
+      "mode": "execute",
+      "chains": [8453],
+      "template_slugs": ["x402-usdc-payment"],
+      "custom_triggers": [
+        {
+          "event_signature": "Transfer(address,address,uint256)",
+          "name": "USDC large transfers",
+          "contract_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+          "chain_ids": [8453],
+          "filter_rules": [
+            {"field": "value", "op": "gte", "value": "1000000000"}
+          ],
+          "webhook_event_type": "transfer.large"
+        }
+      ]
+    }
+  }
+}
+```
+
+Returns: `endpoint_id`, `webhook_secret`, `trigger_ids`, `mode`, `url`.
+
+The `register_middleware` flow creates the endpoint, instantiates any Bazaar templates you specify, and creates any custom triggers -- all in a single tool call. This is the primary onboarding path for AI agents.
+
+---
+
+## Trigger Registry
+
+The Trigger Registry makes TripWire **event-type agnostic**. Instead of only supporting hardcoded ERC-3009 events, any Solidity event signature can be registered as a trigger.
+
+**How it works:**
+
+1. An agent creates a trigger (via MCP `create_trigger` or `register_middleware`) with an event signature, ABI fragment, optional contract address, chain IDs, and filter rules.
+2. When Goldsky delivers a raw log, the processor checks the topic0 against hardcoded signatures first, then falls back to the dynamic Trigger Registry.
+3. Matched triggers have their events decoded with the trigger's ABI, run through the Filter Engine (per-trigger filter predicates on decoded fields), and dispatched to the trigger's endpoint.
+
+**Filter rules** are predicates on decoded event fields:
+
+```json
+[
+  {"field": "value", "op": "gte", "value": "1000000"},
+  {"field": "from", "op": "eq", "value": "0xSomeAddress"}
+]
+```
+
+Supported operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `contains`.
+
+**Dynamic triggers are stored in Supabase** and looked up by topic0 hash at runtime. Each trigger is scoped to an owner address and linked to an endpoint.
+
+---
+
+## Bazaar (Trigger Templates)
+
+The Bazaar is a library of pre-built trigger templates that agents can activate with a single MCP tool call. Templates define a canonical event signature, ABI, default chain IDs, default filter rules, and a category.
+
+**Browse templates:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "list_templates",
+    "arguments": {"category": "payments"}
+  }
+}
+```
+
+**Activate a template:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "activate_template",
+    "arguments": {
+      "slug": "x402-usdc-payment",
+      "endpoint_id": "your-endpoint-id",
+      "params": {
+        "chain_ids": [8453, 1],
+        "contract_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+      }
+    }
+  }
+}
+```
+
+Templates are categorized (`payments`, `defi`, `nft`, `governance`, etc.) and track install counts.
+
+---
+
+## x402 Bazaar Discovery
+
+TripWire publishes a service manifest at `/.well-known/x402-manifest.json` for x402 Bazaar discovery. This allows AI agents and x402-compatible clients to programmatically discover TripWire's capabilities, MCP endpoint, available tools, pricing, and supported chains.
+
+```
+GET /.well-known/x402-manifest.json
+```
+
+The manifest includes:
+- MCP endpoint and transport info
+- List of all 8 MCP tools
+- Priced services (`register_middleware` at $0.003, `create_trigger` at $0.003, `activate_template` at $0.001)
+- Supported chains (Base, Ethereum, Arbitrum)
+- ERC-8004 identity registry address
+
+---
+
 ## Authentication
 
 TripWire uses **SIWE (Sign-In with Ethereum, EIP-4361)** for all authenticated endpoints. There are no API keys -- your Ethereum wallet is your identity.
@@ -249,6 +388,13 @@ All business endpoints are prefixed with `/api/v1`. Operational endpoints are at
 | `GET` | `/health` | None | Basic health check (status, version) |
 | `GET` | `/health/detailed` | None | Deep health check -- probes Supabase, webhook provider, identity resolver |
 | `GET` | `/ready` | None | Readiness probe -- returns 200 only after startup completes |
+| `GET` | `/.well-known/x402-manifest.json` | None | x402 Bazaar service manifest for agent discovery |
+
+### MCP (Model Context Protocol)
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/mcp/` | Bearer `<eth_address>` | JSON-RPC 2.0 endpoint. Methods: `initialize`, `tools/list`, `tools/call` |
 
 ### Authentication
 
@@ -460,9 +606,13 @@ python -m tripwire.main
 | Component | Technology | Role |
 |-----------|------------|------|
 | API Framework | [FastAPI](https://fastapi.tiangolo.com/) + Uvicorn | Async HTTP server with auto-generated OpenAPI docs |
-| Database | [Supabase](https://supabase.com/) (PostgreSQL) | Endpoints, events, nonces, deliveries + Realtime for notify mode |
+| MCP Server | JSON-RPC 2.0 over HTTP (`/mcp/`) | Model Context Protocol interface -- 8 tools for AI agent self-service |
+| Database | [Supabase](https://supabase.com/) (PostgreSQL) | Endpoints, events, triggers, templates, nonces, deliveries + Realtime for notify mode |
 | Webhook Delivery | [Convoy](https://getconvoy.io/) (self-hosted) | Exponential retry (10 attempts), HMAC signing, DLQ, delivery logs |
-| Chain Indexing | [Goldsky](https://goldsky.com/) Turbo | Real-time ERC-3009 event streaming via webhook sink |
+| Chain Indexing | [Goldsky](https://goldsky.com/) Turbo | Real-time onchain event streaming via webhook sink |
+| Generic Decoder | eth-abi (ABI-driven) | Decodes any event using trigger-provided ABI fragments |
+| Filter Engine | Built-in | Per-trigger filter predicates on decoded event fields (eq, gte, lt, in, etc.) |
+| Trigger Registry | Supabase + in-memory lookup | Dynamic trigger definitions, Bazaar templates, topic0-based routing |
 | Nonce Storage | [Redis](https://redis.io/) | SIWE nonce storage with TTL for replay prevention |
 | Payment Protocol | [x402](https://www.x402.org/) | HTTP-native micropayments -- $1 USDC registration on Base |
 | Agent Identity | [ERC-8004](https://github.com/ethereum/ERCs/pull/8004) | Onchain AI agent identity registry (class, deployer, reputation) |
@@ -480,4 +630,4 @@ Proprietary. All Rights Reserved.
 
 ---
 
-Built for the agentic web. Payments happen onchain. TripWire makes them actionable.
+Built for the agentic web. Events happen onchain. TripWire makes them actionable.
