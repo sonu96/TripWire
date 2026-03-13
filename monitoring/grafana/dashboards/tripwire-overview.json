@@ -563,38 +563,6 @@
           "refId": "A"
         }
       ]
-    },
-    {
-      "id": 43,
-      "type": "timeseries",
-      "title": "WebSocket Connections",
-      "description": "Active WebSocket subscriber connections to blockchain RPC nodes",
-      "datasource": { "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 37 },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "fixedColor": "purple", "mode": "fixed" },
-          "custom": {
-            "drawStyle": "line",
-            "lineInterpolation": "stepAfter",
-            "fillOpacity": 20,
-            "spanNulls": false
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "single" }
-      },
-      "targets": [
-        {
-          "expr": "tripwire_ws_connections_active",
-          "legendFormat": "WS connections",
-          "refId": "A"
-        }
-      ]
     }
   ]
 }

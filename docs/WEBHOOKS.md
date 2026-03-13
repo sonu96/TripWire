@@ -26,7 +26,7 @@ This document is the definitive reference for TripWire webhook delivery. It cove
 
 When a USDC transfer is detected on a monitored chain (Ethereum, Base, or Arbitrum), TripWire runs the following pipeline and delivers an event to your registered endpoint:
 
-1. An on-chain ERC-3009 `TransferWithAuthorization` log is ingested from Goldsky or a WebSocket subscriber.
+1. An on-chain ERC-3009 `TransferWithAuthorization` log is ingested from Goldsky Turbo.
 2. TripWire decodes the log, deduplicates the ERC-3009 nonce, and checks finality.
 3. The sender's optional ERC-8004 on-chain agent identity is resolved in parallel with finality.
 4. The transfer is matched against registered endpoints by recipient address and chain.

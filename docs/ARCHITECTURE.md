@@ -49,18 +49,6 @@ Agent -> x402 Facilitator -> POST /api/v1/ingest/facilitator -> TripWire Pipelin
 
 This path skips decode and finality (no tx hash or block number yet). A synthetic pseudo-tx-hash is generated for correlation. The pipeline still runs nonce dedup, identity resolution, policy evaluation, and dispatch. The finality poller later promotes the event to `confirmed` once the real transaction lands.
 
-### 2c. WebSocket Subscriber (Real-Time Path)
-
-```
-Chain RPC Node -> WebSocket -> TripWire WebSocketSubscriberManager -> Pipeline
-```
-
-- **Latency:** ~200-500ms (block propagation time)
-- **Reliability:** Lower. WebSocket connections can drop; no built-in backfill.
-- **Config:** Opt-in via `WS_SUBSCRIBER_ENABLED=true`. Requires `*_WS_URL` environment variables.
-
-The `WebSocketSubscriberManager` subscribes to `eth_subscribe("logs")` on each configured chain, filtering for known USDC contract addresses and ERC-3009 topic signatures. Received logs are fed directly into the `EventProcessor`.
-
 ---
 
 ## 3. Processing Pipeline
@@ -76,7 +64,7 @@ The processor inspects `topic[0]` of the raw log against `_EVENT_SIGNATURES` to 
 `decoder.py` extracts structured data from the raw log:
 
 - **Goldsky path:** Parses the pre-decoded row with `decoded` (authorizer, nonce) and `transfer` (from, to, value) fields.
-- **WebSocket/raw path:** Uses `decode_erc3009_from_logs()` to decode both `Transfer(address,address,uint256)` and `AuthorizationUsed(address,bytes32)` from raw EVM log topics and data.
+- **Raw path:** Uses `decode_erc3009_from_logs()` to decode both `Transfer(address,address,uint256)` and `AuthorizationUsed(address,bytes32)` from raw EVM log topics and data.
 - **Facilitator path:** Skipped entirely; data arrives pre-structured.
 
 Chain ID is resolved from the raw log's `chain_id` field or by reverse-mapping the USDC contract address.

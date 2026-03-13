@@ -13,7 +13,6 @@ a single ERC3009Transfer model when given a full transaction's logs.
 
 from typing import Any
 
-import httpx
 import structlog
 from eth_abi import decode
 
@@ -161,82 +160,6 @@ def _parse_topics(raw_topics: Any) -> list[str]:
     if isinstance(raw_topics, str):
         return [t.strip() for t in raw_topics.split(",") if t.strip()]
     return []
-
-
-async def enrich_from_receipt(
-    transfer: ERC3009Transfer,
-    rpc_client: httpx.AsyncClient,
-    rpc_url: str,
-) -> ERC3009Transfer:
-    """Fetch the tx receipt via RPC and extract Transfer event data.
-
-    When the Turbo pipeline only sends the AuthorizationUsed event,
-    we need to look up the Transfer event from the same transaction
-    to get from_address, to_address, and value.
-
-    Mutates and returns the same transfer object with enriched fields.
-    """
-    if transfer.to_address:
-        return transfer  # already has Transfer data, skip
-
-    tx_hash = transfer.tx_hash
-    if not tx_hash:
-        return transfer
-
-    try:
-        resp = await rpc_client.post(
-            rpc_url,
-            json={
-                "jsonrpc": "2.0",
-                "method": "eth_getTransactionReceipt",
-                "params": [tx_hash],
-                "id": 1,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        if "error" in data or data.get("result") is None:
-            logger.warning("rpc_receipt_error", tx_hash=tx_hash, error=data.get("error"))
-            return transfer
-
-        receipt = data["result"]
-        contract = transfer.token.lower()
-
-        for log in receipt.get("logs", []):
-            log_address = log.get("address", "").lower()
-            topics = log.get("topics", [])
-
-            if (
-                log_address == contract
-                and len(topics) >= 3
-                and topics[0].lower() == TRANSFER_TOPIC.lower()
-            ):
-                from_addr = _address_from_topic(topics[1])
-                to_addr = _address_from_topic(topics[2])
-                log_data = log.get("data", "0x")
-                data_bytes = bytes.fromhex(log_data.removeprefix("0x"))
-                (value,) = decode(["uint256"], data_bytes)
-
-                transfer.from_address = from_addr
-                transfer.to_address = to_addr
-                transfer.value = str(value)
-
-                logger.info(
-                    "rpc_enriched_transfer",
-                    tx_hash=tx_hash,
-                    from_addr=from_addr,
-                    to_addr=to_addr,
-                    value=str(value),
-                )
-                return transfer
-
-        logger.warning("rpc_no_transfer_in_receipt", tx_hash=tx_hash)
-
-    except Exception:
-        logger.exception("rpc_enrich_failed", tx_hash=tx_hash)
-
-    return transfer
 
 
 def decode_transfer_event(raw_log: dict[str, Any]) -> ERC3009Transfer:

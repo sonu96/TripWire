@@ -44,7 +44,6 @@ from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.identity.resolver import create_resolver
 from tripwire.ingestion.finality_poller import FinalityPoller
 from tripwire.ingestion.processor import EventProcessor
-from tripwire.ingestion.ws_subscriber import WebSocketSubscriberManager
 from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.webhook.dlq_handler import DLQHandler
 from tripwire.api.redis import get_redis
@@ -185,19 +184,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("finality_poller_skipped", enabled=False)
 
-    # WebSocket subscriber (medium-speed fast path for real-time ERC-3009 detection)
-    ws_manager: WebSocketSubscriberManager | None = None
-    if settings.ws_subscriber_enabled:
-        ws_manager = WebSocketSubscriberManager(processor)
-        await ws_manager.start()
-        app.state.ws_subscriber_manager = ws_manager
-        logger.info("ws_subscriber_ready")
-    else:
-        logger.info(
-            "ws_subscriber_skipped",
-            ws_subscriber_enabled=settings.ws_subscriber_enabled,
-        )
-
     # Set Prometheus build info
     tripwire_build_info.info({"version": __version__, "env": settings.app_env})
 
@@ -209,10 +195,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # -- Shutdown ------------------------------------------------
-    # Stop WebSocket subscriber if running
-    if ws_manager is not None:
-        await ws_manager.stop()
-
     # Stop finality poller if running
     if finality_poller is not None:
         await finality_poller.stop()

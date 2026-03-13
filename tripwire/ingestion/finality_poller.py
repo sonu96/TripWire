@@ -1,5 +1,4 @@
-"""Finality poller — background task that promotes pending events to confirmed
-and detects chain reorgs.
+"""Finality poller — background task that promotes pending events to confirmed.
 
 Runs as an asyncio background task started during the FastAPI lifespan.  Each
 supported chain is polled on its own cadence (fast for L2s, slower for L1)
@@ -12,10 +11,12 @@ because finality semantics differ:
 For every pending event the poller:
   1. Fetches the current block number via JSON-RPC.
   2. Computes confirmations = current_block - event.block_number.
-  3. Checks whether the block_hash at event.block_number still matches;
-     a mismatch means a reorg occurred.
-  4. Transitions the event to ``confirmed`` or ``reorged`` and fires the
-     appropriate webhook (``payment.confirmed`` / ``payment.reorged``).
+  3. Once confirmations >= required depth, transitions the event to
+     ``confirmed`` and fires a ``payment.confirmed`` webhook.
+
+Note: Manual reorg detection (block hash comparison) has been removed.
+Goldsky Edge provides cross-node consensus, making manual reorg checks
+redundant for our use case.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from tripwire.config.settings import Settings
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.events import EventRepository
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
-from tripwire.ingestion.finality import get_block_number, _get_rpc_client, _RPC_URLS
+from tripwire.ingestion.finality import get_block_number
 from tripwire.types.models import (
     ERC3009Transfer,
     FINALITY_DEPTHS,
@@ -53,11 +54,12 @@ _CHAIN_INTERVAL_ATTR: dict[ChainId, str] = {
 
 
 class FinalityPoller:
-    """Background poller that confirms pending events and detects reorgs.
+    """Background poller that confirms pending events once they reach
+    the required finality depth.
 
     Spawns one asyncio task per chain so each chain runs on its own poll
-    cadence.  All tasks share the persistent httpx client from
-    ``finality.py`` for RPC calls.
+    cadence.  Uses ``get_block_number()`` from ``finality.py`` for the
+    current block height via JSON-RPC.
     """
 
     def __init__(
@@ -191,38 +193,11 @@ class FinalityPoller:
         current_block: int,
         required: int,
     ) -> None:
-        """Check finality and reorg status for a single pending event."""
+        """Check finality depth for a single pending event."""
         event_id: str = event["id"]
         block_number: int = event["block_number"]
-        stored_block_hash: str = event.get("block_hash", "")
 
         confirmations = max(0, current_block - block_number)
-
-        # ── Reorg detection ──────────────────────────────────────────
-        if stored_block_hash:
-            try:
-                live_block_hash = await self._fetch_block_hash(chain_id, block_number)
-            except Exception:
-                logger.exception(
-                    "finality_poll_hash_fetch_failed",
-                    event_id=event_id,
-                    block_number=block_number,
-                )
-                # Can't determine reorg; skip this event and retry next cycle
-                return
-
-            if live_block_hash and live_block_hash != stored_block_hash:
-                logger.warning(
-                    "reorg_detected",
-                    event_id=event_id,
-                    block_number=block_number,
-                    stored_hash=stored_block_hash,
-                    live_hash=live_block_hash,
-                )
-                await self._transition_event(
-                    event, "reorged", WebhookEventType.PAYMENT_REORGED
-                )
-                return
 
         # ── Finality promotion ───────────────────────────────────────
         if confirmations >= required:
@@ -417,37 +392,3 @@ class FinalityPoller:
         )
         return result.data
 
-    async def _fetch_block_hash(self, chain_id: ChainId, block_number: int) -> str:
-        """Fetch the block hash for a specific block number via JSON-RPC.
-
-        Uses eth_getBlockByNumber with ``false`` (no full txs) and extracts
-        the ``hash`` field.  Returns empty string on unexpected responses.
-        """
-        rpc_url = _RPC_URLS[chain_id]
-        payload = {
-            "jsonrpc": "2.0",
-            "method": "eth_getBlockByNumber",
-            "params": [hex(block_number), False],
-            "id": 1,
-        }
-        client = _get_rpc_client()
-        resp = await client.post(rpc_url, json=payload)
-        resp.raise_for_status()
-
-        data = resp.json()
-        if "error" in data:
-            raise RuntimeError(
-                f"RPC error fetching block hash on chain {chain_id}: {data['error']}"
-            )
-
-        block = data.get("result")
-        if block is None:
-            # Block not found (pruned or too far ahead) — treat as inconclusive
-            logger.warning(
-                "finality_poll_block_not_found",
-                chain=chain_id.name,
-                block_number=block_number,
-            )
-            return ""
-
-        return block.get("hash", "")

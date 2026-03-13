@@ -30,10 +30,13 @@ class Settings(BaseSettings):
     # x402 Facilitator
     facilitator_webhook_secret: SecretStr = SecretStr("")
 
-    # Blockchain RPC
-    base_rpc_url: str = "https://mainnet.base.org"
-    ethereum_rpc_url: str = "https://eth.llamarpc.com"
-    arbitrum_rpc_url: str = "https://arb1.arbitrum.io/rpc"
+    # Blockchain RPC (should point to Goldsky Edge endpoints)
+    base_rpc_url: str = ""
+    ethereum_rpc_url: str = ""
+    arbitrum_rpc_url: str = ""
+
+    # Goldsky Edge
+    goldsky_edge_api_key: SecretStr = SecretStr("")
 
     # x402 Payment Gating
     x402_facilitator_url: str = "https://x402.org/facilitator"
@@ -76,12 +79,6 @@ class Settings(BaseSettings):
     otel_enabled: bool = False
     otel_endpoint: str = ""
     otel_service_name: str = "tripwire"
-
-    # WebSocket Subscriber (medium-speed fast path ~200-500ms)
-    ws_subscriber_enabled: bool = False  # opt-in; Goldsky is the primary ingestion path
-    ethereum_ws_url: str = ""
-    base_ws_url: str = ""
-    arbitrum_ws_url: str = ""
 
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> "Settings":

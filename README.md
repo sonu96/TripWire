@@ -385,14 +385,14 @@ All configuration is via environment variables (loaded from `.env` via pydantic-
 | `ERC8004_REPUTATION_REGISTRY` | `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63` | ERC-8004 reputation registry |
 | `IDENTITY_CACHE_TTL` | `300` | Identity resolution cache TTL (seconds) |
 
-### WebSocket Subscriber
+### Goldsky Edge RPC
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WS_SUBSCRIBER_ENABLED` | `false` | Enable WebSocket RPC log subscription (opt-in) |
-| `ETHEREUM_WS_URL` | -- | Ethereum WebSocket RPC URL |
-| `BASE_WS_URL` | -- | Base WebSocket RPC URL |
-| `ARBITRUM_WS_URL` | -- | Arbitrum WebSocket RPC URL |
+| `BASE_RPC_URL` | -- | Goldsky Edge RPC endpoint for Base |
+| `ETHEREUM_RPC_URL` | -- | Goldsky Edge RPC endpoint for Ethereum |
+| `ARBITRUM_RPC_URL` | -- | Goldsky Edge RPC endpoint for Arbitrum |
+| `GOLDSKY_EDGE_API_KEY` | -- | Goldsky Edge API key for authenticated RPC |
 
 ### Dead Letter Queue
 

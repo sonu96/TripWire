@@ -57,18 +57,17 @@ class IdentityResolver(Protocol):
 
 # ── Chain ID → RPC URL helper ────────────────────────────────────
 
-_CHAIN_RPC_KEYS: dict[int, str] = {
-    1: "ethereum_rpc_url",
-    8453: "base_rpc_url",
-    42161: "arbitrum_rpc_url",
-}
-
 
 def _rpc_url_for(settings: Settings, chain_id: int) -> str:
-    key = _CHAIN_RPC_KEYS.get(chain_id)
-    if key is None:
+    urls: dict[int, str] = {
+        1: settings.ethereum_rpc_url,
+        8453: settings.base_rpc_url,
+        42161: settings.arbitrum_rpc_url,
+    }
+    url = urls.get(chain_id)
+    if url is None:
         raise ValueError(f"Unsupported chain_id: {chain_id}")
-    return getattr(settings, key)
+    return url
 
 
 def _cache_key(address: str, chain_id: int) -> str:
@@ -89,13 +88,7 @@ class ERC8004Resolver:
         self._identity_registry = settings.erc8004_identity_registry
         self._reputation_registry = settings.erc8004_reputation_registry
         self._settings = settings
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0, connect=5.0),
-            limits=httpx.Limits(
-                max_keepalive_connections=5,
-                max_connections=10,
-            ),
-        )
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._cache: dict[str, _CacheEntry] = {}
 
     async def _eth_call(self, rpc_url: str, to: str, data: str) -> str | None:

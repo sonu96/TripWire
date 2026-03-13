@@ -1287,7 +1287,7 @@ Same shape as above, with `"status": "unhealthy"` at the top level. The affected
 GET /ready
 ```
 
-Returns `200 OK` only after the application's lifespan startup has completed — all repositories, processors, and background tasks (finality poller, DLQ handler, WebSocket subscriber) have been initialized. Returns `503` if startup is still in progress.
+Returns `200 OK` only after the application's lifespan startup has completed — all repositories, processors, and background tasks (finality poller, DLQ handler) have been initialized. Returns `503` if startup is still in progress.
 
 **Response — 200 OK**
 

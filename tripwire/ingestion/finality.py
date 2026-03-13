@@ -1,4 +1,4 @@
-"""Block finality tracking via raw JSON-RPC calls."""
+"""Block finality tracking via raw JSON-RPC calls (Goldsky Edge)."""
 
 import httpx
 import structlog
@@ -13,35 +13,52 @@ from tripwire.types.models import (
 
 logger = structlog.get_logger(__name__)
 
-# ── Persistent httpx client with connection pooling ──────────────
-_rpc_client: httpx.AsyncClient | None = None
+# ── Shared httpx client (created lazily, no singleton gymnastics) ──
+_http_client: httpx.AsyncClient | None = None
 
 
-def _get_rpc_client() -> httpx.AsyncClient:
-    global _rpc_client
-    if _rpc_client is None:
-        _rpc_client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
-    return _rpc_client
+def _get_http_client() -> httpx.AsyncClient:
+    """Return a module-level async HTTP client, creating it on first use."""
+    global _http_client
+    if _http_client is None:
+        headers: dict[str, str] = {}
+        edge_key = settings.goldsky_edge_api_key.get_secret_value()
+        if edge_key:
+            headers["Authorization"] = f"Bearer {edge_key}"
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            headers=headers,
+        )
+    return _http_client
 
 
-_RPC_URLS: dict[ChainId, str] = {
-    ChainId.ETHEREUM: settings.ethereum_rpc_url,
-    ChainId.BASE: settings.base_rpc_url,
-    ChainId.ARBITRUM: settings.arbitrum_rpc_url,
-}
+def get_rpc_url(chain_id: ChainId) -> str:
+    """Return the configured Goldsky Edge RPC URL for a chain."""
+    urls = {
+        ChainId.ETHEREUM: settings.ethereum_rpc_url,
+        ChainId.BASE: settings.base_rpc_url,
+        ChainId.ARBITRUM: settings.arbitrum_rpc_url,
+    }
+    url = urls.get(chain_id, "")
+    if not url:
+        raise ValueError(f"No RPC URL configured for chain {chain_id}")
+    return url
 
 
-async def get_block_number(chain_id: ChainId) -> int:
+async def get_block_number(
+    chain_id: ChainId,
+    client: httpx.AsyncClient | None = None,
+) -> int:
     """Fetch the latest block number from the chain via JSON-RPC."""
-    rpc_url = _RPC_URLS[chain_id]
+    rpc_url = get_rpc_url(chain_id)
     payload = {
         "jsonrpc": "2.0",
         "method": "eth_blockNumber",
         "params": [],
         "id": 1,
     }
-    client = _get_rpc_client()
-    resp = await client.post(rpc_url, json=payload)
+    http = client or _get_http_client()
+    resp = await http.post(rpc_url, json=payload)
     resp.raise_for_status()
 
     data = resp.json()
@@ -57,13 +74,14 @@ async def get_block_number(chain_id: ChainId) -> int:
 async def check_finality(
     transfer: ERC3009Transfer,
     current_block: int | None = None,
+    client: httpx.AsyncClient | None = None,
 ) -> FinalityStatus:
     """Check whether a transfer has reached finality.
 
     If current_block is not provided, it will be fetched via RPC.
     """
     if current_block is None:
-        current_block = await get_block_number(transfer.chain_id)
+        current_block = await get_block_number(transfer.chain_id, client=client)
 
     required = FINALITY_DEPTHS[transfer.chain_id]
     confirmations = max(0, current_block - transfer.block_number)

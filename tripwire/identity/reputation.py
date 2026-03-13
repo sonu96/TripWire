@@ -20,13 +20,6 @@ _GET_SUMMARY_SELECTOR = "0x8ee8febc"
 _CACHE_TTL = 300  # 5 minutes
 _DEFAULT_SCORE = 50.0
 
-_CHAIN_RPC_KEYS: dict[int, str] = {
-    1: "ethereum_rpc_url",
-    8453: "base_rpc_url",
-    42161: "arbitrum_rpc_url",
-}
-
-
 class _ScoreCacheEntry:
     __slots__ = ("score", "expires_at")
 
@@ -41,7 +34,7 @@ class ReputationService:
     def __init__(self, settings: Settings) -> None:
         self._registry = settings.erc8004_reputation_registry
         self._settings = settings
-        self._client = httpx.AsyncClient(timeout=10)
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._cache: dict[str, _ScoreCacheEntry] = {}
 
     async def get_reputation_score(self, agent_id: int, chain_id: int) -> float:
@@ -57,11 +50,14 @@ class ReputationService:
         return score
 
     async def _fetch_score(self, agent_id: int, chain_id: int) -> float:
-        rpc_key = _CHAIN_RPC_KEYS.get(chain_id)
-        if rpc_key is None:
+        urls: dict[int, str] = {
+            1: self._settings.ethereum_rpc_url,
+            8453: self._settings.base_rpc_url,
+            42161: self._settings.arbitrum_rpc_url,
+        }
+        rpc_url = urls.get(chain_id)
+        if rpc_url is None:
             return _DEFAULT_SCORE
-
-        rpc_url: str = getattr(self._settings, rpc_key)
         # getSummary(uint256 agentId, address[] clientAddresses)
         # Pass empty client list for aggregate score
         data = _GET_SUMMARY_SELECTOR + encode(

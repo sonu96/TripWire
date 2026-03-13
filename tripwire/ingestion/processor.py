@@ -35,7 +35,6 @@ from tripwire.ingestion.decoder import (
     TRANSFER_TOPIC,
     _parse_topics,
     decode_transfer_event,
-    enrich_from_receipt,
 )
 from tripwire.ingestion.finality import check_finality
 from tripwire.notify.realtime import RealtimeNotifier
@@ -246,18 +245,6 @@ class EventProcessor:
         structlog.contextvars.bind_contextvars(
             tx_hash=tx_hash, chain_id=chain_id.value
         )
-
-        # RPC enrichment: fetch Transfer data if missing (Turbo raw payloads)
-        if not transfer.to_address:
-            from tripwire.ingestion.finality import _get_rpc_client, _RPC_URLS
-
-            t0 = time.perf_counter()
-            rpc_url = _RPC_URLS.get(chain_id)
-            if rpc_url:
-                transfer = await enrich_from_receipt(
-                    transfer, _get_rpc_client(), rpc_url
-                )
-            timings["enrich_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         logger.info(
             "processing_event",

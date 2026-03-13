@@ -70,11 +70,6 @@ tripwire_dlq_backlog = Gauge(
     "Number of failed deliveries in the dead-letter queue",
 )
 
-tripwire_ws_connections_active = Gauge(
-    "tripwire_ws_connections_active",
-    "Number of active WebSocket subscriber connections",
-)
-
 # ── Info ──────────────────────────────────────────────────────
 
 tripwire_build_info = Info(

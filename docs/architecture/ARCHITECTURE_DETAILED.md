@@ -314,9 +314,6 @@ YOUR DASHBOARD:
 │  x402 Facilitator       ~100ms        ~100ms         ~100ms            │
 │  Hook (pre-chain)       (fastest)     (fastest)      (fastest)         │
 │                                                                        │
-│  WebSocket              ~300ms        ~250ms*        ~12.1s            │
-│  eth_subscribe          (post-seq)    (flashblocks)  (post-block)      │
-│                                                                        │
 │  Goldsky Turbo          ~500ms-1s     ~1-2s          ~12.5s            │
 │  Webhook                (reliable)    (reliable)     (reliable)        │
 │                                                                        │
@@ -335,7 +332,6 @@ YOUR DASHBOARD:
 │  TOTAL END-TO-END                                                      │
 │                                                                        │
 │  Fast path (facilitator)  ~107-115ms   ~107-115ms    ~107-115ms        │
-│  Medium path (WebSocket)  ~307-315ms   ~257-265ms    ~12.1s            │
 │  Reliable path (Goldsky)  ~507ms-1s    ~1-2s         ~12.5s            │
 │                                                                        │
 │  * Base Flashblocks = 200ms mini-blocks (requires Flashblocks RPC)     │

@@ -111,14 +111,14 @@ All configuration is managed through `tripwire/config/settings.py` using `pydant
 | `ERC8004_IDENTITY_REGISTRY` | No | `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` | Address of the ERC-8004 identity registry contract. |
 | `ERC8004_REPUTATION_REGISTRY` | No | `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63` | Address of the ERC-8004 reputation registry contract. |
 
-### WebSocket Subscriber
+### Goldsky Edge RPC
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `WS_SUBSCRIBER_ENABLED` | No | `false` | Enable the WebSocket subscriber for real-time ERC-3009 detection (~200-500ms). Opt-in; Goldsky is the primary ingestion path. |
-| `ETHEREUM_WS_URL` | No | `""` | Ethereum WebSocket RPC endpoint. |
-| `BASE_WS_URL` | No | `""` | Base WebSocket RPC endpoint. |
-| `ARBITRUM_WS_URL` | No | `""` | Arbitrum WebSocket RPC endpoint. |
+| `BASE_RPC_URL` | Yes (prod) | `""` | Goldsky Edge RPC endpoint for Base. |
+| `ETHEREUM_RPC_URL` | Yes (prod) | `""` | Goldsky Edge RPC endpoint for Ethereum. |
+| `ARBITRUM_RPC_URL` | Yes (prod) | `""` | Goldsky Edge RPC endpoint for Arbitrum. |
+| `GOLDSKY_EDGE_API_KEY` | No | `""` | Goldsky Edge API key for authenticated RPC access. |
 
 ### Production Validation
 
@@ -281,7 +281,7 @@ Deep health check that probes Supabase connectivity, webhook provider status, an
 
 ### `GET /ready`
 
-Readiness probe. Returns `200` only after the full lifespan startup completes (Supabase client, webhook provider, identity resolver, nonce repo, event processor, DLQ handler, finality poller, and WebSocket subscriber are all initialized). Returns `503` during startup.
+Readiness probe. Returns `200` only after the full lifespan startup completes (Supabase client, webhook provider, identity resolver, nonce repo, event processor, DLQ handler, and finality poller are all initialized). Returns `503` during startup.
 
 ---
 
@@ -302,7 +302,6 @@ TripWire uses `structlog` for all logging. Logs are structured JSON in productio
 | `webhook_provider_ready` | INFO | Convoy (or LogOnly fallback) initialized. |
 | `dlq_handler_ready` | INFO | Dead letter queue poller started. |
 | `finality_poller_ready` | INFO | Block finality confirmation poller started. |
-| `ws_subscriber_ready` | INFO | WebSocket subscriber started (opt-in). |
 | `goldsky_webhook_secret_missing` | WARNING | Goldsky secret is empty in non-dev environment; ingest will reject all requests. |
 | `x402_payment_gating_disabled` | WARNING | Treasury address is empty; endpoint registration is free. |
 | `x402_payment_gating_unavailable` | WARNING | x402 package not installed. |
