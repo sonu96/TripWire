@@ -216,3 +216,55 @@ class Subscription(BaseModel):
     filters: SubscriptionFilter
     active: bool = True
     created_at: datetime
+
+
+# ── Trigger Registry ─────────────────────────────────────────
+
+
+class TriggerFilter(BaseModel):
+    """Filter predicate applied to decoded event fields."""
+    field: str
+    op: str = "eq"
+    value: Any = None
+
+
+class Trigger(BaseModel):
+    """Dynamic trigger definition from the trigger registry."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    id: str
+    owner_address: str
+    endpoint_id: str
+    name: str | None = None
+    event_signature: str
+    abi: list[dict[str, Any]]
+    contract_address: str | None = None
+    chain_ids: list[int] = Field(default_factory=list)
+    filter_rules: list[TriggerFilter] = Field(default_factory=list)
+    webhook_event_type: str
+    reputation_threshold: float = 0.0
+    batch_id: str | None = None
+    active: bool = True
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class TriggerTemplate(BaseModel):
+    """Pre-built trigger template for the Bazaar."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    id: str
+    name: str
+    slug: str
+    description: str | None = None
+    category: str = "general"
+    event_signature: str
+    abi: list[dict[str, Any]]
+    default_chains: list[int] = Field(default_factory=list)
+    default_filters: list[TriggerFilter] = Field(default_factory=list)
+    parameter_schema: list[dict[str, Any]] = Field(default_factory=list)
+    webhook_event_type: str
+    reputation_threshold: float = 0.0
+    author_address: str | None = None
+    is_public: bool = True
+    install_count: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

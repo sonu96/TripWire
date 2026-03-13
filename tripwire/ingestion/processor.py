@@ -53,6 +53,9 @@ from tripwire.webhook.dispatcher import (
 )
 from tripwire.observability.metrics import record_pipeline_timing
 from tripwire.webhook.provider import WebhookProvider
+from tripwire.db.repositories.triggers import TriggerRepository
+from tripwire.ingestion.generic_decoder import decode_event_with_abi
+from tripwire.ingestion.filter_engine import evaluate_filters
 
 logger = structlog.get_logger(__name__)
 
@@ -92,6 +95,7 @@ class EventProcessor:
         realtime_notifier: RealtimeNotifier,
         webhook_provider: WebhookProvider,
         supabase_client: Any | None = None,
+        trigger_repo: TriggerRepository | None = None,
     ) -> None:
         self._endpoint_repo = endpoint_repo
         self._event_repo = event_repo
@@ -102,6 +106,7 @@ class EventProcessor:
         self._webhook_provider = webhook_provider
         # Supabase client for subscription queries; falls back to endpoint_repo's client
         self._sb = supabase_client or getattr(endpoint_repo, "_sb", None)
+        self._trigger_repo = trigger_repo
 
     # ── Public entry point ────────────────────────────────────────
 
@@ -113,14 +118,20 @@ class EventProcessor:
         summary dict with processing results.
         """
         with tracer.start_as_current_span("process_event") as span:
-            event_type = self._detect_event_type(raw_log)
-            span.set_attribute("event.type", event_type)
+            detection = self._detect_event_type(raw_log)
 
-            if event_type == "erc3009_transfer":
+            if isinstance(detection, tuple):
+                event_type_label, triggers = detection
+                span.set_attribute("event.type", event_type_label)
+                span.set_attribute("event.trigger_count", len(triggers))
+                result = await self._process_dynamic_event(raw_log, triggers)
+            elif detection == "erc3009_transfer":
+                span.set_attribute("event.type", detection)
                 result = await self._process_erc3009_event(raw_log)
             else:
-                logger.warning("unknown_event_type", event_type=event_type, raw_log=raw_log)
-                result = {"status": "skipped", "reason": f"unknown_event_type: {event_type}"}
+                span.set_attribute("event.type", detection)
+                logger.warning("unknown_event_type", event_type=detection, raw_log=raw_log)
+                result = {"status": "skipped", "reason": f"unknown_event_type: {detection}"}
 
             span.set_attribute("event.status", result.get("status", "unknown"))
             if "tx_hash" in result:
@@ -199,19 +210,41 @@ class EventProcessor:
 
     # ── Event type detection ───────────────────────────────────────
 
-    def _detect_event_type(self, raw_log: dict[str, Any]) -> str:
+    def _detect_event_type(self, raw_log: dict[str, Any]) -> str | tuple[str, list]:
         """Identify the canonical event type from the raw log's topic0.
 
         Checks the first topic against ``_EVENT_SIGNATURES``.  Handles both
         list topics (Mirror) and comma-separated string topics (Turbo).
-        Returns a human-readable event type string, or ``"unknown"`` if no match.
+        Returns a human-readable event type string, a tuple of
+        ``("dynamic", triggers)`` for dynamic triggers, or ``"unknown"``.
         """
         topics = _parse_topics(raw_log.get("topics", []))
         if not topics:
             return "unknown"
 
         topic0 = topics[0].lower()
-        return _EVENT_SIGNATURES.get(topic0, "unknown")
+
+        hardcoded = _EVENT_SIGNATURES.get(topic0)
+        if hardcoded is not None:
+            return hardcoded
+
+        # Fallback: check dynamic trigger registry
+        if self._trigger_repo is not None:
+            chain_id = raw_log.get("chain_id")
+            contract = raw_log.get("address", "").lower() or None
+            triggers = self._trigger_repo.find_by_topic(topic0)
+            # Filter by chain_id and contract_address locally
+            matched = []
+            for t in triggers:
+                if t.chain_ids and chain_id is not None and chain_id not in t.chain_ids:
+                    continue
+                if t.contract_address and contract and t.contract_address.lower() != contract:
+                    continue
+                matched.append(t)
+            if matched:
+                return ("dynamic", matched)
+
+        return "unknown"
 
     # ── ERC-3009 handler ───────────────────────────────────────────
 
@@ -316,6 +349,201 @@ class EventProcessor:
             timings=timings,
             pipeline_start=pipeline_start,
         )
+
+    # ── Dynamic trigger handler ─────────────────────────────────────
+
+    async def _process_dynamic_event(
+        self, raw_log: dict[str, Any], triggers: list
+    ) -> dict[str, Any]:
+        """Process a raw log against one or more dynamic triggers.
+
+        For each matched trigger: decode with its ABI, apply filters,
+        deduplicate, resolve identity, fetch endpoint, and dispatch.
+        """
+        from tripwire.types.models import Trigger  # noqa: F811
+
+        pipeline_start = time.perf_counter()
+        tx_hash = raw_log.get("transaction_hash", "")
+        log_index = raw_log.get("log_index", 0)
+        results: list[dict[str, Any]] = []
+
+        for trigger in triggers:
+            trigger: Trigger
+            trigger_id = trigger.id
+
+            # 1. Decode event using trigger's ABI
+            try:
+                decoded = decode_event_with_abi(raw_log, trigger.abi)
+            except Exception:
+                logger.exception(
+                    "dynamic_decode_failed",
+                    trigger_id=trigger_id,
+                    tx_hash=tx_hash,
+                )
+                results.append({"trigger_id": trigger_id, "status": "error", "reason": "decode_failed"})
+                continue
+
+            # 2. Apply trigger-specific filters
+            passed, reason = evaluate_filters(decoded, trigger.filter_rules)
+            if not passed:
+                logger.info(
+                    "dynamic_filter_rejected",
+                    trigger_id=trigger_id,
+                    tx_hash=tx_hash,
+                    reason=reason,
+                )
+                results.append({"trigger_id": trigger_id, "status": "filtered", "reason": reason})
+                continue
+
+            # 3. Deduplication: tx_hash:log_index:trigger_id
+            dedup_nonce = f"{tx_hash}:{log_index}:{trigger_id}"
+            try:
+                is_new = await asyncio.to_thread(
+                    self._nonce_repo.record_nonce,
+                    chain_id=decoded.get("_chain_id") or 0,
+                    nonce=dedup_nonce,
+                    authorizer="dynamic_trigger",
+                )
+            except Exception:
+                logger.exception("dynamic_dedup_failed", trigger_id=trigger_id, tx_hash=tx_hash)
+                results.append({"trigger_id": trigger_id, "status": "error", "reason": "dedup_failed"})
+                continue
+
+            if not is_new:
+                logger.info("dynamic_duplicate", trigger_id=trigger_id, tx_hash=tx_hash)
+                results.append({"trigger_id": trigger_id, "status": "duplicate"})
+                continue
+
+            # 4. Identity resolution — use first address field found
+            identity = None
+            address_for_identity = None
+            for key, val in decoded.items():
+                if key.startswith("_"):
+                    continue
+                if isinstance(val, str) and len(val) == 42 and val.startswith("0x"):
+                    address_for_identity = val
+                    break
+
+            if address_for_identity:
+                try:
+                    identity = await self._resolver.resolve(
+                        address_for_identity, decoded.get("_chain_id") or 0
+                    )
+                except Exception:
+                    logger.warning(
+                        "dynamic_identity_failed",
+                        trigger_id=trigger_id,
+                        address=address_for_identity,
+                    )
+
+            # 5. Fetch endpoint by trigger.endpoint_id
+            try:
+                endpoint = await asyncio.to_thread(
+                    self._endpoint_repo.get_by_id, trigger.endpoint_id
+                )
+            except Exception:
+                logger.exception(
+                    "dynamic_endpoint_fetch_failed",
+                    trigger_id=trigger_id,
+                    endpoint_id=trigger.endpoint_id,
+                )
+                results.append({"trigger_id": trigger_id, "status": "error", "reason": "endpoint_fetch_failed"})
+                continue
+
+            if not endpoint or not endpoint.active:
+                logger.info(
+                    "dynamic_endpoint_inactive",
+                    trigger_id=trigger_id,
+                    endpoint_id=trigger.endpoint_id,
+                )
+                results.append({"trigger_id": trigger_id, "status": "skipped", "reason": "endpoint_inactive"})
+                continue
+
+            # 6. Dispatch via webhook provider
+            event_type_str = trigger.webhook_event_type
+            payload = {
+                "id": str(uuid.uuid4()),
+                "idempotency_key": f"dyn_{tx_hash}_{log_index}_{trigger_id}",
+                "type": event_type_str,
+                "mode": endpoint.mode.value,
+                "timestamp": int(time.time()),
+                "trigger_id": trigger_id,
+                "data": decoded,
+            }
+
+            message_id = None
+            if endpoint.convoy_project_id:
+                try:
+                    message_id = await self._webhook_provider.send(
+                        app_id=endpoint.convoy_project_id,
+                        event_type=event_type_str,
+                        payload=payload,
+                    )
+                except Exception:
+                    logger.exception(
+                        "dynamic_dispatch_failed",
+                        trigger_id=trigger_id,
+                        tx_hash=tx_hash,
+                    )
+
+            # 7. Record event
+            event_id = str(uuid.uuid4())
+            now = datetime.now(timezone.utc).isoformat()
+            row: dict[str, Any] = {
+                "id": event_id,
+                "type": event_type_str,
+                "data": decoded,
+                "created_at": now,
+                "chain_id": decoded.get("_chain_id"),
+                "tx_hash": tx_hash,
+                "block_number": decoded.get("_block_number", 0),
+                "block_hash": decoded.get("_block_hash", ""),
+                "log_index": decoded.get("_log_index", 0),
+                "from_address": address_for_identity or "",
+                "to_address": decoded.get("_address", ""),
+                "status": "confirmed",
+                "endpoint_id": trigger.endpoint_id,
+            }
+            if identity:
+                row["identity_data"] = identity.model_dump()
+            try:
+                self._event_repo.insert(row)
+            except Exception:
+                logger.exception("dynamic_event_record_failed", event_id=event_id)
+
+            # Record delivery
+            if message_id:
+                self._record_delivery(
+                    endpoint_id=endpoint.id,
+                    event_id=event_id,
+                    provider_message_id=message_id,
+                )
+
+            results.append({
+                "trigger_id": trigger_id,
+                "status": "processed",
+                "event_id": event_id,
+                "message_id": message_id,
+            })
+
+        total_ms = round((time.perf_counter() - pipeline_start) * 1000, 2)
+        processed_count = sum(1 for r in results if r.get("status") == "processed")
+
+        logger.info(
+            "dynamic_event_processed",
+            tx_hash=tx_hash,
+            triggers_evaluated=len(triggers),
+            triggers_dispatched=processed_count,
+            total_ms=total_ms,
+        )
+
+        return {
+            "status": "processed" if processed_count > 0 else "filtered",
+            "tx_hash": tx_hash,
+            "triggers_evaluated": len(triggers),
+            "triggers_dispatched": processed_count,
+            "results": results,
+        }
 
     # ── Generic dispatch pipeline (shared across event types) ──────
 
