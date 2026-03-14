@@ -20,6 +20,7 @@ dependencies = [
     "redis[hiredis]>=5.0.0",
     "x402[fastapi,evm]>=2.3.0",
     "prometheus-client>=0.20.0",
+    "jmespath>=0.10.0",
 ]
 
 [project.optional-dependencies]

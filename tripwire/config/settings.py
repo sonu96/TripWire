@@ -22,21 +22,21 @@ class Settings(BaseSettings):
     convoy_url: str = "http://localhost:5005"
     webhook_signing_secret: SecretStr = SecretStr("")  # Default HMAC secret, can be overridden per endpoint
 
-    # Goldsky
+    # Goldsky platform (CLI auth for deploying/managing Turbo pipelines)
     goldsky_api_key: SecretStr = SecretStr("")
     goldsky_project_id: str = ""
-    goldsky_webhook_secret: SecretStr = SecretStr("")
+    goldsky_webhook_secret: SecretStr = SecretStr("")  # Validates inbound Goldsky Turbo webhooks
+
+    # Goldsky Edge (managed RPC with caching + cross-node consensus)
+    goldsky_edge_api_key: SecretStr = SecretStr("")
 
     # x402 Facilitator
     facilitator_webhook_secret: SecretStr = SecretStr("")
 
-    # Blockchain RPC (should point to Goldsky Edge endpoints)
+    # Blockchain RPC (Goldsky Edge endpoints)
     base_rpc_url: str = ""
     ethereum_rpc_url: str = ""
     arbitrum_rpc_url: str = ""
-
-    # Goldsky Edge
-    goldsky_edge_api_key: SecretStr = SecretStr("")
 
     # x402 Payment Gating
     x402_facilitator_url: str = "https://x402.org/facilitator"

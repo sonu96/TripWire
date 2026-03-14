@@ -10,12 +10,12 @@ import asyncio
 import time
 from typing import Protocol, runtime_checkable
 
-import httpx
 from eth_abi import decode, encode
 
 import structlog
 
 from tripwire.config.settings import Settings
+from tripwire.rpc import eth_call
 from tripwire.types.models import AgentIdentity
 
 logger = structlog.get_logger(__name__)
@@ -55,19 +55,7 @@ class IdentityResolver(Protocol):
     async def resolve(self, address: str, chain_id: int) -> AgentIdentity | None: ...
 
 
-# ── Chain ID → RPC URL helper ────────────────────────────────────
-
-
-def _rpc_url_for(settings: Settings, chain_id: int) -> str:
-    urls: dict[int, str] = {
-        1: settings.ethereum_rpc_url,
-        8453: settings.base_rpc_url,
-        42161: settings.arbitrum_rpc_url,
-    }
-    url = urls.get(chain_id)
-    if url is None:
-        raise ValueError(f"Unsupported chain_id: {chain_id}")
-    return url
+# ── Cache key helper ─────────────────────────────────────────────
 
 
 def _cache_key(address: str, chain_id: int) -> str:
@@ -88,28 +76,7 @@ class ERC8004Resolver:
         self._identity_registry = settings.erc8004_identity_registry
         self._reputation_registry = settings.erc8004_reputation_registry
         self._settings = settings
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
         self._cache: dict[str, _CacheEntry] = {}
-
-    async def _eth_call(self, rpc_url: str, to: str, data: str) -> str | None:
-        """Send an eth_call and return the hex result, or None on failure."""
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [{"to": to, "data": data}, "latest"],
-        }
-        try:
-            resp = await self._client.post(rpc_url, json=payload)
-            resp.raise_for_status()
-            body = resp.json()
-            result = body.get("result")
-            if not result or result == "0x" or len(result) < 66:
-                return None
-            return result
-        except Exception:
-            logger.warning("eth_call_failed", to=to, rpc_url=rpc_url)
-            return None
 
     async def resolve(self, address: str, chain_id: int) -> AgentIdentity | None:
         """Resolve an ERC-8004 agent identity, returning None if unregistered."""
@@ -119,17 +86,18 @@ class ERC8004Resolver:
         if entry is not None and entry.expires_at > time.monotonic():
             return entry.value
 
-        rpc_url = _rpc_url_for(self._settings, chain_id)
-        identity = await self._resolve_onchain(address, rpc_url)
-        self._cache[key] = _CacheEntry(identity, ttl=self._settings.identity_cache_ttl)
+        identity = await self._resolve_onchain(address, chain_id)
+        # Use shorter TTL for negative results to avoid caching RPC failures
+        ttl = self._settings.identity_cache_ttl if identity is not None else 30
+        self._cache[key] = _CacheEntry(identity, ttl=ttl)
         return identity
 
-    async def _resolve_onchain(self, address: str, rpc_url: str) -> AgentIdentity | None:
+    async def _resolve_onchain(self, address: str, chain_id: int) -> AgentIdentity | None:
         registry = self._identity_registry
 
         # Step 1: balanceOf(address) — check if sender owns an ERC-8004 NFT
         balance_data = BALANCE_OF_SELECTOR + encode(["address"], [address]).hex()
-        balance_result = await self._eth_call(rpc_url, registry, balance_data)
+        balance_result = await eth_call(chain_id, registry, balance_data)
         if balance_result is None:
             return None
 
@@ -146,7 +114,7 @@ class ERC8004Resolver:
         token_data = TOKEN_OF_OWNER_SELECTOR + encode(
             ["address", "uint256"], [address, 0]
         ).hex()
-        token_result = await self._eth_call(rpc_url, registry, token_data)
+        token_result = await eth_call(chain_id, registry, token_data)
         if token_result is None:
             return None
 
@@ -171,11 +139,11 @@ class ERC8004Resolver:
 
         uri_result, meta_result, cap_result, owner_result, summary_result = (
             await asyncio.gather(
-                self._eth_call(rpc_url, registry, uri_data),
-                self._eth_call(rpc_url, registry, meta_data),
-                self._eth_call(rpc_url, registry, cap_data),
-                self._eth_call(rpc_url, registry, owner_data),
-                self._eth_call(rpc_url, self._reputation_registry, summary_data),
+                eth_call(chain_id, registry, uri_data),
+                eth_call(chain_id, registry, meta_data),
+                eth_call(chain_id, registry, cap_data),
+                eth_call(chain_id, registry, owner_data),
+                eth_call(chain_id, self._reputation_registry, summary_data),
             )
         )
 
@@ -216,12 +184,12 @@ class ERC8004Resolver:
                 logger.warning("decode_owner_failed", agent_id=agent_id)
 
         # Decode getSummary (reputation)
-        reputation_score = 50.0
+        reputation_score = 0.0
         if summary_result:
             try:
                 # Score is in basis points (0-10000) → convert to 0-100
-                decoded = decode(["uint256"], bytes.fromhex(summary_result[2:66]))
-                raw_score = decoded[0]
+                decoded_vals = decode(["uint256"], bytes.fromhex(summary_result[2:66]))
+                raw_score = decoded_vals[0]
                 reputation_score = min(raw_score / 100.0, 100.0)
             except Exception:
                 logger.warning("decode_reputation_failed", agent_id=agent_id)
@@ -239,11 +207,8 @@ class ERC8004Resolver:
             metadata={"agent_id": agent_id, "agent_uri": agent_uri},
         )
 
-    async def close(self) -> None:
-        await self._client.aclose()
 
-
-# ── MockResolver ─────────────────────────────────────────────────
+# ── MockResolver ─────────────────────────────────────────────
 
 _MOCK_AGENTS: list[dict] = [
     {

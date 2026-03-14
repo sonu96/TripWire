@@ -1,4 +1,4 @@
-"""Filter engine for trigger-specific predicates.
+"""Filter engine for trigger-specific predicates using JMESPath.
 
 Evaluates a list of filter rules against decoded event fields.
 All filters must pass (AND logic) for the event to match.
@@ -10,6 +10,7 @@ import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import jmespath
 import structlog
 
 logger = structlog.get_logger(__name__)
@@ -24,6 +25,10 @@ def evaluate_filters(
     """Evaluate all filter rules against decoded event data.
 
     Returns (passed, rejection_reason).
+
+    Each filter has: field, op, value.
+    Supports JMESPath expressions in the field (e.g. "args.recipient")
+    and standard comparison operators.
     """
     if not filters:
         return True, None
@@ -33,7 +38,8 @@ def evaluate_filters(
         op = f.op if hasattr(f, "op") else f.get("op", "eq")
         value = f.value if hasattr(f, "value") else f.get("value")
 
-        field_val = decoded.get(field)
+        # Use JMESPath for field extraction — supports nested paths like "args.to"
+        field_val = jmespath.search(field, decoded)
         if field_val is None:
             return False, f"field '{field}' not present in event"
 
@@ -77,6 +83,15 @@ def _evaluate_op(field_val: Any, op: str, target: Any) -> bool:
             return bool(re.search(str(target), str(field_val)))
         except re.error:
             return False
+    elif op == "jmespath":
+        # Full JMESPath expression mode: value is a JMESPath expression
+        # that must evaluate to truthy against the original data
+        # field_val is the decoded dict in this case
+        try:
+            result = jmespath.search(str(target), field_val if isinstance(field_val, dict) else {})
+            return bool(result)
+        except Exception:
+            return False
     else:
         logger.warning("unknown_filter_op", op=op)
         return False
@@ -87,7 +102,6 @@ def _normalize(val: Any) -> Any:
         s = val.lower().strip()
         if _ADDRESS_RE.match(s):
             return s
-        # Try numeric normalization for string-encoded integers
         d = _to_decimal(s)
         if d is not None:
             return d

@@ -3,7 +3,7 @@
 import httpx
 import structlog
 
-from tripwire.config.settings import settings
+from tripwire.rpc import eth_block_number, get_rpc_url  # noqa: F401 — re-export for callers
 from tripwire.types.models import (
     FINALITY_DEPTHS,
     ChainId,
@@ -13,62 +13,13 @@ from tripwire.types.models import (
 
 logger = structlog.get_logger(__name__)
 
-# ── Shared httpx client (created lazily, no singleton gymnastics) ──
-_http_client: httpx.AsyncClient | None = None
-
-
-def _get_http_client() -> httpx.AsyncClient:
-    """Return a module-level async HTTP client, creating it on first use."""
-    global _http_client
-    if _http_client is None:
-        headers: dict[str, str] = {}
-        edge_key = settings.goldsky_edge_api_key.get_secret_value()
-        if edge_key:
-            headers["Authorization"] = f"Bearer {edge_key}"
-        _http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(10.0),
-            headers=headers,
-        )
-    return _http_client
-
-
-def get_rpc_url(chain_id: ChainId) -> str:
-    """Return the configured Goldsky Edge RPC URL for a chain."""
-    urls = {
-        ChainId.ETHEREUM: settings.ethereum_rpc_url,
-        ChainId.BASE: settings.base_rpc_url,
-        ChainId.ARBITRUM: settings.arbitrum_rpc_url,
-    }
-    url = urls.get(chain_id, "")
-    if not url:
-        raise ValueError(f"No RPC URL configured for chain {chain_id}")
-    return url
-
 
 async def get_block_number(
     chain_id: ChainId,
     client: httpx.AsyncClient | None = None,
 ) -> int:
     """Fetch the latest block number from the chain via JSON-RPC."""
-    rpc_url = get_rpc_url(chain_id)
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "eth_blockNumber",
-        "params": [],
-        "id": 1,
-    }
-    http = client or _get_http_client()
-    resp = await http.post(rpc_url, json=payload)
-    resp.raise_for_status()
-
-    data = resp.json()
-    if "error" in data:
-        raise RuntimeError(f"RPC error on chain {chain_id}: {data['error']}")
-
-    block_hex = data["result"]
-    block_num = int(block_hex, 16)
-    logger.debug("rpc_block_number", chain_id=chain_id, block=block_num)
-    return block_num
+    return await eth_block_number(chain_id, client=client)
 
 
 async def check_finality(
