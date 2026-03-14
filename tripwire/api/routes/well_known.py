@@ -2,11 +2,40 @@
 
 from fastapi import APIRouter
 
+from tripwire.mcp.types import AuthTier
+
 router = APIRouter()
 
 
 @router.get("/.well-known/x402-manifest.json")
 async def x402_manifest():
+    # Import here to avoid circular imports (server.py registers tools at module level)
+    from tripwire.mcp.server import TOOLS
+
+    # Build services list from x402-gated tools
+    services = []
+    for tool_def in TOOLS.values():
+        if tool_def.auth_tier == AuthTier.X402 and tool_def.price:
+            services.append({
+                "name": tool_def.name,
+                "description": tool_def.description,
+                "endpoint": "/mcp",
+                "method": "POST",
+                "price": tool_def.price,
+                "network": tool_def.network,
+            })
+
+    # Build full tool list with auth tiers
+    mcp_tools = []
+    for tool_def in TOOLS.values():
+        tool_info = {
+            "name": tool_def.name,
+            "auth_tier": tool_def.auth_tier.value,
+        }
+        if tool_def.price:
+            tool_info["price"] = tool_def.price
+        mcp_tools.append(tool_info)
+
     return {
         "@context": "https://x402.org/context",
         "name": "TripWire",
@@ -16,50 +45,25 @@ async def x402_manifest():
             "protocol": "ERC-8004",
             "registry": "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
         },
+        "auth": {
+            "siwe": {
+                "nonce_endpoint": "/auth/nonce",
+                "domain": "tripwire.dev",
+            },
+            "x402": {
+                "facilitator": "https://x402.org/facilitator",
+                "network": "eip155:8453",
+            },
+        },
         "mcp": {
             "endpoint": "/mcp",
-            "transport": "streamable-http",
-            "tools": [
-                "register_middleware",
-                "create_trigger",
-                "list_triggers",
-                "delete_trigger",
-                "list_templates",
-                "activate_template",
-                "get_trigger_status",
-                "search_events",
-            ],
+            "transport": "json-rpc",
+            "tools": mcp_tools,
         },
-        "services": [
-            {
-                "name": "register_middleware",
-                "description": "Register TripWire as onchain event middleware for your API",
-                "endpoint": "/mcp",
-                "method": "POST",
-                "price": "$0.003",
-                "network": "eip155:8453",
-            },
-            {
-                "name": "create_trigger",
-                "description": "Create a custom onchain event trigger",
-                "endpoint": "/mcp",
-                "method": "POST",
-                "price": "$0.003",
-                "network": "eip155:8453",
-            },
-            {
-                "name": "activate_template",
-                "description": "Activate a pre-built trigger template from the Bazaar",
-                "endpoint": "/mcp",
-                "method": "POST",
-                "price": "$0.001",
-                "network": "eip155:8453",
-            },
-        ],
+        "services": services,
         "supported_chains": [
             {"chain_id": 8453, "name": "Base"},
             {"chain_id": 1, "name": "Ethereum"},
             {"chain_id": 42161, "name": "Arbitrum"},
         ],
-        "trigger_templates": "/mcp (use list_templates tool)",
     }

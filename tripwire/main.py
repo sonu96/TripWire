@@ -205,10 +205,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if dlq_handler is not None:
         await dlq_handler.stop()
 
-    # Close identity resolver HTTP client if it has one
-    if hasattr(resolver, "close"):
-        await resolver.close()
-
     # Flush and shut down OTel tracing (no-op if never initialised)
     shutdown_tracing()
 

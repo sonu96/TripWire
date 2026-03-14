@@ -1,7 +1,7 @@
 """MCP tool handlers for TripWire agent operations.
 
 Each handler is an async function with signature:
-    async def handler(params: dict, agent_address: str, repos: dict) -> dict
+    async def handler(params: dict, ctx: MCPAuthContext, repos: dict) -> dict
 """
 
 from __future__ import annotations
@@ -12,6 +12,8 @@ from typing import Any
 
 import structlog
 from nanoid import generate as nanoid
+
+from tripwire.mcp.types import MCPAuthContext
 
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.events import EventRepository
@@ -49,7 +51,7 @@ def _now_iso() -> str:
 
 
 async def register_middleware(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """Register TripWire as middleware for an agent's API endpoint.
 
@@ -62,7 +64,7 @@ async def register_middleware(
     url: str = params["url"]
     mode: str = params.get("mode", "execute")
     chains: list[int] = params.get("chains", [8453])
-    recipient: str = params.get("recipient", agent_address)
+    recipient: str = params.get("recipient", ctx.agent_address)
     policies: dict = params.get("policies", {})
     template_slugs: list[str] = params.get("template_slugs", [])
     custom_triggers: list[dict] = params.get("custom_triggers", [])
@@ -78,7 +80,7 @@ async def register_middleware(
         "mode": mode,
         "chains": chains,
         "recipient": recipient.lower(),
-        "owner_address": agent_address.lower(),
+        "owner_address": ctx.agent_address.lower(),
         "policies": EndpointPolicies(**policies).model_dump(),
         "webhook_secret": webhook_secret,
         "active": True,
@@ -92,7 +94,7 @@ async def register_middleware(
     logger.info(
         "mcp_endpoint_created",
         endpoint_id=endpoint_id,
-        agent=agent_address,
+        agent=ctx.agent_address,
         mode=mode,
     )
 
@@ -108,7 +110,7 @@ async def register_middleware(
         trigger_id = nanoid(size=21)
         trigger_data = {
             "id": trigger_id,
-            "owner_address": agent_address.lower(),
+            "owner_address": ctx.agent_address.lower(),
             "endpoint_id": endpoint_id,
             "name": template.name,
             "event_signature": template.event_signature,
@@ -136,7 +138,7 @@ async def register_middleware(
         trigger_id = nanoid(size=21)
         trigger_data = {
             "id": trigger_id,
-            "owner_address": agent_address.lower(),
+            "owner_address": ctx.agent_address.lower(),
             "endpoint_id": endpoint_id,
             "name": ct.get("name"),
             "event_signature": ct["event_signature"],
@@ -174,7 +176,7 @@ async def register_middleware(
 
 
 async def create_trigger(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """Create a custom trigger for an existing endpoint."""
     endpoint_repo, trigger_repo, _, _ = _repos(repos)
@@ -183,14 +185,14 @@ async def create_trigger(
     endpoint = endpoint_repo.get_by_id(endpoint_id)
     if endpoint is None:
         return {"error": "Endpoint not found", "code": "NOT_FOUND"}
-    if endpoint.owner_address.lower() != agent_address.lower():
+    if endpoint.owner_address.lower() != ctx.agent_address.lower():
         return {"error": "Not authorized", "code": "FORBIDDEN"}
 
     now = _now_iso()
     trigger_id = nanoid(size=21)
     trigger_data = {
         "id": trigger_id,
-        "owner_address": agent_address.lower(),
+        "owner_address": ctx.agent_address.lower(),
         "endpoint_id": endpoint_id,
         "name": params.get("name"),
         "event_signature": params["event_signature"],
@@ -211,7 +213,7 @@ async def create_trigger(
     logger.info(
         "mcp_trigger_created",
         trigger_id=trigger_id,
-        agent=agent_address,
+        agent=ctx.agent_address,
         endpoint_id=endpoint_id,
     )
 
@@ -227,12 +229,12 @@ async def create_trigger(
 
 
 async def list_triggers(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """List all triggers owned by the calling agent."""
     _, trigger_repo, _, _ = _repos(repos)
 
-    triggers = trigger_repo.list_by_owner(agent_address)
+    triggers = trigger_repo.list_by_owner(ctx.agent_address)
     active_only = params.get("active_only", True)
 
     items = []
@@ -256,7 +258,7 @@ async def list_triggers(
 
 
 async def delete_trigger(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """Deactivate a trigger (soft delete). Verifies ownership."""
     _, trigger_repo, _, _ = _repos(repos)
@@ -265,7 +267,7 @@ async def delete_trigger(
     trigger = trigger_repo.get_by_id(trigger_id)
     if trigger is None:
         return {"error": "Trigger not found", "code": "NOT_FOUND"}
-    if trigger.owner_address.lower() != agent_address.lower():
+    if trigger.owner_address.lower() != ctx.agent_address.lower():
         return {"error": "Not authorized", "code": "FORBIDDEN"}
 
     deactivated = trigger_repo.deactivate(trigger_id)
@@ -275,7 +277,7 @@ async def delete_trigger(
     logger.info(
         "mcp_trigger_deleted",
         trigger_id=trigger_id,
-        agent=agent_address,
+        agent=ctx.agent_address,
     )
 
     return {"trigger_id": trigger_id, "active": False}
@@ -285,7 +287,7 @@ async def delete_trigger(
 
 
 async def list_templates(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """Browse available trigger templates from the Bazaar."""
     _, _, template_repo, _ = _repos(repos)
@@ -316,7 +318,7 @@ async def list_templates(
 
 
 async def activate_template(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """Instantiate a template with custom params for an endpoint."""
     endpoint_repo, trigger_repo, template_repo, _ = _repos(repos)
@@ -332,7 +334,7 @@ async def activate_template(
     endpoint = endpoint_repo.get_by_id(endpoint_id)
     if endpoint is None:
         return {"error": "Endpoint not found", "code": "NOT_FOUND"}
-    if endpoint.owner_address.lower() != agent_address.lower():
+    if endpoint.owner_address.lower() != ctx.agent_address.lower():
         return {"error": "Not authorized", "code": "FORBIDDEN"}
 
     # Merge default filters with custom params
@@ -347,7 +349,7 @@ async def activate_template(
     trigger_id = nanoid(size=21)
     trigger_data = {
         "id": trigger_id,
-        "owner_address": agent_address.lower(),
+        "owner_address": ctx.agent_address.lower(),
         "endpoint_id": endpoint_id,
         "name": f"{template.name} (from template)",
         "event_signature": template.event_signature,
@@ -381,7 +383,7 @@ async def activate_template(
         trigger_id=trigger_id,
         template_slug=slug,
         endpoint_id=endpoint_id,
-        agent=agent_address,
+        agent=ctx.agent_address,
     )
 
     return {
@@ -397,7 +399,7 @@ async def activate_template(
 
 
 async def get_trigger_status(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """Check trigger health and recent event count."""
     _, trigger_repo, _, event_repo = _repos(repos)
@@ -407,7 +409,7 @@ async def get_trigger_status(
     trigger = trigger_repo.get_by_id(trigger_id)
     if trigger is None:
         return {"error": "Trigger not found", "code": "NOT_FOUND"}
-    if trigger.owner_address.lower() != agent_address.lower():
+    if trigger.owner_address.lower() != ctx.agent_address.lower():
         return {"error": "Not authorized", "code": "FORBIDDEN"}
 
     # Count recent events matching this trigger's endpoint
@@ -438,7 +440,7 @@ async def get_trigger_status(
 
 
 async def search_events(
-    params: dict, agent_address: str, repos: dict
+    params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
     """Query recent events for the agent's endpoints."""
     endpoint_repo = repos["endpoint_repo"]
@@ -448,7 +450,7 @@ async def search_events(
     result = (
         supabase.table("endpoints")
         .select("id")
-        .eq("owner_address", agent_address.lower())
+        .eq("owner_address", ctx.agent_address.lower())
         .eq("active", True)
         .execute()
     )

@@ -1,23 +1,18 @@
-"""MCP JSON-RPC server mounted as a FastAPI sub-application.
+"""MCP JSON-RPC server with 3-tier authentication.
 
-Implements the Model Context Protocol over HTTP:
-- POST /  (mounted at /mcp/) -- JSON-RPC endpoint handling:
-    - initialize
-    - tools/list
-    - tools/call
-
-Authentication: Bearer token containing the agent's Ethereum address (MVP).
-Real SIWE verification comes later.
+Authentication tiers:
+- PUBLIC: No auth needed (initialize, tools/list)
+- SIWX: Wallet signature via SIWE (free tools)
+- X402: Per-call payment via x402 protocol (paid tools)
 """
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine
+import json
+from typing import Any
 
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from tripwire.db.client import get_supabase_client
@@ -27,29 +22,17 @@ from tripwire.db.repositories.triggers import (
     TriggerRepository,
     TriggerTemplateRepository,
 )
-from tripwire.identity.resolver import IdentityResolver
 from tripwire.observability.audit import AuditLogger, fire_and_forget
 
+from tripwire.mcp.types import AuthTier, MCPAuthContext, ToolDef
+from tripwire.mcp.auth import build_auth_context, settle_payment
 from tripwire.mcp import tools as tool_handlers
 
 logger = structlog.get_logger(__name__)
 
-_ETH_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
-
-# MCP protocol version
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
 # ── Tool definition registry ────────────────────────────────
-
-
-@dataclass
-class ToolDef:
-    name: str
-    description: str
-    input_schema: dict[str, Any]
-    handler: Callable[..., Coroutine[Any, Any, dict]]
-    min_reputation: float = 0.0
-
 
 TOOLS: dict[str, ToolDef] = {}
 
@@ -58,7 +41,9 @@ def _register(
     name: str,
     description: str,
     input_schema: dict[str, Any],
-    handler: Callable[..., Coroutine[Any, Any, dict]],
+    handler,
+    auth_tier: AuthTier = AuthTier.SIWX,
+    price: str | None = None,
     min_reputation: float = 0.0,
 ) -> None:
     TOOLS[name] = ToolDef(
@@ -66,6 +51,8 @@ def _register(
         description=description,
         input_schema=input_schema,
         handler=handler,
+        auth_tier=auth_tier,
+        price=price,
         min_reputation=min_reputation,
     )
 
@@ -134,7 +121,8 @@ _register(
         "required": ["url"],
     },
     handler=tool_handlers.register_middleware,
-    min_reputation=0.0,
+    auth_tier=AuthTier.X402,
+    price="$0.003",
 )
 
 _register(
@@ -169,7 +157,8 @@ _register(
         "required": ["endpoint_id", "event_signature"],
     },
     handler=tool_handlers.create_trigger,
-    min_reputation=0.0,
+    auth_tier=AuthTier.X402,
+    price="$0.003",
 )
 
 _register(
@@ -186,7 +175,7 @@ _register(
         },
     },
     handler=tool_handlers.list_triggers,
-    min_reputation=0.0,
+    auth_tier=AuthTier.SIWX,
 )
 
 _register(
@@ -200,7 +189,7 @@ _register(
         "required": ["trigger_id"],
     },
     handler=tool_handlers.delete_trigger,
-    min_reputation=0.0,
+    auth_tier=AuthTier.SIWX,
 )
 
 _register(
@@ -216,7 +205,7 @@ _register(
         },
     },
     handler=tool_handlers.list_templates,
-    min_reputation=0.0,
+    auth_tier=AuthTier.SIWX,
 )
 
 _register(
@@ -235,7 +224,8 @@ _register(
         "required": ["slug", "endpoint_id"],
     },
     handler=tool_handlers.activate_template,
-    min_reputation=0.0,
+    auth_tier=AuthTier.X402,
+    price="$0.001",
 )
 
 _register(
@@ -249,7 +239,7 @@ _register(
         "required": ["trigger_id"],
     },
     handler=tool_handlers.get_trigger_status,
-    min_reputation=0.0,
+    auth_tier=AuthTier.SIWX,
 )
 
 _register(
@@ -274,7 +264,7 @@ _register(
         },
     },
     handler=tool_handlers.search_events,
-    min_reputation=0.0,
+    auth_tier=AuthTier.SIWX,
 )
 
 
@@ -302,23 +292,8 @@ _INTERNAL_ERROR = -32603
 # Application error codes
 _AUTH_REQUIRED = -32000
 _REPUTATION_TOO_LOW = -32001
-
-
-# ── Auth extraction ──────────────────────────────────────────
-
-
-def _extract_agent_address(request: Request) -> str | None:
-    """Extract agent address from Authorization: Bearer <address> header.
-
-    MVP auth -- real SIWE verification comes later.
-    """
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return None
-    token = auth_header[7:].strip()
-    if _ETH_ADDRESS_RE.match(token):
-        return token.lower()
-    return None
+_PAYMENT_REQUIRED = -32002
+_RATE_LIMITED = -32003
 
 
 # ── MCP FastAPI sub-app ──────────────────────────────────────
@@ -358,7 +333,7 @@ def create_mcp_app() -> FastAPI:
                 status_code=200,
             )
 
-        # ── Handle initialize ────────────────────────────────
+        # ── Handle initialize (PUBLIC) ──────────────────────
         if method == "initialize":
             return JSONResponse(
                 content=_jsonrpc_success(req_id, {
@@ -374,21 +349,26 @@ def create_mcp_app() -> FastAPI:
                 status_code=200,
             )
 
-        # ── Handle tools/list ────────────────────────────────
+        # ── Handle tools/list (PUBLIC) ──────────────────────
         if method == "tools/list":
             tool_list = []
             for tool_def in TOOLS.values():
-                tool_list.append({
+                entry = {
                     "name": tool_def.name,
                     "description": tool_def.description,
                     "inputSchema": tool_def.input_schema,
-                })
+                }
+                # Include pricing metadata so clients know which tools cost money
+                if tool_def.auth_tier == AuthTier.X402 and tool_def.price:
+                    entry["x-tripwire-price"] = tool_def.price
+                    entry["x-tripwire-network"] = tool_def.network
+                tool_list.append(entry)
             return JSONResponse(
                 content=_jsonrpc_success(req_id, {"tools": tool_list}),
                 status_code=200,
             )
 
-        # ── Handle tools/call ────────────────────────────────
+        # ── Handle tools/call ───────────────────────────────
         if method == "tools/call":
             tool_name = params.get("name")
             tool_args = params.get("arguments", {})
@@ -405,52 +385,93 @@ def create_mcp_app() -> FastAPI:
 
             tool_def = TOOLS[tool_name]
 
-            # Auth required for all tool calls
-            agent_address = _extract_agent_address(request)
-            if not agent_address:
+            # ── Authenticate via 3-tier auth ────────────────
+            parent_app = request.app.state.parent_app
+            identity_resolver = parent_app.state.identity_resolver
+            try:
+                ctx: MCPAuthContext = await build_auth_context(
+                    request, tool_def, identity_resolver
+                )
+            except HTTPException as exc:
+                # Map HTTP status codes to JSON-RPC error codes
+                if exc.status_code == 402:
+                    code = _PAYMENT_REQUIRED
+                elif exc.status_code == 403:
+                    code = _REPUTATION_TOO_LOW
+                else:
+                    code = _AUTH_REQUIRED
                 return JSONResponse(
                     content=_jsonrpc_error(
                         req_id,
-                        _AUTH_REQUIRED,
-                        "Authorization required: Bearer <ethereum_address>",
+                        code,
+                        exc.detail if isinstance(exc.detail, str) else str(exc.detail),
                     ),
                     status_code=200,
                 )
 
-            # Reputation gating via ERC-8004 identity
+            # ── Require agent_address for non-PUBLIC tools ──
+            if tool_def.auth_tier != AuthTier.PUBLIC and not ctx.agent_address:
+                return JSONResponse(
+                    content=_jsonrpc_error(
+                        req_id,
+                        _AUTH_REQUIRED,
+                        "Could not determine agent address from authentication",
+                    ),
+                    status_code=200,
+                )
+
+            # ── Reputation gating ───────────────────────────
             if tool_def.min_reputation > 0:
-                identity_resolver: IdentityResolver = (
-                    request.app.state.identity_resolver
-                )
-                identity = await identity_resolver.resolve(
-                    agent_address, chain_id=8453
-                )
-                reputation = (
-                    identity.reputation_score if identity else 0.0
-                )
-                if reputation < tool_def.min_reputation:
+                if ctx.reputation_score < tool_def.min_reputation:
                     logger.warning(
                         "mcp_reputation_gate_blocked",
-                        agent=agent_address,
+                        agent=ctx.agent_address,
                         tool=tool_name,
-                        reputation=reputation,
+                        reputation=ctx.reputation_score,
                         required=tool_def.min_reputation,
                     )
                     return JSONResponse(
                         content=_jsonrpc_error(
                             req_id,
                             _REPUTATION_TOO_LOW,
-                            f"Reputation too low: {reputation:.1f} < {tool_def.min_reputation:.1f}",
+                            f"Reputation too low: {ctx.reputation_score:.1f} < {tool_def.min_reputation:.1f}",
                             data={
-                                "reputation": reputation,
+                                "reputation": ctx.reputation_score,
                                 "required": tool_def.min_reputation,
                             },
                         ),
                         status_code=200,
                     )
 
-            # Build repos dict from parent app state
-            parent_app = request.app.state.parent_app
+            # ── Per-address rate limiting ────────────────────
+            if ctx.agent_address:
+                try:
+                    from tripwire.api.redis import get_redis
+                    r = get_redis()
+                    rate_key = f"mcp:rate:{ctx.agent_address}"
+                    current = await r.incr(rate_key)
+                    if current == 1:
+                        await r.expire(rate_key, 60)  # 60-second window
+                    if current > 60:  # 60 calls/minute per address
+                        logger.warning(
+                            "mcp_rate_limited",
+                            agent=ctx.agent_address,
+                            tool=tool_name,
+                            count=current,
+                        )
+                        return JSONResponse(
+                            content=_jsonrpc_error(
+                                req_id,
+                                _RATE_LIMITED,
+                                "Rate limit exceeded: max 60 tool calls per minute",
+                            ),
+                            status_code=200,
+                        )
+                except Exception:
+                    # Redis down — fail open for rate limiting (auth already passed)
+                    logger.warning("mcp_rate_limit_redis_unavailable")
+
+            # ── Build repos dict from parent app state ──────
             supabase = parent_app.state.supabase
 
             repos = {
@@ -461,34 +482,59 @@ def create_mcp_app() -> FastAPI:
                 "event_repo": EventRepository(supabase),
             }
 
-            # Execute the tool handler
+            # ── Execute the tool handler ────────────────────
             try:
-                result = await tool_def.handler(tool_args, agent_address, repos)
+                result = await tool_def.handler(tool_args, ctx, repos)
             except Exception as exc:
                 logger.exception(
                     "mcp_tool_call_failed",
                     tool=tool_name,
-                    agent=agent_address,
+                    agent=ctx.agent_address,
+                    auth_tier=ctx.auth_tier.value,
                     error=str(exc),
                 )
                 return JSONResponse(
                     content=_jsonrpc_error(
                         req_id,
                         _INTERNAL_ERROR,
-                        f"Tool execution failed: {str(exc)}",
+                        "Tool execution failed",
                     ),
                     status_code=200,
                 )
 
-            # Audit log every tool call
+            # ── Settle x402 payment after successful execution
+            if tool_def.auth_tier == AuthTier.X402 and "error" not in result:
+                try:
+                    await settle_payment(request)
+                except Exception as exc:
+                    logger.error(
+                        "mcp_x402_settle_failed",
+                        tool=tool_name,
+                        agent=ctx.agent_address,
+                        error=str(exc),
+                    )
+                    # Do NOT return tool result if settlement fails —
+                    # prevents free service via settlement manipulation.
+                    return JSONResponse(
+                        content=_jsonrpc_error(
+                            req_id,
+                            _PAYMENT_REQUIRED,
+                            "Payment settlement failed — tool result withheld",
+                        ),
+                        status_code=200,
+                    )
+
+            # ── Audit log ───────────────────────────────────
             audit_logger: AuditLogger = parent_app.state.audit_logger
             fire_and_forget(audit_logger.log(
                 action=f"mcp.tools.{tool_name}",
-                actor=agent_address,
+                actor=ctx.agent_address or "anonymous",
                 resource_type="mcp_tool",
                 resource_id=tool_name,
                 details={
                     "arguments": tool_args,
+                    "auth_tier": ctx.auth_tier.value,
+                    "payment_verified": ctx.payment_verified,
                     "success": "error" not in result,
                 },
                 ip_address=(
@@ -499,7 +545,8 @@ def create_mcp_app() -> FastAPI:
             logger.info(
                 "mcp_tool_call",
                 tool=tool_name,
-                agent=agent_address,
+                agent=ctx.agent_address,
+                auth_tier=ctx.auth_tier.value,
                 success="error" not in result,
             )
 
@@ -518,7 +565,7 @@ def create_mcp_app() -> FastAPI:
                 status_code=200,
             )
 
-        # ── Unknown method ───────────────────────────────────
+        # ── Unknown method ──────────────────────────────────
         return JSONResponse(
             content=_jsonrpc_error(
                 req_id, _METHOD_NOT_FOUND, f"Method not found: {method}"
@@ -531,6 +578,4 @@ def create_mcp_app() -> FastAPI:
 
 def _serialize_result(result: dict) -> str:
     """Serialize a tool result dict to a JSON string for the MCP content response."""
-    import json
-
     return json.dumps(result, default=str)

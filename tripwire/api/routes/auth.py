@@ -17,6 +17,7 @@ _NONCE_TTL_SECONDS = 300  # 5 minutes
 
 @router.get("/nonce")
 @limiter.limit("30/minute")
+@limiter.limit("1000/minute", key_func=lambda *args, **kwargs: "global")
 async def get_nonce(request: Request) -> dict[str, str]:
     """Generate a cryptographically random nonce, store it in Redis with a 5-min TTL."""
     nonce = secrets.token_urlsafe(32)

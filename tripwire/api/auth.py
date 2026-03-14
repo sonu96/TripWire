@@ -30,6 +30,7 @@ def _build_siwe_message(
     nonce: str,
     issued_at: str,
     expiration_time: str,
+    chain_id: int = 8453,
 ) -> str:
     """Construct an EIP-4361 SIWE message string."""
     return (
@@ -40,7 +41,7 @@ def _build_siwe_message(
         f"\n"
         f"URI: https://{domain}\n"
         f"Version: 1\n"
-        f"Chain ID: 1\n"
+        f"Chain ID: {chain_id}\n"
         f"Nonce: {nonce}\n"
         f"Issued At: {issued_at}\n"
         f"Expiration Time: {expiration_time}"
