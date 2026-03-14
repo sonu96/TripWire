@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from tripwire.config.settings import settings
 from tripwire.mcp.types import AuthTier
 
 router = APIRouter()
@@ -21,8 +22,10 @@ async def x402_manifest():
                 "description": tool_def.description,
                 "endpoint": "/mcp",
                 "method": "POST",
+                "scheme": "exact",
                 "price": tool_def.price,
                 "network": tool_def.network,
+                "pay_to": settings.tripwire_treasury_address,
             })
 
     # Build full tool list with auth tiers
@@ -43,16 +46,17 @@ async def x402_manifest():
         "version": "1.0.0",
         "identity": {
             "protocol": "ERC-8004",
-            "registry": "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
+            "registry": settings.erc8004_identity_registry,
         },
         "auth": {
             "siwe": {
                 "nonce_endpoint": "/auth/nonce",
-                "domain": "tripwire.dev",
+                "domain": settings.siwe_domain,
             },
             "x402": {
-                "facilitator": "https://x402.org/facilitator",
-                "network": "eip155:8453",
+                "facilitator": settings.x402_facilitator_url,
+                "network": settings.x402_network,
+                "pay_to": settings.tripwire_treasury_address,
             },
         },
         "mcp": {

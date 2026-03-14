@@ -408,6 +408,21 @@ def create_mcp_app() -> FastAPI:
                     ),
                     status_code=200,
                 )
+            except Exception as exc:
+                # Redis down, network errors, etc. — return JSON-RPC error, not HTTP 500
+                logger.exception(
+                    "mcp_auth_unexpected_error",
+                    tool=tool_name,
+                    error=str(exc),
+                )
+                return JSONResponse(
+                    content=_jsonrpc_error(
+                        req_id,
+                        _INTERNAL_ERROR,
+                        "Authentication service unavailable",
+                    ),
+                    status_code=200,
+                )
 
             # ── Require agent_address for non-PUBLIC tools ──
             if tool_def.auth_tier != AuthTier.PUBLIC and not ctx.agent_address:
@@ -513,6 +528,15 @@ def create_mcp_app() -> FastAPI:
                         agent=ctx.agent_address,
                         error=str(exc),
                     )
+                    # Clean up dedup key so the payer can retry with the same proof
+                    try:
+                        import hashlib as _hl
+                        from tripwire.api.redis import get_redis as _get_redis
+                        _payment = request.headers.get("X-PAYMENT", "")
+                        _ph = _hl.sha256(_payment.encode()).hexdigest()
+                        await _get_redis().delete(f"x402:payment:{_ph}:{tool_name}")
+                    except Exception:
+                        pass  # Best-effort cleanup
                     # Do NOT return tool result if settlement fails —
                     # prevents free service via settlement manipulation.
                     return JSONResponse(

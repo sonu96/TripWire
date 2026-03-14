@@ -205,6 +205,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if dlq_handler is not None:
         await dlq_handler.stop()
 
+    # Close shared RPC HTTP client
+    from tripwire.rpc import close_rpc_client
+    await close_rpc_client()
+
     # Flush and shut down OTel tracing (no-op if never initialised)
     shutdown_tracing()
 

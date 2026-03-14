@@ -117,3 +117,11 @@ async def eth_block_number(
     block_num = int(block_hex, 16)
     logger.debug("rpc_block_number", chain_id=chain_id, block=block_num)
     return block_num
+
+
+async def close_rpc_client() -> None:
+    """Close the shared HTTP client on shutdown."""
+    global _http_client
+    if _http_client is not None:
+        await _http_client.aclose()
+        _http_client = None
