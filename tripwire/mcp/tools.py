@@ -21,7 +21,7 @@ from tripwire.db.repositories.triggers import (
     TriggerRepository,
     TriggerTemplateRepository,
 )
-from tripwire.types.models import EndpointMode, EndpointPolicies
+from tripwire.types.models import EndpointMode, EndpointPolicies, execution_state_from_status
 from tripwire.utils.topic import compute_topic0
 
 logger = structlog.get_logger(__name__)
@@ -429,6 +429,23 @@ async def get_trigger_status(
         logger.warning("mcp_event_count_failed", trigger_id=trigger_id)
         event_count = -1
 
+    # Fetch the most recent event's status for execution state
+    last_event_execution_state = None
+    try:
+        last_evt = (
+            supabase.table("events")
+            .select("status")
+            .eq("endpoint_id", trigger.endpoint_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if last_evt.data:
+            state, _, _ = execution_state_from_status(last_evt.data[0].get("status", "pending"))
+            last_event_execution_state = state.value
+    except Exception:
+        logger.warning("mcp_last_event_status_failed", trigger_id=trigger_id)
+
     return {
         "trigger_id": trigger.id,
         "name": trigger.name,
@@ -436,6 +453,7 @@ async def get_trigger_status(
         "chain_ids": trigger.chain_ids,
         "active": trigger.active,
         "event_count": event_count,
+        "last_event_execution_state": last_event_execution_state,
         "created_at": trigger.created_at.isoformat() if trigger.created_at else None,
     }
 
@@ -499,6 +517,7 @@ async def search_events(
 
     events = []
     for e in events_result.data:
+        state, safe, source = execution_state_from_status(e.get("status", "pending"))
         events.append({
             "id": e.get("id"),
             "tx_hash": e.get("tx_hash"),
@@ -506,6 +525,9 @@ async def search_events(
             "status": e.get("status"),
             "block_number": e.get("block_number"),
             "created_at": e.get("created_at"),
+            "execution_state": state.value,
+            "safe_to_execute": safe,
+            "trust_source": source.value,
         })
 
     return {"events": events, "count": len(events)}

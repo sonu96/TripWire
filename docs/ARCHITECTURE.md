@@ -318,8 +318,9 @@ topic0 = topics[0].lower()
   Raw log
     |
     v
-  1. DECODE              decode_transfer_event()
-    |                    Extracts ERC3009Transfer from raw Goldsky log
+  1. DECODE              ERC3009Decoder().decode()
+    |                    Returns DecodedEvent envelope with typed_model=ERC3009Transfer
+    |                    (wraps decode_transfer_event() via decoder abstraction, see 9.3)
     |                    ~1ms
     v
   2. DEDUP               nonce_repo.record_nonce_or_correlate()
@@ -377,12 +378,17 @@ since they have zero data dependencies on each other.
 For each matched trigger:
 
 ```
-  1. DECODE              decode_event_with_abi(raw_log, trigger.abi)
-                         Generic ABI decoder using eth-abi
+  1. DECODE              AbiGenericDecoder(trigger.abi).decode()
+                         Returns DecodedEvent envelope with decoded fields dict
+                         (wraps decode_event_with_abi() via decoder abstraction, see 9.3)
   2. FILTER              evaluate_filters(decoded, trigger.filter_rules)
                          JMESPath-based filter engine (AND logic)
   3. DEDUP               tx_hash:log_index:trigger_id as nonce key
   4. IDENTITY            First address field in decoded data
+  4b. REPUTATION GATE    If trigger.reputation_threshold > 0:
+                         Compare resolved identity's reputation_score against threshold
+                         Events from agents below threshold are rejected with
+                         status="filtered", reason="reputation_below_threshold"
   5. ENDPOINT FETCH      endpoint_repo.get_by_id(trigger.endpoint_id)
   6. DISPATCH            webhook_provider.send() via Convoy
   7. RECORD              events table + event_endpoints join
@@ -487,6 +493,28 @@ The `WebhookEventType` enum now includes six event types:
 `payment.finalized`, `payment.failed`, `payment.reorged`.
 
 All payloads also carry `version: "v1"` for forward compatibility.
+
+### 5.1a Execution State Derivation
+
+The function `execution_state_from_status()` in `tripwire/types/models.py`
+maps the database `events.status` column to the execution metadata triple
+`(ExecutionState, safe_to_execute, TrustSource)` at query time. This is a
+pure derivation -- no schema migration is needed.
+
+```
+  events.status         -> ExecutionState    safe_to_execute  TrustSource
+  ─────────────────────────────────────────────────────────────────────────
+  pre_confirmed         -> provisional       false            facilitator
+  pending               -> confirmed         false            onchain
+  confirmed             -> confirmed         false            onchain
+  finalized             -> finalized         true             onchain
+  reorged               -> reorged           false            onchain
+```
+
+Applied at API and MCP response boundaries: whenever event data is returned
+to callers (REST API responses, MCP tool results), the derived fields are
+injected into the payload. This ensures consumers always receive the
+execution state without relying on them to interpret raw status strings.
 
 ### 5.2 The Two Trust Models
 
@@ -660,8 +688,9 @@ address
 
 1. **Pipeline enrichment**: Every webhook payload includes `data.identity` (AgentIdentity or null)
 2. **Endpoint policies**: `required_agent_class` and `min_reputation_score` filter webhooks
-3. **MCP reputation gating**: Per-tool `min_reputation` threshold checked before execution
-4. **Audit context**: Agent identity logged with every event
+3. **Dynamic trigger reputation gating**: Triggers with `reputation_threshold > 0` evaluate the resolved agent identity's reputation score against the threshold. Events from agents scoring below the threshold are rejected with status `"filtered"`, reason `"reputation_below_threshold"`. Previously this field existed on the Trigger model but was never evaluated (dead code); it is now enforced at step 4b of the dynamic trigger pipeline (see Section 4.3).
+4. **MCP reputation gating**: Per-tool `min_reputation` threshold checked before execution
+5. **Audit context**: Agent identity logged with every event
 
 ### 6.5 Mock vs Production
 
@@ -997,16 +1026,123 @@ The TriggerIndex (used by event bus workers) maintains an in-memory dict
 rebuilt from the database every 10 seconds. Uses the precomputed `topic0`
 column (keccak256 hash), added in migration 017.
 
-### 9.3 Generic ABI Decoder
+### 9.3 Decoder Abstraction (Phase C1)
 
-`decode_event_with_abi()` in `tripwire/ingestion/generic_decoder.py`:
+The `tripwire/ingestion/decoders/` package provides a unified decoder
+interface that all event processing flows through. This is Phase C1 of a
+planned three-phase unification.
 
-- Accepts any ABI event fragment
-- Decodes indexed params from topics[1:] (address, uint, bytes32, bool)
-- Decodes non-indexed params from data via `eth_abi.decode()`
-- Returns flat dict of `field_name -> value` plus `_`-prefixed metadata
+**Package layout:**
 
-### 9.4 JMESPath Filter Engine
+```
+tripwire/ingestion/decoders/
+  __init__.py        — re-exports all public names
+  protocol.py        — Decoder protocol + DecodedEvent dataclass
+  erc3009.py         — ERC3009Decoder (wraps decode_transfer_event)
+  abi_generic.py     — AbiGenericDecoder (wraps decode_event_with_abi)
+```
+
+**`Decoder` protocol** (`protocol.py`, `@runtime_checkable`):
+
+| Method/Property | Signature                                       | Description                    |
+|-----------------|-------------------------------------------------|--------------------------------|
+| `name`          | `-> str`                                        | Decoder identifier             |
+| `can_decode()`  | `(raw_log) -> bool`                             | Check if this decoder handles the log |
+| `decode()`      | `(raw_log, ...) -> DecodedEvent`                | Decode raw log into envelope   |
+
+**`DecodedEvent` dataclass** (`protocol.py`) -- unified output envelope:
+
+| Field              | Type              | Description                              |
+|--------------------|-------------------|------------------------------------------|
+| tx_hash            | str               | Transaction hash                         |
+| block_number       | int               | Block number                             |
+| block_hash         | str               | Block hash                               |
+| log_index          | int               | Log index within transaction             |
+| chain_id           | int               | Chain ID                                 |
+| contract_address   | str               | Emitting contract address                |
+| topic0             | str               | Event signature hash                     |
+| fields             | dict              | Decoded event fields                     |
+| raw_log            | dict              | Original raw log data                    |
+| decoder_name       | str               | Which decoder produced this              |
+| typed_model        | object \| None    | Typed Pydantic model (e.g. ERC3009Transfer) |
+| identity_address   | str \| None       | Address to resolve identity for          |
+| dedup_key          | str \| None       | Deduplication key                        |
+
+**Concrete decoders:**
+
+- **`ERC3009Decoder`** (`erc3009.py`): Wraps existing `decode_transfer_event()`. Sets `typed_model` to `ERC3009Transfer`, `identity_address` to the authorizer.
+- **`AbiGenericDecoder(abi_fragment)`** (`abi_generic.py`): Wraps existing `decode_event_with_abi()`. Stores the full decoded dict in `fields`. Accepts any ABI event fragment; decodes indexed params from topics[1:] and non-indexed params from data via `eth_abi.decode()`.
+
+**Integration**: `processor.py` now calls `ERC3009Decoder().decode()` and
+`AbiGenericDecoder(trigger.abi).decode()` instead of invoking the raw
+decode functions directly. The raw functions remain available for backward
+compatibility but the processor routes through the decoder abstraction.
+
+**Planned phases:**
+
+| Phase | Status          | Description                                          |
+|-------|-----------------|------------------------------------------------------|
+| C1    | **Implemented** | Decoder protocol + DecodedEvent envelope + two concrete decoders |
+| C2    | **Implemented** | Unified processing loop (feature-flagged) -- single code path for ERC-3009 and dynamic triggers |
+| C3    | **Implemented** | Per-trigger payment gating via decoder metadata      |
+
+### 9.4 Unified Processing Loop (Phase C2)
+
+`_process_unified()` in `processor.py` replaces the separate `_process_erc3009_event`
+and `_process_dynamic_event` methods with a single code path. Feature-flagged via
+`UNIFIED_PROCESSOR=true` (default: false). Legacy split paths remain as fallback.
+
+**What dynamic triggers gain in the unified path:**
+- Finality checking (block confirmations via RPC)
+- Full policy evaluation (endpoint policies, not just reputation threshold)
+- Finality depth gating per endpoint
+- Execution state metadata (`execution_state`, `safe_to_execute`, `trust_source`)
+- Notify mode support (Supabase Realtime push)
+- OpenTelemetry tracing spans
+- Prometheus pipeline metrics
+
+**Pipeline stages (unified):**
+
+```
+  1. DECODE         ERC3009Decoder or AbiGenericDecoder(trigger.abi)
+  2. FILTER         evaluate_filters(decoded.fields, trigger.filter_rules)
+  3. PAYMENT GATE   _check_payment_gate(decoded, trigger)           [C3]
+  4. DEDUP          nonce_repo (correlation-aware for ERC-3009, simple for dynamic)
+  5. FINALITY       check_finality() or get_block_number() in parallel with...
+     IDENTITY       resolver.resolve(decoded.identity_address)
+  6. REPUTATION     trigger.reputation_threshold gating
+  7. ENDPOINT       recipient matching (ERC-3009) or trigger.endpoint_id (dynamic)
+     POLICY         evaluate_policy(transfer_data, identity, endpoint.policies)
+     FINALITY GATE  endpoint.policies.finality_depth check
+  8. DISPATCH       Convoy webhook (execute) or Supabase Realtime (notify)
+  9. RECORD         event_repo.insert + link_endpoints
+```
+
+### 9.5 Per-Trigger Payment Gating (Phase C3)
+
+Triggers can require that a decoded event contains payment metadata meeting a
+minimum threshold before dispatch proceeds. Controlled by three fields on the
+`Trigger` model (migration 024):
+
+| Field              | Type     | Description                                    |
+|--------------------|----------|------------------------------------------------|
+| require_payment    | bool     | Enable payment gating (default: false)         |
+| payment_token      | str/null | Required token contract (null = any token)     |
+| min_payment_amount | str/null | Minimum amount in smallest unit                |
+
+**DecodedEvent payment fields** (populated by decoders):
+
+| Field          | Populated by     | Source                    |
+|----------------|------------------|---------------------------|
+| payment_amount | ERC3009Decoder   | `transfer.value`          |
+| payment_token  | ERC3009Decoder   | `transfer.token`          |
+| payment_from   | ERC3009Decoder   | `transfer.from_address`   |
+| payment_to     | ERC3009Decoder   | `transfer.to_address`     |
+
+`_check_payment_gate(decoded, trigger)` validates: (1) payment data exists,
+(2) token matches if specified, (3) amount >= minimum. Returns `(bool, reason)`.
+
+### 9.6 JMESPath Filter Engine
 
 `evaluate_filters()` in `tripwire/ingestion/filter_engine.py`:
 
@@ -1201,16 +1337,17 @@ Key indexes: `(endpoint_id, status, created_at DESC)`,
 
 ### 10.9 audit_log (migration 012)
 
-| Column        | Type        | Notes                                     |
-|---------------|-------------|-------------------------------------------|
-| id            | UUID PK     | Auto-generated                            |
-| action        | TEXT        | e.g. 'mcp.tools.create_trigger'           |
-| actor         | TEXT        | Wallet address or 'anonymous'             |
-| resource_type | TEXT        |                                           |
-| resource_id   | TEXT        |                                           |
-| details       | JSONB       | Tool arguments, auth tier, etc.           |
-| ip_address    | TEXT        |                                           |
-| created_at    | TIMESTAMPTZ |                                           |
+| Column              | Type        | Notes                                     |
+|---------------------|-------------|-------------------------------------------|
+| id                  | UUID PK     | Auto-generated                            |
+| action              | TEXT        | e.g. 'mcp.tools.create_trigger'           |
+| actor               | TEXT        | Wallet address or 'anonymous'             |
+| resource_type       | TEXT        |                                           |
+| resource_id         | TEXT        |                                           |
+| details             | JSONB       | Tool arguments, auth tier, etc.           |
+| ip_address          | TEXT        |                                           |
+| execution_latency_ms| INTEGER     | End-to-end execution latency (migration 022) |
+| created_at          | TIMESTAMPTZ |                                           |
 
 ### 10.10 realtime_events
 
@@ -1231,6 +1368,22 @@ Used by Supabase Realtime for notify-mode delivery. Rows are inserted by
 
 See Section 9.1 for `trigger_templates`, `triggers`, and
 `trigger_instances`.
+
+### 10.12 agent_metrics (materialized view, migration 023)
+
+Aggregated per-agent metrics, refreshed periodically. Created by migration
+`023_agent_metrics_view.sql`.
+
+| Column                | Type    | Description                              |
+|-----------------------|---------|------------------------------------------|
+| agent_address         | TEXT    | Agent wallet address (grouping key)      |
+| total_events          | BIGINT  | Total events associated with this agent  |
+| finalized_events      | BIGINT  | Events that reached finalized status     |
+| successful_deliveries | BIGINT  | Webhook deliveries with status 'sent'    |
+| active_triggers       | BIGINT  | Currently active triggers owned by agent |
+
+This is a materialized view (not a table), so it must be refreshed via
+`REFRESH MATERIALIZED VIEW agent_metrics` to reflect current data.
 
 ---
 

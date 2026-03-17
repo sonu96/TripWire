@@ -232,6 +232,28 @@ def derive_execution_metadata(
     return ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN
 
 
+def execution_state_from_status(
+    status: str,
+) -> tuple[ExecutionState, bool, TrustSource]:
+    """Derive execution metadata from the DB ``events.status`` column.
+
+    Maps the 5 lifecycle status values to (execution_state, safe_to_execute,
+    trust_source).  Used at the API/MCP response layer so we don't need extra
+    DB columns.
+    """
+    _STATUS_MAP: dict[str, tuple[ExecutionState, bool, TrustSource]] = {
+        "pre_confirmed": (ExecutionState.PROVISIONAL, False, TrustSource.FACILITATOR),
+        "pending": (ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN),
+        "confirmed": (ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN),
+        "finalized": (ExecutionState.FINALIZED, True, TrustSource.ONCHAIN),
+        "reorged": (ExecutionState.REORGED, False, TrustSource.ONCHAIN),
+    }
+    return _STATUS_MAP.get(
+        status,
+        (ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN),
+    )
+
+
 class WebhookData(BaseModel):
     transfer: TransferData
     finality: FinalityData | None = None
@@ -299,6 +321,10 @@ class Trigger(BaseModel):
     webhook_event_type: str
     reputation_threshold: float = 0.0
     batch_id: str | None = None
+    # C3: Payment gating — require decoded event to contain payment meeting threshold
+    require_payment: bool = False
+    payment_token: str | None = None  # Required token contract (None = any token)
+    min_payment_amount: str | None = None  # Minimum amount in smallest unit
     active: bool = True
     created_at: datetime | None = None
     updated_at: datetime | None = None

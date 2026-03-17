@@ -8,6 +8,7 @@ from tripwire.api import get_supabase
 from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
+from tripwire.types.models import execution_state_from_status
 from tripwire.webhook.convoy_client import retry_message
 
 logger = structlog.get_logger(__name__)
@@ -22,6 +23,24 @@ def _verify_endpoint_ownership(endpoint_row: dict, wallet_address: str) -> None:
     """Raise 403 if the endpoint does not belong to the authenticated wallet."""
     if endpoint_row.get("owner_address", "").lower() != wallet_address.lower():
         raise HTTPException(status_code=403, detail="Not authorized to access this endpoint")
+
+
+def _enrich_deliveries(rows: list[dict], sb) -> list[dict]:
+    """Enrich delivery rows with execution state from their parent events."""
+    event_ids = list({r["event_id"] for r in rows if r.get("event_id")})
+    if not event_ids:
+        return rows
+    try:
+        ev_result = sb.table("events").select("id,status").in_("id", event_ids).execute()
+        status_map = {e["id"]: e.get("status", "pending") for e in ev_result.data}
+    except Exception:
+        return rows
+    for row in rows:
+        status = status_map.get(row.get("event_id"), "pending")
+        state, safe, _ = execution_state_from_status(status)
+        row["execution_state"] = state.value
+        row["safe_to_execute"] = safe
+    return rows
 
 
 def _get_wallet_endpoint_ids(sb, wallet_address: str) -> list[str]:
@@ -45,6 +64,8 @@ class DeliveryResponse(BaseModel):
     provider_message_id: str | None = None
     status: str
     created_at: str
+    execution_state: str | None = None
+    safe_to_execute: bool | None = None
 
 
 class DeliveryListResponse(BaseModel):
@@ -127,6 +148,7 @@ async def list_deliveries(
     if has_more:
         rows = rows[:limit]
 
+    rows = _enrich_deliveries(rows, sb)
     next_cursor = rows[-1]["id"] if has_more and rows else None
     return DeliveryListResponse(data=rows, cursor=next_cursor, has_more=has_more)
 
@@ -151,7 +173,8 @@ async def get_delivery(
         raise HTTPException(status_code=404, detail="Parent endpoint not found")
     _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
 
-    return DeliveryResponse(**row)
+    enriched = _enrich_deliveries([row], sb)
+    return DeliveryResponse(**enriched[0])
 
 
 @router.get("/endpoints/{endpoint_id}/deliveries", response_model=DeliveryListResponse)
@@ -184,6 +207,7 @@ async def list_endpoint_deliveries(
     if has_more:
         rows = rows[:limit]
 
+    rows = _enrich_deliveries(rows, sb)
     next_cursor = rows[-1]["id"] if has_more and rows else None
     return DeliveryListResponse(data=rows, cursor=next_cursor, has_more=has_more)
 

@@ -18,7 +18,7 @@ Base URL: https://<host>:3402/api/v1
 | `/api/v1/events` | Event history |
 | `/api/v1/deliveries` | Delivery tracking |
 | `/api/v1/ingest` | Goldsky and facilitator ingestion |
-| `/api/v1/stats` | Processing statistics |
+| `/api/v1/stats` | Processing statistics and agent metrics |
 | `/auth` | Nonce issuance (root-level, no `/api/v1`) |
 | `/.well-known` | x402 manifest (root-level) |
 | `/health`, `/ready`, `/metrics` | Operational (root-level) |
@@ -373,6 +373,9 @@ List events across all of the wallet's endpoints, with cursor pagination and opt
         "to_address": "0x...",
         "amount": "1000000"
       },
+      "execution_state": "confirmed",
+      "safe_to_execute": false,
+      "trust_source": "onchain",
       "created_at": "2026-03-16T12:00:00Z"
     }
   ],
@@ -389,7 +392,7 @@ Get a single event by ID. Verifies ownership through the parent endpoint.
 
 **Rate limit**: 30/min
 
-**Response** (200): Single `EventResponse` object.
+**Response** (200): Single `EventResponse` object (includes `execution_state`, `safe_to_execute`, and `trust_source` fields).
 
 ### GET /api/v1/endpoints/{endpoint_id}/events
 
@@ -399,7 +402,17 @@ List events for a specific endpoint with cursor pagination.
 
 **Query parameters**: `cursor`, `limit` (same as above).
 
-**Response** (200): Same `EventListResponse` format.
+**Response** (200): Same `EventListResponse` format (includes `execution_state`, `safe_to_execute`, and `trust_source` on each event).
+
+### Execution State Fields on Events
+
+All event responses (`GET /api/v1/events`, `GET /api/v1/events/{event_id}`, `GET /api/v1/endpoints/{endpoint_id}/events`) include three additional fields on every event object:
+
+| Field | Type | Description |
+|---|---|---|
+| `execution_state` | string | Current execution state: `"provisional"`, `"confirmed"`, `"finalized"`, or `"reorged"`. |
+| `safe_to_execute` | boolean | Whether the event is safe to act on. `true` only when the event has reached `"finalized"` state. |
+| `trust_source` | string | Origin of the trust assertion: `"facilitator"` (pre-settlement from x402 facilitator) or `"onchain"` (confirmed via Goldsky indexing pipeline). |
 
 ---
 
@@ -434,6 +447,8 @@ List deliveries across all of the wallet's endpoints, with optional filters and 
       "event_id": "evt_abc123",
       "provider_message_id": "convoy_msg_xyz",
       "status": "delivered",
+      "execution_state": "finalized",
+      "safe_to_execute": true,
       "created_at": "2026-03-16T12:00:05Z"
     }
   ],
@@ -448,7 +463,7 @@ Get a single delivery by ID. Verifies ownership through the parent endpoint.
 
 **Rate limit**: 30/min
 
-**Response** (200): Single `DeliveryResponse` object.
+**Response** (200): Single `DeliveryResponse` object (includes `execution_state` and `safe_to_execute` fields).
 
 ### GET /api/v1/endpoints/{endpoint_id}/deliveries
 
@@ -458,7 +473,16 @@ List deliveries for a specific endpoint.
 
 **Query parameters**: `status`, `cursor`, `limit`.
 
-**Response** (200): Same `DeliveryListResponse` format.
+**Response** (200): Same `DeliveryListResponse` format (includes `execution_state` and `safe_to_execute` on each delivery).
+
+### Execution State Fields on Deliveries
+
+All delivery responses (`GET /api/v1/deliveries`, `GET /api/v1/deliveries/{delivery_id}`, `GET /api/v1/endpoints/{endpoint_id}/deliveries`) include two additional fields on every delivery object:
+
+| Field | Type | Description |
+|---|---|---|
+| `execution_state` | string | Execution state of the associated event at the time of delivery: `"provisional"`, `"confirmed"`, `"finalized"`, or `"reorged"`. |
+| `safe_to_execute` | boolean | Whether the associated event was safe to act on at delivery time. `true` only when `execution_state` is `"finalized"`. |
 
 ### GET /api/v1/endpoints/{endpoint_id}/deliveries/stats
 
@@ -677,9 +701,60 @@ Return processing statistics scoped to the authenticated wallet's endpoints.
   "total_events": 1542,
   "events_last_hour": 23,
   "active_endpoints": 3,
-  "last_event_at": "2026-03-16T11:58:32Z"
+  "last_event_at": "2026-03-16T11:58:32Z",
+  "execution_state_breakdown": {
+    "finalized": 1420,
+    "confirmed": 98,
+    "provisional": 21,
+    "reorged": 3
+  }
 }
 ```
+
+| Field | Type | Description |
+|---|---|---|
+| `total_events` | int | Total events across all wallet endpoints. |
+| `events_last_hour` | int | Events received in the last 60 minutes. |
+| `active_endpoints` | int | Number of active endpoints. |
+| `last_event_at` | string (ISO-8601) | Timestamp of the most recent event. |
+| `execution_state_breakdown` | object | Count of events grouped by execution state (`finalized`, `confirmed`, `provisional`, `reorged`). States with zero events may be omitted. |
+
+### GET /api/v1/stats/agent-metrics
+
+Return aggregated per-agent metrics from a materialized view. Useful for monitoring agent activity across all of the wallet's endpoints.
+
+**Rate limit**: 30/min
+
+**Response** (200):
+
+```json
+{
+  "data": [
+    {
+      "agent_address": "0x1234567890abcdef1234567890abcdef12345678",
+      "total_events": 320,
+      "finalized_events": 305,
+      "successful_deliveries": 298,
+      "active_triggers": 4
+    },
+    {
+      "agent_address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      "total_events": 87,
+      "finalized_events": 85,
+      "successful_deliveries": 82,
+      "active_triggers": 1
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `agent_address` | string | The agent's Ethereum address. |
+| `total_events` | int | Total events originated by this agent. |
+| `finalized_events` | int | Events that reached `finalized` execution state. |
+| `successful_deliveries` | int | Deliveries with `delivered` status for this agent's events. |
+| `active_triggers` | int | Number of active triggers associated with this agent. |
 
 ---
 
@@ -918,11 +993,14 @@ created_at    datetime
 ### Event
 
 ```
-id            string
-endpoint_id   string?
-type          WebhookEventType     payment.confirmed | payment.pending | payment.pre_confirmed | payment.finalized | payment.failed | payment.reorged
-data          object               Transfer details, finality info, identity
-created_at    string (ISO-8601)
+id               string
+endpoint_id      string?
+type             WebhookEventType     payment.confirmed | payment.pending | payment.pre_confirmed | payment.finalized | payment.failed | payment.reorged
+data             object               Transfer details, finality info, identity
+execution_state  string               "provisional" | "confirmed" | "finalized" | "reorged"
+safe_to_execute  bool                 true only when execution_state is "finalized"
+trust_source     string               "facilitator" | "onchain"
+created_at       string (ISO-8601)
 ```
 
 ### WebhookPayload
@@ -979,6 +1057,8 @@ created_at            datetime?
 updated_at            datetime?
 ```
 
+**Reputation enforcement**: When `reputation_threshold` is greater than 0, TripWire evaluates the sender's ERC-8004 reputation score at event processing time. Events from agents whose reputation falls below the threshold are rejected. Agents with no onchain identity are also rejected.
+
 ### TriggerTemplate
 
 ```
@@ -1001,3 +1081,19 @@ install_count         int
 created_at            datetime?
 updated_at            datetime?
 ```
+
+---
+
+## 15. MCP Reputation Requirements
+
+Paid MCP tools require a minimum agent reputation score to invoke. This prevents low-reputation or unregistered agents from accessing premium functionality.
+
+| MCP Tool | Auth Tier | Minimum Reputation |
+|---|---|---|
+| `register_middleware` | X402 | 10.0 |
+| `create_trigger` | X402 | 10.0 |
+| `activate_template` | X402 | 10.0 |
+
+Agents with a reputation score below 10.0 (or with no registered ERC-8004 onchain identity) will receive a rejection error when calling these tools. Reputation is resolved from the ERC-8004 registry at invocation time.
+
+Public and SIWX-tier MCP tools (e.g., `list_templates`, `list_triggers`) do not enforce a reputation threshold.

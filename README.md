@@ -11,7 +11,8 @@ Turn onchain events into safe execution signals -- instantly or after finality. 
 ## What TripWire Does
 
 - **Indexes onchain events via Goldsky Turbo** across Base, Ethereum, and Arbitrum. Any EVM event -- ERC-3009 payments, ERC-20 transfers, DeFi swaps, NFT mints -- can be a trigger.
-- **Evaluates triggers, verifies finality, and enriches with identity.** Events are decoded with the trigger's ABI, filtered against configurable rules, checked for onchain finality (per-chain depth), and annotated with the sender's ERC-8004 agent identity.
+- **Unified processing pipeline.** A single code path decodes, deduplicates, checks finality, resolves ERC-8004 identity, evaluates policies, and gates on payment metadata -- for both built-in ERC-3009 events and dynamic triggers created via MCP or API.
+- **Per-trigger payment gating.** Triggers can require that the decoded event contains a payment meeting a minimum threshold before dispatch proceeds. Gate on token contract, minimum amount, or both.
 - **Delivers signed webhooks via Convoy** with at-least-once guarantees. HMAC-signed payloads, exponential backoff retries (10 attempts), and a dead-letter queue ensure nothing is silently dropped.
 
 ---
@@ -40,7 +41,7 @@ L0  Chain             Base / Ethereum / Arbitrum (ERC-3009, any EVM event)
      |
 L1  Goldsky Turbo     Indexes events, delivers raw logs via webhook to /ingest
      |
-L2  TripWire Engine   Dedup -> Decode -> Filter -> Identity (ERC-8004) -> Policy
+L2  TripWire Engine   Decode -> Filter -> Payment Gate -> Dedup -> Finality ∥ Identity -> Policy
      |
 L3  Convoy Delivery   HMAC-signed webhooks, 10x retries, backoff, DLQ
      |
@@ -213,6 +214,7 @@ Every delivery follows the v1 payload schema. The `execution_state` and `safe_to
 - **Finality verified per-chain** -- Ethereum: 12 blocks, Base: 3 blocks, Arbitrum: 1 block. Configurable per-endpoint via `policies.finality_depth`.
 - **Reorg detection** -- The finality poller detects block reorganizations and emits `payment.reorged` events so your application can roll back provisional actions.
 - **Circuit breaker on Convoy** -- Webhook delivery fails fast on unresponsive endpoints and auto-recovers, preventing cascade failures.
+- **Payment gating** -- Triggers can require minimum payment amounts and specific tokens before dispatch. Gating runs before deduplication so rejected events don't consume nonces.
 
 ---
 
@@ -227,6 +229,21 @@ Every delivery follows the v1 payload schema. The `execution_state` and `safe_to
 | [Security](docs/SECURITY.md)               | Auth model, HMAC signing, threat model           |
 | [Operations](docs/OPERATIONS.md)           | Deployment, monitoring, DLQ handling             |
 | [Development](docs/DEVELOPMENT.md)         | Local setup, testing, contribution guidelines    |
+| [Team Update](docs/TEAM-UPDATE.md)         | Latest sprint summary and known issues           |
+
+---
+
+## Decoder Architecture (Phases C1-C3)
+
+TripWire uses a unified decoder abstraction to process all event types through a single pipeline:
+
+| Phase | Status | Description |
+|-------|--------|-------------|
+| C1 | Done | `Decoder` protocol + `DecodedEvent` envelope + `ERC3009Decoder` + `AbiGenericDecoder` |
+| C2 | Done | Unified processing loop -- single code path for ERC-3009 and dynamic triggers (feature-flagged via `UNIFIED_PROCESSOR`) |
+| C3 | Done | Per-trigger payment gating via decoder metadata (`require_payment`, `payment_token`, `min_payment_amount`) |
+
+When `UNIFIED_PROCESSOR=true`, dynamic triggers gain finality checking, full policy evaluation, execution state metadata, notify mode, tracing, and metrics -- all features previously exclusive to the ERC-3009 path.
 
 ---
 

@@ -2,6 +2,18 @@
 
 All notable changes to TripWire are documented in this file.
 
+## [2026-03-17]
+
+### Added
+- **Unified processing loop (C2)** — New `_process_unified()` in `processor.py` merges separate ERC-3009 and dynamic trigger code paths into a single pipeline using `DecodedEvent`. Feature-flagged via `UNIFIED_PROCESSOR=true`. Dynamic triggers now gain: finality checking, full policy evaluation, finality depth gating, execution state metadata, notify mode, tracing spans, and Prometheus metrics.
+- **Per-trigger payment gating (C3)** — Triggers can require decoded events to contain payment data meeting a threshold before dispatch. New fields on `Trigger`: `require_payment`, `payment_token`, `min_payment_amount`. New fields on `DecodedEvent`: `payment_amount`, `payment_token`, `payment_from`, `payment_to`. Migration `024_trigger_payment_gating.sql`.
+- **Execution state everywhere** — New `execution_state_from_status()` helper in `tripwire/types/models.py` maps DB status to `(ExecutionState, safe_to_execute, TrustSource)`. All event and delivery API responses now include `execution_state`, `safe_to_execute`, and `trust_source` fields. Stats endpoint includes `execution_state_breakdown` dict. MCP `search_events` returns execution state fields per event; `get_trigger_status` returns `last_event_execution_state`.
+- **Reputation gating for paid MCP tools** — `register_middleware`, `create_trigger`, and `activate_template` now require `min_reputation >= 10.0`. Dynamic triggers with `reputation_threshold > 0` reject events from low-reputation agents.
+- **Execution latency tracking** — Migration `022_audit_latency.sql` adds `execution_latency_ms` column to `audit_log`; MCP server records execution latency per tool call.
+- **Agent metrics materialized view** — Migration `023_agent_metrics_view.sql` creates `agent_metrics` materialized view; new `GET /stats/agent-metrics` endpoint exposes per-agent metrics.
+- **Decoder abstraction** — New `tripwire/ingestion/decoders/` package introducing a `Decoder` protocol, `DecodedEvent` dataclass, `ERC3009Decoder`, and `AbiGenericDecoder`. Processor uses decoder wrappers; existing decoder functions remain untouched for backward compatibility.
+- **Execution state and decoder tests** — `tests/test_execution_state.py` with 15 tests covering status mapping, decoder protocol compliance, and both decoder wrappers.
+
 ## [Unreleased]
 
 ### Added

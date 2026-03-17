@@ -59,7 +59,7 @@ tripwire/
   api/             FastAPI routes, auth middleware, rate limiting
   config/          Settings via pydantic-settings (.env loading)
   db/              Supabase client, repositories, SQL migrations
-    migrations/    Numbered SQL migration files (001..021)
+    migrations/    Numbered SQL migration files (001..023)
     repositories/  Data access: endpoints, events, nonces, triggers, webhooks
   identity/        ERC-8004 identity resolution
     resolver.py    ERC8004Resolver (prod, makes eth_call to onchain registry)
@@ -312,6 +312,8 @@ There is no automated migration runner. Run them in order against your Supabase 
 | 019 | `019_nonce_archival.sql` | Nonce archival table and function for unbounded table growth |
 | 020 | `020_unified_event_lifecycle.sql` | Unified event lifecycle: `source` column on nonces, `record_nonce_or_correlate` function with SELECT FOR UPDATE (fixes nonce TOCTOU race), enables Goldsky to promote facilitator pre_confirmed events |
 | 021 | `021_dlq_retry_count.sql` | Persistent `dlq_retry_count` column on webhook_deliveries (replaces in-memory retry counter in DLQHandler) |
+| 022 | `022_audit_latency.sql` | Add `execution_latency_ms` column to `audit_log` for tracking MCP tool execution latency |
+| 023 | `023_agent_metrics_view.sql` | Create `agent_metrics` materialized view for per-agent metrics; powers `GET /stats/agent-metrics` endpoint |
 
 ---
 
@@ -363,6 +365,8 @@ The `MockResolver` makes identity-dependent code testable without any external d
 - **Unit tests** (`tests/test_routes.py`): Use `MockSupabase` with lightweight chain-able query builder. Override `require_wallet_auth` and `_verify_goldsky_request` dependencies. Use `httpx.ASGITransport` to call the app without a running server.
 
 - **Integration tests** (`tests/integration/test_pipeline.py`): Use `StatefulMockSupabase` that tracks inserts/selects/upserts across tables. Wire the real `EventProcessor` with all repositories. Cover scenarios: register then ingest, nonce deduplication, wallet auth round-trip, policy rejection, notify-mode with subscriptions.
+
+- **Execution state and decoder tests** (`tests/test_execution_state.py`): 15 tests covering `execution_state_from_status()` mapping, `Decoder` protocol compliance, and both `ERC3009Decoder` and `AbiGenericDecoder` wrappers.
 
 - **x402 middleware tests** (`tests/test_routes.py::TestX402PaymentMiddleware`): Require the `x402` package; skipped when not installed.
 

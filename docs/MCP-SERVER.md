@@ -58,7 +58,7 @@ After SIWE authentication succeeds, the server resolves the caller's ERC-8004 id
 - `identity`: full `AgentIdentity` record (name, metadata, registration block)
 - `reputation_score`: integer 0–100
 
-If a tool's `min_reputation` threshold is set above 0 and the caller's score is below it, the request is rejected with `-32001 REPUTATION_TOO_LOW`. Currently all 8 tools have `min_reputation=0`, so the check always passes; operators can enable reputation gating by changing tool registrations.
+If a tool's `min_reputation` threshold is set above 0 and the caller's score is below it, the request is rejected with `-32001 REPUTATION_TOO_LOW`. X402-tier tools (`register_middleware`, `create_trigger`, `activate_template`) require `min_reputation >= 10.0`. SIWX-tier tools remain at `min_reputation=0`. Agents with a reputation score below 10 calling a paid tool will receive JSON-RPC error code `-32001` ("Reputation too low").
 
 ### X402 (Per-Call Payment)
 
@@ -72,16 +72,16 @@ Payment is verified before tool execution but settled only after successful exec
 
 ### Pricing Table
 
-| Tool                | Auth Tier | Price   | Network        |
-|---------------------|-----------|---------|----------------|
-| `register_middleware` | X402    | $0.003  | eip155:8453    |
-| `create_trigger`      | X402    | $0.003  | eip155:8453    |
-| `activate_template`   | X402    | $0.001  | eip155:8453    |
-| `list_triggers`       | SIWX    | free    | --             |
-| `delete_trigger`      | SIWX    | free    | --             |
-| `list_templates`      | SIWX    | free    | --             |
-| `get_trigger_status`  | SIWX    | free    | --             |
-| `search_events`       | SIWX    | free    | --             |
+| Tool                | Auth Tier | Price   | Network        | Min Reputation |
+|---------------------|-----------|---------|----------------|----------------|
+| `register_middleware` | X402    | $0.003  | eip155:8453    | 10.0           |
+| `create_trigger`      | X402    | $0.003  | eip155:8453    | 10.0           |
+| `activate_template`   | X402    | $0.001  | eip155:8453    | 10.0           |
+| `list_triggers`       | SIWX    | free    | --             | 0              |
+| `delete_trigger`      | SIWX    | free    | --             | 0              |
+| `list_templates`      | SIWX    | free    | --             | 0              |
+| `get_trigger_status`  | SIWX    | free    | --             | 0              |
+| `search_events`       | SIWX    | free    | --             | 0              |
 
 All x402 payments are on Base (chain ID 8453) and paid to the treasury address configured in `TRIPWIRE_TREASURY_ADDRESS`.
 
@@ -388,11 +388,14 @@ Returns trigger health information and event count. The caller must own the trig
   "chain_ids": [8453],
   "active": true,
   "event_count": 137,
+  "last_event_execution_state": "confirmed",
   "created_at": "2026-03-15T10:30:00+00:00"
 }
 ```
 
 The `event_count` field returns `-1` if the count query fails.
+
+The `last_event_execution_state` field is a string or `null`. It reports the execution state of the most recent event matched by this trigger, using the same values as the `execution_state` field in `search_events` (`"provisional"`, `"confirmed"`, `"finalized"`, `"reorged"`). It is `null` if the trigger has not yet matched any events.
 
 ### 8. search_events
 
@@ -420,12 +423,25 @@ Queries recent events across all of the caller's active endpoints. Uses the `eve
       "chain_id": 8453,
       "status": "confirmed",
       "block_number": 12345678,
-      "created_at": "2026-03-15T10:31:00+00:00"
+      "created_at": "2026-03-15T10:31:00+00:00",
+      "execution_state": "confirmed",
+      "safe_to_execute": false,
+      "trust_source": "onchain"
     }
   ],
   "count": 1
 }
 ```
+
+Each event in the response now includes three execution metadata fields:
+
+| Field             | Type    | Description                                                                                              |
+|-------------------|---------|----------------------------------------------------------------------------------------------------------|
+| `execution_state` | string  | One of `provisional`, `confirmed`, `finalized`, `reorged`. Derived from event type and finality data     |
+| `safe_to_execute` | boolean | `true` only when the event is finalized (enough confirmations or `payment.finalized` event type)         |
+| `trust_source`    | string  | `"facilitator"` for pre-confirmed events (off-chain attestation), `"onchain"` for all others             |
+
+These fields follow the same derivation rules documented in the [Webhook Payload Shape](#webhook-payload-shape) section. Agents should gate irreversible side-effects on `safe_to_execute == true`.
 
 ---
 
@@ -603,7 +619,7 @@ Every `tools/call` invocation is logged to the `audit_log` table, regardless of 
 | `actor`        | Agent wallet address, or `"anonymous"`          |
 | `resource_type`| `mcp_tool`                                      |
 | `resource_id`  | Tool name                                       |
-| `details`      | `{ arguments, auth_tier, payment_verified, success }` |
+| `details`      | `{ arguments, auth_tier, payment_verified, success, execution_latency_ms }` |
 | `ip_address`   | Client IP from request                          |
 
 ---
@@ -616,6 +632,6 @@ Every `tools/call` invocation is logged to the `audit_log` table, regardless of 
 
 3. **No timeout on tool handler execution.** Tool handlers run without any timeout. A slow database query or hung external call will block indefinitely. There is no `asyncio.wait_for` or equivalent wrapper around handler execution.
 
-4. **Reputation gating is defined but inert.** The reputation gating mechanism exists in the execution pipeline, but all 8 tools have `min_reputation=0`. This means the reputation check always passes. Changing thresholds requires a code change.
+4. **Reputation gating is active for paid tools only.** X402-tier tools (`register_middleware`, `create_trigger`, `activate_template`) require `min_reputation >= 10.0`. SIWX-tier tools remain at `min_reputation=0`. Changing thresholds still requires a code change.
 
 5. **Tool pricing is hardcoded.** Prices are set at module import time in `server.py` via `_register()` calls. Changing a tool's price requires redeploying the application. There is no admin API or database-driven pricing.

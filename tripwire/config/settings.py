@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     event_bus_enabled: bool = False  # Enable Redis Streams event bus for async event processing
     event_bus_workers: int = 3  # Number of trigger worker processes for event bus
 
+    # Unified processor (C2) — single code path for ERC-3009 and dynamic triggers
+    unified_processor: bool = False
+
     # Finality poller
     finality_poller_enabled: bool = True
     finality_poll_interval_arbitrum: int = 5

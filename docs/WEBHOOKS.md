@@ -362,7 +362,13 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
 
 ### Dynamic Trigger Payload (`wire.triggered`)
 
-Dynamic trigger events use a slightly different payload structure. The `data` field contains the ABI-decoded event fields directly, and includes a `trigger_id`:
+Dynamic trigger events use a slightly different payload structure. The `data` field contains the ABI-decoded event fields directly, and includes a `trigger_id`.
+
+#### Reputation Gating
+
+Dynamic triggers that have `reputation_threshold > 0` will filter events based on the sender's ERC-8004 reputation score. After identity resolution, if the resolved agent's `reputation_score` is below the trigger's `reputation_threshold`, the event is silently dropped and no webhook is dispatched. If the sender has no ERC-8004 identity (`data.identity` is `null`), the event is also dropped. This allows trigger creators to restrict webhooks to high-reputation agents without additional endpoint-level policy configuration.
+
+#### Payload Structure
 
 ```json
 {
@@ -530,6 +536,8 @@ When an onchain event is processed, TripWire matches it against registered endpo
 For standard ERC-3009 payment events, Goldsky Turbo handles decoding via its SQL transform pipeline and delivers fully structured payloads to `/ingest`. TripWire consumes these directly without additional ABI decoding.
 
 For **dynamic trigger events** (`wire.triggered`), Goldsky delivers the raw log (topics + data bytes) to `/ingest`. TripWire performs ABI decoding locally using `eth-abi`, based on the ABI registered with the trigger. Goldsky's SQL transforms only cover the built-in ERC-3009 event set.
+
+Internally, decoding is handled by a unified decoder abstraction: `ERC3009Decoder` wraps the existing `decode_transfer_event` for standard payment events, and `AbiGenericDecoder` wraps `decode_event_with_abi` for dynamic trigger events, producing a `DecodedEvent` envelope. This is an internal refactor -- the webhook payload format is unchanged.
 
 ### Match Criteria
 
@@ -721,6 +729,8 @@ Returns a paginated list of deliveries. Supports cursor-based pagination (pass t
       "event_id": "evt_456",
       "provider_message_id": "conv_msg_789",
       "status": "sent",
+      "execution_state": "confirmed",
+      "safe_to_execute": false,
       "created_at": "2026-03-16T00:00:00Z"
     }
   ],
@@ -735,7 +745,7 @@ Returns a paginated list of deliveries. Supports cursor-based pagination (pass t
 GET /deliveries/{delivery_id}
 ```
 
-Returns a single delivery record.
+Returns a single delivery record. The response includes `execution_state` and `safe_to_execute` fields derived from the parent event's status, allowing consumers to check execution safety without a separate event lookup.
 
 ### List Deliveries by Endpoint
 
@@ -743,7 +753,7 @@ Returns a single delivery record.
 GET /endpoints/{endpoint_id}/deliveries?status={status}&cursor={cursor}&limit={n}
 ```
 
-Same response format as the global list, scoped to a single endpoint.
+Same response format as the global list, scoped to a single endpoint. All delivery list and detail responses include `execution_state` and `safe_to_execute` derived from the parent event.
 
 ### Delivery Stats
 

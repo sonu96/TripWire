@@ -6,7 +6,7 @@ The agentic web is no longer a whiteboard sketch. AI agents are live on mainnet,
 
 x402 provides the rails. **TripWire provides the infrastructure.**
 
-x402 payment webhooks are the first use case, but TripWire is built as a **programmable onchain event trigger platform**. Any onchain event -- token transfers, contract interactions, governance votes, NFT mints -- can be mapped to a webhook, filtered through policies, and delivered to your application or AI agent. The same verification, identity enrichment, and delivery pipeline applies to any event type.
+x402 payment webhooks are the first use case, but TripWire is built as a **programmable onchain event trigger platform**. Any onchain event -- token transfers, contract interactions, governance votes, NFT mints -- can be mapped to a webhook, filtered through policies, gated on payment requirements, and delivered to your application or AI agent. A unified processing pipeline (Phase C2) routes both ERC-3009 payments and dynamic triggers through the same decode-filter-gate-dedup-finality-identity-policy-dispatch path. Per-trigger payment gating (Phase C3) lets triggers require minimum payment amounts before firing.
 
 Every API developer accepting x402 payments today faces the same problem: the payment settles onchain, but the application logic lives offchain. Between those two worlds sits a gap -- a gap filled with chain watchers, finality checks, replay protection, identity lookups, webhook delivery, and audit logging. Six distinct pieces of infrastructure that have nothing to do with your product.
 
@@ -59,7 +59,7 @@ async with TripwireClient(api_key="tw_...") as client:
 
 Register an endpoint. Define a policy. Receive verified, enriched payloads. Execute your business logic. That's it.
 
-TripWire handles the chain watching (Goldsky Turbo via webhooks), the finality tracking (per-chain confirmation depths), the replay protection (nonce deduplication), the identity resolution (ERC-8004), the webhook delivery (Convoy self-hosted + direct httpx fast path), and the audit logging (Supabase) -- so you never have to.
+TripWire handles the chain watching (Goldsky Turbo via webhooks), the finality tracking (per-chain confirmation depths), the replay protection (nonce deduplication), the identity resolution (ERC-8004), the payment gating (per-trigger amount and token requirements), the webhook delivery (Convoy self-hosted), and the audit logging (Supabase) -- so you never have to.
 
 ---
 
@@ -96,9 +96,13 @@ Both modes deliver the same enriched payload structure:
 ```json
 {
   "id": "evt_abc123",
-  "type": "payment.confirmed",
+  "type": "payment.finalized",
   "mode": "execute",
   "timestamp": 1709856000,
+  "version": "v1",
+  "execution_state": "finalized",
+  "safe_to_execute": true,
+  "trust_source": "onchain",
   "data": {
     "transfer": {
       "chain_id": 8453,
@@ -125,7 +129,7 @@ Both modes deliver the same enriched payload structure:
 }
 ```
 
-Every payload includes the raw transfer data, finality status, and -- when available -- the sender's onchain AI agent identity. Your application gets the full picture without making a single chain call.
+Every payload includes `execution_state` (`provisional`, `confirmed`, `finalized`, `reorged`), `safe_to_execute` (true only after finality), and `trust_source` (`facilitator` or `onchain`). Your application branches on these fields without making a single chain call.
 
 ---
 
@@ -224,13 +228,20 @@ Break-even lands at roughly **98,500 events per month** -- approximately 330 act
 
 ### Phase 1 -- Foundation (Current)
 
-Core infrastructure for x402 payment event processing:
-- Goldsky Turbo-powered chain indexing for ERC-3009 events on Base, Ethereum, and Arbitrum (webhook delivery to TripWire ingest endpoint)
+Core infrastructure for programmable onchain event triggers:
+- Goldsky Turbo-powered chain indexing for ERC-3009 events on Base, Ethereum, and Arbitrum
+- **Dynamic trigger registry** -- create triggers for any EVM event via MCP or API, no deploy needed
+- **Unified processing pipeline** (C2) -- single code path for ERC-3009 and dynamic triggers with finality, policy, identity, and metrics
+- **Per-trigger payment gating** (C3) -- gate dispatch on payment amount and token requirements
+- **Decoder abstraction** (C1) -- `Decoder` protocol with `DecodedEvent` envelope, `ERC3009Decoder`, `AbiGenericDecoder`
 - Finality tracking with per-chain confirmation depths
-- Nonce-based replay protection
-- Notify mode (Supabase Realtime) and Execute mode (Convoy webhook delivery with direct httpx fast path)
-- Policy engine with amount, sender, agent class, and reputation filters
-- ERC-8004 identity resolution
+- Nonce-based replay protection with facilitator-Goldsky correlation
+- Notify mode (Supabase Realtime) and Execute mode (Convoy webhook delivery)
+- Policy engine with amount, sender, agent class, reputation, and finality depth filters
+- ERC-8004 identity resolution with reputation scoring
+- MCP server with 8 tools, 3-tier auth (PUBLIC / SIWX / X402), x402 Bazaar
+- Execution state lifecycle: `provisional` → `confirmed` → `finalized` (with `reorged` branch)
+- Redis Streams event bus for horizontal scaling (optional, feature-flagged)
 - Python SDK (`tripwire-sdk`)
 - REST API for endpoint and subscription management
 
@@ -259,18 +270,20 @@ Becoming the infrastructure standard for agentic commerce:
 ## Architecture at a Glance
 
 ```
-L0  Chain         Base / Ethereum / Arbitrum (ERC-3009 transfers)
+L0  Chain         Base / Ethereum / Arbitrum (ERC-3009 + any EVM event)
                           |
 L1  Indexing       Goldsky Turbo --> Webhook POST to TripWire /ingest
                           |
-L2  Middleware     TripWire (verify, deduplicate, identify, evaluate)
+L2  Middleware     TripWire (decode, filter, payment gate, dedup, finality, identity, policy)
                           |
-L3  Delivery       Convoy + direct POST (Execute) | Supabase Realtime (Notify)
+L3  Delivery       Convoy webhooks (Execute) | Supabase Realtime (Notify)
                           |
 L4  Application    Your API (execute business logic)
+                          |
+L5  MCP Server     8 tools for AI agent trigger CRUD (3-tier auth)
 ```
 
-Five layers. One integration point. Every layer is managed, scalable, and observable.
+Six layers. One integration point. Every layer is managed, scalable, and observable.
 
 ---
 

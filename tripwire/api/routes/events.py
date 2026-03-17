@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from tripwire.api import get_supabase
 from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
-from tripwire.types.models import WebhookEventType
+from tripwire.types.models import WebhookEventType, execution_state_from_status
 
 logger = structlog.get_logger(__name__)
 
@@ -29,12 +29,24 @@ class EventResponse(BaseModel):
     type: WebhookEventType
     data: dict
     created_at: str
+    execution_state: str | None = None
+    safe_to_execute: bool | None = None
+    trust_source: str | None = None
 
 
 class EventListResponse(BaseModel):
     data: list[EventResponse]
     cursor: str | None = None
     has_more: bool = False
+
+
+def _enrich_event(row: dict) -> dict:
+    """Add execution_state, safe_to_execute, trust_source to an event row."""
+    state, safe, source = execution_state_from_status(row.get("status", "pending"))
+    row["execution_state"] = state.value
+    row["safe_to_execute"] = safe
+    row["trust_source"] = source.value
+    return row
 
 
 def _get_wallet_endpoint_ids(sb, wallet_address: str) -> list[str]:
@@ -91,7 +103,11 @@ async def list_events(
         rows = rows[:limit]
 
     next_cursor = rows[-1]["id"] if has_more and rows else None
-    return EventListResponse(data=rows, cursor=next_cursor, has_more=has_more)
+    return EventListResponse(
+        data=[_enrich_event(r) for r in rows],
+        cursor=next_cursor,
+        has_more=has_more,
+    )
 
 
 @router.get("/events/{event_id}", response_model=EventResponse)
@@ -119,7 +135,7 @@ async def get_event(
         # Events without an endpoint_id cannot be verified — deny access
         raise HTTPException(status_code=403, detail="Not authorized to access this event")
 
-    return EventResponse(**event)
+    return EventResponse(**_enrich_event(event))
 
 
 @router.get("/endpoints/{endpoint_id}/events", response_model=EventListResponse)
@@ -161,4 +177,8 @@ async def list_endpoint_events(
         rows = rows[:limit]
 
     next_cursor = rows[-1]["id"] if has_more and rows else None
-    return EventListResponse(data=rows, cursor=next_cursor, has_more=has_more)
+    return EventListResponse(
+        data=[_enrich_event(r) for r in rows],
+        cursor=next_cursor,
+        has_more=has_more,
+    )

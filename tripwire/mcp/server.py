@@ -9,6 +9,7 @@ Authentication tiers:
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import structlog
@@ -123,6 +124,7 @@ _register(
     handler=tool_handlers.register_middleware,
     auth_tier=AuthTier.X402,
     price="$0.003",
+    min_reputation=10.0,
 )
 
 _register(
@@ -159,6 +161,7 @@ _register(
     handler=tool_handlers.create_trigger,
     auth_tier=AuthTier.X402,
     price="$0.003",
+    min_reputation=10.0,
 )
 
 _register(
@@ -226,6 +229,7 @@ _register(
     handler=tool_handlers.activate_template,
     auth_tier=AuthTier.X402,
     price="$0.001",
+    min_reputation=10.0,
 )
 
 _register(
@@ -498,6 +502,7 @@ def create_mcp_app() -> FastAPI:
             }
 
             # ── Execute the tool handler ────────────────────
+            _t0 = time.perf_counter()
             try:
                 result = await tool_def.handler(tool_args, ctx, repos)
             except Exception as exc:
@@ -549,6 +554,7 @@ def create_mcp_app() -> FastAPI:
                     )
 
             # ── Audit log ───────────────────────────────────
+            _latency_ms = int((time.perf_counter() - _t0) * 1000)
             audit_logger: AuditLogger = parent_app.state.audit_logger
             fire_and_forget(audit_logger.log(
                 action=f"mcp.tools.{tool_name}",
@@ -560,6 +566,7 @@ def create_mcp_app() -> FastAPI:
                     "auth_tier": ctx.auth_tier.value,
                     "payment_verified": ctx.payment_verified,
                     "success": "error" not in result,
+                    "execution_latency_ms": _latency_ms,
                 },
                 ip_address=(
                     request.client.host if request.client else None
