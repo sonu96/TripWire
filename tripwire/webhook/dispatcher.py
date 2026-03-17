@@ -20,7 +20,9 @@ from tripwire.types.models import (
     WebhookEventType,
     WebhookPayload,
     build_finality_data,
+    derive_execution_metadata,
 )
+from tripwire.webhook.convoy_client import ConvoyCircuitOpenError
 from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
@@ -60,8 +62,14 @@ def _build_payload(
     endpoint_id: str,
     finality: FinalityStatus | None = None,
     identity: AgentIdentity | None = None,
+    required_depth: int | None = None,
 ) -> WebhookPayload:
-    """Build a WebhookPayload from transfer, finality, and identity data."""
+    """Build a WebhookPayload from transfer, finality, and identity data.
+
+    If *required_depth* is provided it overrides the chain-default
+    ``required_confirmations`` in the finality payload so that webhook
+    consumers see the threshold that was actually applied for this endpoint.
+    """
     idempotency_key = generate_idempotency_key(
         chain_id=transfer.chain_id.value,
         tx_hash=transfer.tx_hash,
@@ -69,15 +77,23 @@ def _build_payload(
         endpoint_id=endpoint_id,
         event_type=event_type.value,
     )
+    finality_data = build_finality_data(finality, required_depth=required_depth)
+    execution_state, safe_to_execute, trust_source = derive_execution_metadata(
+        event_type, finality_data
+    )
     return WebhookPayload(
         id=str(uuid.uuid4()),
         idempotency_key=idempotency_key,
         type=event_type,
         mode=mode,
         timestamp=int(time.time()),
+        version="v1",
+        execution_state=execution_state,
+        safe_to_execute=safe_to_execute,
+        trust_source=trust_source,
         data=WebhookData(
             transfer=build_transfer_data(transfer),
-            finality=build_finality_data(finality),
+            finality=finality_data,
             identity=identity,
         ),
     )
@@ -146,6 +162,23 @@ def match_subscriptions(
     return matched
 
 
+def resolve_endpoint_depth(
+    endpoint: Endpoint,
+    chain_id: "ChainId",
+) -> int | None:
+    """Return the effective finality depth for an endpoint.
+
+    Returns ``None`` (meaning "use chain default") when the endpoint has no
+    explicit ``finality_depth`` override.
+    """
+    from tripwire.types.models import FINALITY_DEPTHS, EndpointPolicies
+
+    policies = endpoint.policies or EndpointPolicies()
+    if policies.finality_depth is not None:
+        return policies.finality_depth
+    return None
+
+
 async def dispatch_event(
     transfer: ERC3009Transfer,
     matched_endpoints: list[Endpoint],
@@ -173,6 +206,7 @@ async def dispatch_event(
             )
             continue
 
+        ep_depth = resolve_endpoint_depth(endpoint, transfer.chain_id)
         payload = _build_payload(
             transfer=transfer,
             event_type=event_type,
@@ -180,6 +214,7 @@ async def dispatch_event(
             endpoint_id=endpoint.id,
             finality=finality,
             identity=identity,
+            required_depth=ep_depth,
         )
 
         # Embed the Convoy endpoint ID so that ConvoyProvider.send() can forward it
@@ -203,6 +238,14 @@ async def dispatch_event(
                 tx_hash=transfer.tx_hash,
                 event_type=event_type.value,
                 message_id=message_id,
+            )
+        except ConvoyCircuitOpenError:
+            logger.warning(
+                "convoy_circuit_open",
+                endpoint_id=endpoint.id,
+                convoy_project_id=project_id,
+                tx_hash=transfer.tx_hash,
+                event_type=event_type.value,
             )
         except Exception:
             logger.exception(

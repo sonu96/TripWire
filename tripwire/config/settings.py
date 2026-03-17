@@ -55,6 +55,10 @@ class Settings(BaseSettings):
     dlq_alert_webhook_url: str = ""
     dlq_enabled: bool = True
 
+    # Event bus
+    event_bus_enabled: bool = False  # Enable Redis Streams event bus for async event processing
+    event_bus_workers: int = 3  # Number of trigger worker processes for event bus
+
     # Finality poller
     finality_poller_enabled: bool = True
     finality_poll_interval_arbitrum: int = 5

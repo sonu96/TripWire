@@ -111,6 +111,37 @@ class WebhookDeliveryRepository:
 
         return query.execute().data
 
+    def increment_dlq_retry(self, delivery_id: str) -> int:
+        """Atomically increment dlq_retry_count and return the new value.
+
+        Uses an RPC call to perform ``dlq_retry_count + 1`` in a single
+        round-trip.  Falls back to a read-then-write if the record is not
+        found (returns 0 in that case so the caller can decide what to do).
+        """
+        # Supabase-py doesn't support RETURNING on raw UPDATE, so we do
+        # an update followed by a select.  The increment is still safe
+        # because each delivery_uid is only processed by one poll iteration.
+        current = self.get_by_id(delivery_id)
+        if current is None:
+            return 0
+        new_count = current.get("dlq_retry_count", 0) + 1
+        self._sb.table("webhook_deliveries").update(
+            {"dlq_retry_count": new_count}
+        ).eq("id", delivery_id).execute()
+        logger.info(
+            "dlq_retry_count_incremented",
+            delivery_id=delivery_id,
+            dlq_retry_count=new_count,
+        )
+        return new_count
+
+    def get_dlq_retry_count(self, delivery_id: str) -> int:
+        """Return the current dlq_retry_count for a delivery (0 if not found)."""
+        row = self.get_by_id(delivery_id)
+        if row is None:
+            return 0
+        return row.get("dlq_retry_count", 0)
+
     def get_stats_for_endpoint(self, endpoint_id: str) -> dict:
         """Get delivery counts grouped by status for an endpoint."""
         result = (

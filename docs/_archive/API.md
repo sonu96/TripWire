@@ -76,7 +76,17 @@ Authorization: Bearer <ethereum_address>
 
 The value is the agent's Ethereum address in hex (`0x` + 40 hex characters). The server normalizes it to lowercase.
 
-**MVP auth** -- the bearer token is the raw address. Full SIWE verification is planned for a future release.
+MCP authentication uses a **3-tier model**:
+
+| Tier | Mechanism | Tools |
+|---|---|---|
+| **PUBLIC** | No auth required | `initialize`, `tools/list` |
+| **SIWX** | Wallet signature via SIWE (free, identity-gated) | `list_triggers`, `list_templates`, `get_trigger_status`, `search_events`, `delete_trigger` |
+| **X402** | Per-call x402 micropayment required | `register_middleware`, `create_trigger`, `activate_template` |
+
+For **SIWX** tier tools, the `Authorization: Bearer <ethereum_address>` header identifies the caller. The server normalizes the address to lowercase.
+
+For **X402** tier tools, a valid x402 payment proof must accompany the request. The server verifies the ERC-3009 payment before executing the tool.
 
 **ERC-8004 Identity Resolution:** When a tool has a non-zero `min_reputation` threshold, the server resolves the agent's ERC-8004 identity on Base (chain 8453) and checks `reputation_score` against the threshold. If the agent is unregistered or below threshold, the call is rejected with error code `-32001`.
 
@@ -699,7 +709,7 @@ The cursor is the `id` of the last record in the returned page. The server uses 
 
 ## Rate Limiting
 
-Rate limits are enforced per-key using [slowapi](https://github.com/laurentS/slowapi). The key is derived from the `Authorization: Bearer` token when present, falling back to the client IP address.
+Rate limits are enforced per-caller using [slowapi](https://github.com/laurentS/slowapi). The rate limit key is derived from the authenticated wallet address (`X-TripWire-Address` header) when present, falling back to the client IP address.
 
 | Endpoint group | Limit |
 |---|---|
@@ -734,7 +744,7 @@ Supported EVM chains. Values are integer chain IDs.
 | Value | Description |
 |---|---|
 | `"notify"` | Delivers webhook notifications. Supports subscriptions with fine-grained filters. |
-| `"execute"` | Wires a Convoy application for guaranteed webhook delivery with retries. Returns a `webhook_secret` on creation. |
+| `"execute"` | Wires a Convoy application for guaranteed webhook delivery with retries. A `webhook_secret` is returned once at creation and never stored. |
 
 ### WebhookEventType
 
@@ -793,15 +803,16 @@ Policies gate which transfers are dispatched to an endpoint. All fields are opti
   "active": true,
   "convoy_project_id": "convoy-app-id",
   "convoy_endpoint_id": "convoy-endpoint-id",
-  "webhook_secret": "hex-secret-returned-only-on-creation",
   "created_at": "2024-01-01T00:00:00Z",
   "updated_at": "2024-01-01T00:00:00Z"
 }
 ```
 
-`webhook_secret` is only present in the `POST /api/v1/endpoints` response for `execute`-mode endpoints. It is not returned on any subsequent read. Store it securely immediately.
+**Important:** For `execute`-mode endpoints, a `webhook_secret` is returned **exactly once** in the `POST /api/v1/endpoints` creation response. The secret is **not persisted in the database** and is never returned on any subsequent read. Store it securely immediately upon creation.
 
 `registration_tx_hash` and `registration_chain_id` are populated only when an x402 payment was verified at registration time.
+
+**Event-endpoint mapping:** Events can match multiple endpoints via the `event_endpoints` join table. When an event matches more than one registered endpoint, it is dispatched to all of them independently.
 
 ### Subscription Object
 

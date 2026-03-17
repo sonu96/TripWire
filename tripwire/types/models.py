@@ -102,7 +102,7 @@ class EndpointPolicies(BaseModel):
     blocked_senders: list[EthAddress] | None = None
     required_agent_class: str | None = None
     min_reputation_score: float | None = Field(None, ge=0, le=100)
-    finality_depth: int = Field(default=3, ge=1, le=64)
+    finality_depth: int | None = Field(default=None, ge=1, le=64)
 
 
 class RegisterEndpointRequest(BaseModel):
@@ -145,12 +145,25 @@ class Endpoint(BaseModel):
 
 # ── Webhook Payload ────────────────────────────────────────────
 
+class ExecutionState(str, Enum):
+    PROVISIONAL = "provisional"
+    CONFIRMED = "confirmed"
+    FINALIZED = "finalized"
+    REORGED = "reorged"
+
+
+class TrustSource(str, Enum):
+    FACILITATOR = "facilitator"
+    ONCHAIN = "onchain"
+
+
 class WebhookEventType(str, Enum):
     PAYMENT_CONFIRMED = "payment.confirmed"
     PAYMENT_PENDING = "payment.pending"
     PAYMENT_PRE_CONFIRMED = "payment.pre_confirmed"
     PAYMENT_FAILED = "payment.failed"
     PAYMENT_REORGED = "payment.reorged"
+    PAYMENT_FINALIZED = "payment.finalized"
 
 
 class TransferData(BaseModel):
@@ -170,15 +183,53 @@ class FinalityData(BaseModel):
     is_finalized: bool
 
 
-def build_finality_data(finality: "FinalityStatus | None") -> "FinalityData | None":
-    """Build FinalityData from a FinalityStatus, if available."""
+def build_finality_data(
+    finality: "FinalityStatus | None",
+    required_depth: int | None = None,
+) -> "FinalityData | None":
+    """Build FinalityData from a FinalityStatus, if available.
+
+    If *required_depth* is provided it overrides the chain-default
+    ``required_confirmations`` stored on the FinalityStatus.  The
+    ``is_finalized`` flag is recomputed against the override so that
+    the webhook payload accurately reflects the endpoint's configured
+    finality threshold.
+    """
     if finality is None:
         return None
+    req = required_depth if required_depth is not None else finality.required_confirmations
     return FinalityData(
         confirmations=finality.confirmations,
-        required_confirmations=finality.required_confirmations,
-        is_finalized=finality.is_finalized,
+        required_confirmations=req,
+        is_finalized=finality.confirmations >= req,
     )
+
+
+def derive_execution_metadata(
+    event_type: WebhookEventType,
+    finality: FinalityData | None,
+) -> tuple[ExecutionState, bool, TrustSource]:
+    """Derive execution state, safe_to_execute flag, and trust source.
+
+    Mapping:
+    - PRE_CONFIRMED → provisional, false, facilitator
+    - REORGED/FAILED → reorged, false, onchain
+    - PAYMENT_FINALIZED or finality.is_finalized → finalized, true, onchain
+    - else → confirmed, false, onchain
+    """
+    if event_type == WebhookEventType.PAYMENT_PRE_CONFIRMED:
+        return ExecutionState.PROVISIONAL, False, TrustSource.FACILITATOR
+
+    if event_type in (WebhookEventType.PAYMENT_REORGED, WebhookEventType.PAYMENT_FAILED):
+        return ExecutionState.REORGED, False, TrustSource.ONCHAIN
+
+    if event_type == WebhookEventType.PAYMENT_FINALIZED:
+        return ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
+
+    if finality is not None and finality.is_finalized:
+        return ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
+
+    return ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN
 
 
 class WebhookData(BaseModel):
@@ -193,6 +244,10 @@ class WebhookPayload(BaseModel):
     type: WebhookEventType
     mode: EndpointMode
     timestamp: int
+    version: str = "v1"
+    execution_state: ExecutionState | None = None
+    safe_to_execute: bool = False
+    trust_source: TrustSource = TrustSource.ONCHAIN
     data: WebhookData
 
 
@@ -236,6 +291,7 @@ class Trigger(BaseModel):
     endpoint_id: str
     name: str | None = None
     event_signature: str
+    topic0: str | None = None  # precomputed keccak256 hash of event_signature
     abi: list[dict[str, Any]]
     contract_address: str | None = None
     chain_ids: list[int] = Field(default_factory=list)
@@ -257,6 +313,7 @@ class TriggerTemplate(BaseModel):
     description: str | None = None
     category: str = "general"
     event_signature: str
+    topic0: str | None = None  # precomputed keccak256 hash of event_signature
     abi: list[dict[str, Any]]
     default_chains: list[int] = Field(default_factory=list)
     default_filters: list[TriggerFilter] = Field(default_factory=list)

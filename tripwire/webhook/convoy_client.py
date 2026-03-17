@@ -15,12 +15,84 @@ import structlog
 
 from tripwire.config.settings import settings
 from tripwire.observability.metrics import (
+    tripwire_convoy_circuit_state,
     tripwire_webhook_delivery_duration_seconds,
     tripwire_webhooks_sent_total,
 )
 from tripwire.observability.tracing import tracer, StatusCode
 
 logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker — protects against Convoy being down
+# ---------------------------------------------------------------------------
+
+class ConvoyCircuitOpenError(Exception):
+    """Raised when the Convoy circuit breaker is open and requests are rejected fast."""
+
+
+# State machine: closed (normal) → open (failing) → half_open (probing)
+_circuit_state: str = "closed"
+_failure_count: int = 0
+_last_failure_time: float = 0.0
+_FAILURE_THRESHOLD: int = 5        # consecutive failures to trip the circuit
+_RECOVERY_TIMEOUT: float = 30.0    # seconds before allowing a probe request
+_HALF_OPEN_TIMEOUT: float = 10.0   # shorter timeout for probe requests
+
+
+def _check_circuit() -> bool:
+    """Return True if the circuit allows the request, False to reject fast."""
+    global _circuit_state
+
+    if _circuit_state == "closed":
+        return True
+
+    if _circuit_state == "open":
+        if time.monotonic() - _last_failure_time > _RECOVERY_TIMEOUT:
+            _circuit_state = "half_open"
+            tripwire_convoy_circuit_state.set(2)
+            logger.info("convoy_circuit_half_open", after_seconds=_RECOVERY_TIMEOUT)
+            return True  # allow one probe
+        return False  # reject fast
+
+    # half_open — allow the probe request through
+    return True
+
+
+def _record_success() -> None:
+    """Record a successful Convoy call; reset the circuit to closed."""
+    global _circuit_state, _failure_count
+    if _circuit_state != "closed":
+        logger.info("convoy_circuit_closed", previous_state=_circuit_state)
+    _circuit_state = "closed"
+    _failure_count = 0
+    tripwire_convoy_circuit_state.set(0)
+
+
+def _record_failure() -> None:
+    """Record a failed Convoy call; open the circuit after threshold breached."""
+    global _circuit_state, _failure_count, _last_failure_time
+    _failure_count += 1
+    _last_failure_time = time.monotonic()
+    if _failure_count >= _FAILURE_THRESHOLD:
+        _circuit_state = "open"
+        tripwire_convoy_circuit_state.set(1)
+        logger.warning("convoy_circuit_opened", failures=_failure_count)
+
+
+def _guard_circuit() -> None:
+    """Check the circuit breaker; raise ConvoyCircuitOpenError if open."""
+    if not _check_circuit():
+        raise ConvoyCircuitOpenError(
+            f"Convoy circuit breaker is open (failures={_failure_count}, "
+            f"recovery in {_RECOVERY_TIMEOUT - (time.monotonic() - _last_failure_time):.1f}s)"
+        )
+
+
+def get_circuit_state() -> str:
+    """Return the current circuit breaker state for diagnostics."""
+    return _circuit_state
 
 # ---------------------------------------------------------------------------
 # Module-level clients — lazy-initialized
@@ -84,6 +156,7 @@ async def create_application(developer_id: str, name: str) -> str:
 
     Returns the Convoy project ID (``data.uid``).
     """
+    _guard_circuit()
     client = _get_convoy_client()
     body: dict[str, Any] = {
         "name": name,
@@ -101,6 +174,7 @@ async def create_application(developer_id: str, name: str) -> str:
         response.raise_for_status()
         data = response.json()
         project_id: str = data["data"]["uid"]
+        _record_success()
         logger.info(
             "convoy_project_created",
             developer_id=developer_id,
@@ -108,6 +182,14 @@ async def create_application(developer_id: str, name: str) -> str:
             name=name,
         )
         return project_id
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        _record_failure()
+        logger.exception(
+            "convoy_project_create_failed",
+            developer_id=developer_id,
+            name=name,
+        )
+        raise
     except Exception:
         logger.exception(
             "convoy_project_create_failed",
@@ -134,6 +216,7 @@ async def create_endpoint(
 
     Returns the Convoy endpoint ID.
     """
+    _guard_circuit()
     client = _get_convoy_client()
     if not secret:
         raise ValueError("secret is required — never let Convoy auto-generate")
@@ -152,6 +235,7 @@ async def create_endpoint(
         response.raise_for_status()
         data = response.json()
         endpoint_id: str = data["data"]["uid"]
+        _record_success()
         logger.info(
             "convoy_endpoint_created",
             project_id=app_id,
@@ -159,6 +243,14 @@ async def create_endpoint(
             url=url,
         )
         return endpoint_id
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        _record_failure()
+        logger.exception(
+            "convoy_endpoint_create_failed",
+            project_id=app_id,
+            url=url,
+        )
+        raise
     except Exception:
         logger.exception(
             "convoy_endpoint_create_failed",
@@ -187,6 +279,7 @@ async def send_webhook(
 
     Returns the Convoy event ID.
     """
+    _guard_circuit()
     with tracer.start_as_current_span("convoy_send_webhook") as span:
         span.set_attribute("convoy.project_id", app_id)
         span.set_attribute("convoy.event_type", event_type)
@@ -194,6 +287,12 @@ async def send_webhook(
             span.set_attribute("convoy.endpoint_id", endpoint_id)
 
         client = _get_convoy_client()
+        # Use a shorter timeout when probing in half_open state
+        timeout_override = (
+            httpx.Timeout(_HALF_OPEN_TIMEOUT)
+            if _circuit_state == "half_open"
+            else None
+        )
         body: dict[str, Any] = {
             "event_type": event_type,
             "data": payload,
@@ -208,6 +307,7 @@ async def send_webhook(
             response = await client.post(
                 f"/api/v1/projects/{app_id}/events",
                 json=body,
+                **({"timeout": timeout_override} if timeout_override else {}),
             )
             response.raise_for_status()
             tripwire_webhook_delivery_duration_seconds.observe(
@@ -215,6 +315,7 @@ async def send_webhook(
             )
             data = response.json()
             event_id: str = data["data"]["uid"]
+            _record_success()
             tripwire_webhooks_sent_total.labels(status="success", mode="execute").inc()
             span.set_attribute("convoy.status", "success")
             logger.info(
@@ -224,6 +325,21 @@ async def send_webhook(
                 event_id=event_id,
             )
             return event_id
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            tripwire_webhook_delivery_duration_seconds.observe(
+                time.perf_counter() - send_start
+            )
+            _record_failure()
+            tripwire_webhooks_sent_total.labels(status="failed", mode="execute").inc()
+            span.record_exception(exc)
+            span.set_status(StatusCode.ERROR, str(exc))
+            span.set_attribute("convoy.status", "failed")
+            logger.exception(
+                "convoy_webhook_send_failed",
+                project_id=app_id,
+                event_type=event_type,
+            )
+            raise
         except Exception as exc:
             tripwire_webhook_delivery_duration_seconds.observe(
                 time.perf_counter() - send_start

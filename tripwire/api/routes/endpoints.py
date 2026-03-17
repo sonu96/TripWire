@@ -131,11 +131,11 @@ async def register_endpoint(
                 description=f"TripWire endpoint for {body.recipient}",
                 secret=webhook_secret,
             )
-            # Persist the provider IDs and webhook secret back to the endpoint row
+            # Persist the provider IDs back to the endpoint row
+            # webhook_secret is NOT stored in DB (Convoy is sole HMAC signer)
             sb.table("endpoints").update({
                 "convoy_project_id": convoy_project_id,
                 "convoy_endpoint_id": convoy_endpoint_id,
-                "webhook_secret": webhook_secret,
             }).eq("id", endpoint_id).execute()
             endpoint.convoy_project_id = convoy_project_id
             endpoint.convoy_endpoint_id = convoy_endpoint_id

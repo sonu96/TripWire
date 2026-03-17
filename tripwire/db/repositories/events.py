@@ -60,3 +60,76 @@ class EventRepository:
         )
         return result.data[0] if result.data else None
 
+    def promote_to_confirmed(
+        self,
+        event_id: str,
+        tx_hash: str,
+        block_number: int,
+        block_hash: str,
+        log_index: int,
+    ) -> dict | None:
+        """Promote a pre_confirmed event to confirmed with real onchain data.
+
+        Updates the event row with the real tx_hash, block_number, block_hash,
+        log_index, and transitions status from pre_confirmed to confirmed.
+        Returns the updated row or None if the event was not found.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        updates: dict[str, Any] = {
+            "tx_hash": tx_hash,
+            "block_number": block_number,
+            "block_hash": block_hash,
+            "log_index": log_index,
+            "status": "confirmed",
+            "confirmed_at": now,
+        }
+
+        result = (
+            self._sb.table("events")
+            .update(updates)
+            .eq("id", event_id)
+            .execute()
+        )
+        if result.data:
+            logger.info(
+                "event_promoted_to_confirmed",
+                event_id=event_id,
+                tx_hash=tx_hash,
+                block_number=block_number,
+            )
+            return result.data[0]
+        return None
+
+    # ── event_endpoints join table (#7) ───────────────────────────
+
+    def link_endpoints(self, event_id: str, endpoint_ids: list[str]) -> None:
+        """Link an event to multiple endpoints via the join table."""
+        if not endpoint_ids:
+            return
+        rows = [
+            {"event_id": event_id, "endpoint_id": eid}
+            for eid in endpoint_ids
+        ]
+        try:
+            self._sb.table("event_endpoints").upsert(
+                rows,
+                on_conflict="event_id,endpoint_id",
+                ignore_duplicates=True,
+            ).execute()
+        except Exception:
+            logger.exception(
+                "link_endpoints_failed",
+                event_id=event_id,
+                endpoint_ids=endpoint_ids,
+            )
+
+    def get_endpoint_ids(self, event_id: str) -> list[str]:
+        """Return all endpoint IDs linked to an event."""
+        result = (
+            self._sb.table("event_endpoints")
+            .select("endpoint_id")
+            .eq("event_id", event_id)
+            .execute()
+        )
+        return [row["endpoint_id"] for row in result.data]
+

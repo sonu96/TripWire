@@ -30,8 +30,9 @@ import structlog
 from tripwire.config.settings import Settings
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.events import EventRepository
+from tripwire.db.repositories.nonces import NonceRepository
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
-from tripwire.ingestion.finality import get_block_number
+from tripwire.ingestion.finality import get_block_number, get_block_hash
 from tripwire.types.models import (
     ERC3009Transfer,
     FINALITY_DEPTHS,
@@ -69,12 +70,14 @@ class FinalityPoller:
         delivery_repo: WebhookDeliveryRepository,
         webhook_provider: WebhookProvider,
         settings: Settings,
+        nonce_repo: NonceRepository | None = None,
     ) -> None:
         self._event_repo = event_repo
         self._endpoint_repo = endpoint_repo
         self._delivery_repo = delivery_repo
         self._webhook_provider = webhook_provider
         self._settings = settings
+        self._nonce_repo = nonce_repo
         self._tasks: list[asyncio.Task[None]] = []
 
     # ------------------------------------------------------------------
@@ -170,8 +173,33 @@ class FinalityPoller:
 
         required = FINALITY_DEPTHS[chain_id]
 
+        # Batch fetch canonical block hashes for reorg detection.
+        # Group events by block_number to avoid redundant RPC calls.
+        unique_blocks = {e["block_number"] for e in pending_events}
+        canonical_hashes: dict[int, str] = {}
+        for block_num in unique_blocks:
+            try:
+                h = await get_block_hash(chain_id, block_num)
+                if h:
+                    canonical_hashes[block_num] = h.lower()
+            except Exception:
+                logger.warning(
+                    "finality_poll_hash_fetch_failed",
+                    chain=chain_id.name,
+                    block_number=block_num,
+                )
+
         for event in pending_events:
             try:
+                # Reorg detection: compare stored block_hash vs canonical
+                stored_hash = (event.get("block_hash") or "").lower()
+                block_num = event["block_number"]
+                canonical = canonical_hashes.get(block_num)
+
+                if canonical and stored_hash and canonical != stored_hash:
+                    await self._handle_reorg(event)
+                    continue
+
                 await self._process_event(event, chain_id, current_block, required)
             except asyncio.CancelledError:
                 raise
@@ -193,35 +221,56 @@ class FinalityPoller:
         current_block: int,
         required: int,
     ) -> None:
-        """Check finality depth for a single pending event."""
+        """Check finality depth for a single event (pending or confirmed).
+
+        Handles two transitions in the unified lifecycle:
+          - pending  + finality reached → confirmed  + fire payment.confirmed
+          - confirmed + finality reached → finalized + fire payment.finalized
+        """
         event_id: str = event["id"]
         block_number: int = event["block_number"]
+        current_status: str = event.get("status", "pending")
 
         confirmations = max(0, current_block - block_number)
 
         # ── Finality promotion ───────────────────────────────────────
         if confirmations >= required:
-            logger.info(
-                "event_finalized",
-                event_id=event_id,
-                confirmations=confirmations,
-                required=required,
-            )
             # Update finality depth before status transition
             await asyncio.to_thread(
                 self._event_repo.update_finality, event_id, confirmations
             )
-            await self._transition_event(
-                event, "confirmed", WebhookEventType.PAYMENT_CONFIRMED
-            )
+
+            if current_status == "pending":
+                # pending → confirmed: first finality threshold crossed
+                logger.info(
+                    "event_confirmed",
+                    event_id=event_id,
+                    confirmations=confirmations,
+                    required=required,
+                )
+                await self._transition_event(
+                    event, "confirmed", WebhookEventType.PAYMENT_CONFIRMED
+                )
+            elif current_status == "confirmed":
+                # confirmed → finalized: promoted event now has full finality
+                logger.info(
+                    "event_finalized",
+                    event_id=event_id,
+                    confirmations=confirmations,
+                    required=required,
+                )
+                await self._transition_event(
+                    event, "finalized", WebhookEventType.PAYMENT_FINALIZED
+                )
         else:
             # Update depth even if not yet final (useful for dashboards)
             await asyncio.to_thread(
                 self._event_repo.update_finality, event_id, confirmations
             )
             logger.debug(
-                "event_still_pending",
+                "event_still_waiting",
                 event_id=event_id,
+                current_status=current_status,
                 confirmations=confirmations,
                 required=required,
             )
@@ -256,33 +305,48 @@ class FinalityPoller:
             )
             return
 
-        # 2. Dispatch webhook to matched endpoints
-        endpoint_id = event.get("endpoint_id")
-        if not endpoint_id:
-            logger.debug(
-                "finality_poll_no_endpoint",
-                event_id=event_id,
-                msg="No endpoint_id on event; skipping webhook dispatch",
-            )
-            return
-
+        # 2. Dispatch webhook to ALL matched endpoints via join table (#7)
         try:
-            endpoint = await asyncio.to_thread(
-                self._endpoint_repo.get_by_id, endpoint_id
+            endpoint_ids = await asyncio.to_thread(
+                self._event_repo.get_endpoint_ids, event_id
             )
         except Exception:
             logger.exception(
-                "finality_poll_endpoint_fetch_failed",
+                "finality_poll_endpoint_ids_fetch_failed",
                 event_id=event_id,
-                endpoint_id=endpoint_id,
+            )
+            # Fall back to legacy endpoint_id column
+            endpoint_ids = []
+            legacy_id = event.get("endpoint_id")
+            if legacy_id:
+                endpoint_ids = [legacy_id]
+
+        if not endpoint_ids:
+            logger.debug(
+                "finality_poll_no_endpoints",
+                event_id=event_id,
+                msg="No endpoints linked to event; skipping webhook dispatch",
             )
             return
 
-        if endpoint is None:
+        endpoints = []
+        for eid in endpoint_ids:
+            try:
+                ep = await asyncio.to_thread(self._endpoint_repo.get_by_id, eid)
+                if ep is not None:
+                    endpoints.append(ep)
+            except Exception:
+                logger.exception(
+                    "finality_poll_endpoint_fetch_failed",
+                    event_id=event_id,
+                    endpoint_id=eid,
+                )
+
+        if not endpoints:
             logger.warning(
-                "finality_poll_endpoint_not_found",
+                "finality_poll_no_active_endpoints",
                 event_id=event_id,
-                endpoint_id=endpoint_id,
+                endpoint_ids=endpoint_ids,
             )
             return
 
@@ -306,23 +370,24 @@ class FinalityPoller:
             required_confirmations=FINALITY_DEPTHS.get(
                 ChainId(event["chain_id"]), 12
             ),
-            is_finalized=(new_status == "confirmed"),
+            is_finalized=(new_status in ("confirmed", "finalized")),
         )
 
         try:
             message_ids = await dispatch_event(
                 transfer=transfer,
-                matched_endpoints=[endpoint],
+                matched_endpoints=endpoints,
                 provider=self._webhook_provider,
                 event_type=webhook_event_type,
                 finality=finality,
             )
 
-            # Record delivery
-            for msg_id in message_ids:
+            # Record delivery for each endpoint
+            for i, ep in enumerate(endpoints):
+                msg_id = message_ids[i] if i < len(message_ids) else None
                 try:
                     self._delivery_repo.create(
-                        endpoint_id=endpoint_id,
+                        endpoint_id=ep.id,
                         event_id=event_id,
                         provider_message_id=msg_id,
                         status="sent" if msg_id else "failed",
@@ -331,6 +396,7 @@ class FinalityPoller:
                     logger.exception(
                         "finality_poll_delivery_record_failed",
                         event_id=event_id,
+                        endpoint_id=ep.id,
                     )
 
             logger.info(
@@ -338,6 +404,7 @@ class FinalityPoller:
                 event_id=event_id,
                 event_type=webhook_event_type.value,
                 webhooks_sent=len(message_ids),
+                endpoints_count=len(endpoints),
             )
         except Exception:
             logger.exception(
@@ -345,6 +412,87 @@ class FinalityPoller:
                 event_id=event_id,
                 webhook_event_type=webhook_event_type.value,
             )
+
+    # ------------------------------------------------------------------
+    # Reorg handling (#2)
+    # ------------------------------------------------------------------
+
+    async def _handle_reorg(self, event: dict[str, Any]) -> None:
+        """Handle a detected reorg: mark event reorged, invalidate nonce, notify endpoints."""
+        event_id: str = event["id"]
+        logger.warning(
+            "reorg_detected",
+            event_id=event_id,
+            block_number=event.get("block_number"),
+            stored_hash=event.get("block_hash"),
+        )
+
+        # 1. Update event status to reorged
+        try:
+            await asyncio.to_thread(
+                self._event_repo.update_status, event_id, "reorged"
+            )
+        except Exception:
+            logger.exception("reorg_status_update_failed", event_id=event_id)
+            return
+
+        # 2. Invalidate the nonce so it can be reused
+        if self._nonce_repo is not None:
+            try:
+                await asyncio.to_thread(
+                    self._nonce_repo.invalidate_by_event_id, event_id
+                )
+            except Exception:
+                logger.exception("reorg_nonce_invalidation_failed", event_id=event_id)
+
+        # 3. Dispatch payment.reorged to all linked endpoints
+        try:
+            endpoint_ids = await asyncio.to_thread(
+                self._event_repo.get_endpoint_ids, event_id
+            )
+        except Exception:
+            logger.exception("reorg_endpoint_ids_fetch_failed", event_id=event_id)
+            endpoint_ids = []
+            legacy_id = event.get("endpoint_id")
+            if legacy_id:
+                endpoint_ids = [legacy_id]
+
+        if not endpoint_ids:
+            return
+
+        endpoints = []
+        for eid in endpoint_ids:
+            try:
+                ep = await asyncio.to_thread(self._endpoint_repo.get_by_id, eid)
+                if ep is not None:
+                    endpoints.append(ep)
+            except Exception:
+                logger.exception("reorg_endpoint_fetch_failed", endpoint_id=eid)
+
+        if not endpoints:
+            return
+
+        try:
+            transfer = self._reconstruct_transfer(event)
+        except Exception:
+            logger.exception("reorg_transfer_reconstruct_failed", event_id=event_id)
+            return
+
+        try:
+            message_ids = await dispatch_event(
+                transfer=transfer,
+                matched_endpoints=endpoints,
+                provider=self._webhook_provider,
+                event_type=WebhookEventType.PAYMENT_REORGED,
+            )
+            logger.info(
+                "reorg_webhook_dispatched",
+                event_id=event_id,
+                webhooks_sent=len(message_ids),
+                endpoints_count=len(endpoints),
+            )
+        except Exception:
+            logger.exception("reorg_dispatch_failed", event_id=event_id)
 
     # ------------------------------------------------------------------
     # Data access helpers
@@ -376,7 +524,12 @@ class FinalityPoller:
         )
 
     def _fetch_pending_events(self, chain_id: ChainId) -> list[dict[str, Any]]:
-        """Query the events table for pending events on *chain_id*.
+        """Query the events table for pending and confirmed events on *chain_id*.
+
+        Fetches events with status IN ('pending', 'confirmed') that have a
+        real block_number (> 0). This excludes pre_confirmed events (which
+        have block_number=0 since they have no onchain tx yet) and picks up
+        confirmed events that need finalization promotion.
 
         Uses the Supabase client through the EventRepository's underlying
         client to run a filtered query.
@@ -384,7 +537,8 @@ class FinalityPoller:
         result = (
             self._event_repo._sb.table("events")
             .select("*")
-            .eq("status", "pending")
+            .in_("status", ["pending", "confirmed"])
+            .gt("block_number", 0)
             .eq("chain_id", chain_id.value)
             .order("block_number", desc=False)
             .limit(100)

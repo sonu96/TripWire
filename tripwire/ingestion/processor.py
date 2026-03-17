@@ -39,6 +39,7 @@ from tripwire.ingestion.decoder import (
 from tripwire.ingestion.finality import check_finality
 from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.types.models import (
+    FINALITY_DEPTHS,
     Endpoint,
     EndpointMode,
     EndpointPolicies,
@@ -162,20 +163,27 @@ class EventProcessor:
             tx_hash=transfer.tx_hash, chain_id=chain_id.value
         )
 
+        # Generate event_id upfront so we can pass it to nonce recording
+        # for later correlation when Goldsky delivers the real onchain event.
+        event_id = str(uuid.uuid4())
+
         logger.info(
             "processing_pre_confirmed",
             event_type="payment.pre_confirmed",
+            event_id=event_id,
             authorizer=transfer.authorizer,
         )
 
-        # 1. Nonce deduplication
+        # 1. Nonce deduplication (with correlation support)
         t0 = time.perf_counter()
         try:
-            is_new = await asyncio.to_thread(
-                self._nonce_repo.record_nonce,
+            is_new, existing_event_id, existing_source = await asyncio.to_thread(
+                self._nonce_repo.record_nonce_or_correlate,
                 chain_id=chain_id.value,
                 nonce=transfer.nonce,
                 authorizer=transfer.authorizer,
+                event_id=event_id,
+                source="facilitator",
             )
         except Exception:
             logger.exception("nonce_dedup_failed", tx_hash=transfer.tx_hash)
@@ -199,6 +207,7 @@ class EventProcessor:
 
         # 3. Dispatch through generic pipeline with pre_confirmed event type
         #    finality=None signals no onchain confirmation yet.
+        #    Pass the pre-generated event_id so it correlates with the nonce record.
         return await self._dispatch_for_transfer(
             transfer=transfer,
             finality=None,
@@ -206,6 +215,7 @@ class EventProcessor:
             timings=timings,
             pipeline_start=pipeline_start,
             event_type_override=WebhookEventType.PAYMENT_PRE_CONFIRMED,
+            event_id=event_id,
         )
 
     # ── Event type detection ───────────────────────────────────────
@@ -285,7 +295,7 @@ class EventProcessor:
             authorizer=transfer.authorizer,
         )
 
-        # 2. Deduplication
+        # 2. Deduplication (with facilitator correlation)
         #    ERC-3009: use authorizer + nonce (unique per authorization)
         #    Plain Transfer: use tx_hash + log_index (no meaningful nonce)
         t0 = time.perf_counter()
@@ -293,11 +303,12 @@ class EventProcessor:
         dedup_nonce = transfer.nonce if not is_plain_transfer else f"{tx_hash}:{transfer.log_index}"
         dedup_authorizer = transfer.authorizer if not is_plain_transfer else "transfer"
         try:
-            is_new = await asyncio.to_thread(
-                self._nonce_repo.record_nonce,
+            is_new, existing_event_id, existing_source = await asyncio.to_thread(
+                self._nonce_repo.record_nonce_or_correlate,
                 chain_id=chain_id.value,
                 nonce=dedup_nonce,
                 authorizer=dedup_authorizer,
+                source="goldsky",
             )
         except Exception:
             logger.exception("nonce_dedup_failed", tx_hash=tx_hash)
@@ -305,6 +316,21 @@ class EventProcessor:
         timings["dedup_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         if not is_new:
+            # Check if this is a facilitator-claimed nonce that needs promotion
+            if existing_source == "facilitator" and existing_event_id:
+                logger.info(
+                    "promoting_pre_confirmed_event",
+                    tx_hash=tx_hash,
+                    existing_event_id=existing_event_id,
+                    nonce=dedup_nonce,
+                )
+                return await self._promote_pre_confirmed_event(
+                    existing_event_id=existing_event_id,
+                    transfer=transfer,
+                    timings=timings,
+                    pipeline_start=pipeline_start,
+                )
+            # True duplicate — same source or no correlation info
             logger.info("duplicate_nonce", tx_hash=tx_hash, nonce=dedup_nonce)
             return {"status": "duplicate", "tx_hash": tx_hash}
 
@@ -467,6 +493,10 @@ class EventProcessor:
                 "type": event_type_str,
                 "mode": endpoint.mode.value,
                 "timestamp": int(time.time()),
+                "version": "v1",
+                "execution_state": "confirmed",
+                "safe_to_execute": False,
+                "trust_source": "onchain",
                 "trigger_id": trigger_id,
                 "data": decoded,
             }
@@ -486,7 +516,7 @@ class EventProcessor:
                         tx_hash=tx_hash,
                     )
 
-            # 7. Record event
+            # 7. Record event and link endpoint via join table
             event_id = str(uuid.uuid4())
             now = datetime.now(timezone.utc).isoformat()
             row: dict[str, Any] = {
@@ -508,6 +538,8 @@ class EventProcessor:
                 row["identity_data"] = identity.model_dump()
             try:
                 self._event_repo.insert(row)
+                # Link endpoint via join table (#7)
+                self._event_repo.link_endpoints(event_id, [trigger.endpoint_id])
             except Exception:
                 logger.exception("dynamic_event_record_failed", event_id=event_id)
 
@@ -545,6 +577,221 @@ class EventProcessor:
             "results": results,
         }
 
+    # ── Facilitator → Goldsky promotion ─────────────────────────────
+
+    async def _promote_pre_confirmed_event(
+        self,
+        existing_event_id: str,
+        transfer,
+        timings: dict[str, float],
+        pipeline_start: float,
+    ) -> dict[str, Any]:
+        """Promote a pre_confirmed event to confirmed when Goldsky delivers the real tx.
+
+        Called when Goldsky delivers an onchain event whose nonce was already
+        claimed by the facilitator fast path.  Updates the event row with real
+        onchain data (tx_hash, block_number, block_hash, log_index), checks
+        finality, and dispatches the appropriate webhook (payment.confirmed or
+        payment.finalized).
+        """
+        tx_hash = transfer.tx_hash
+
+        # 1. Promote the event row with real onchain data
+        try:
+            updated = await asyncio.to_thread(
+                self._event_repo.promote_to_confirmed,
+                event_id=existing_event_id,
+                tx_hash=tx_hash,
+                block_number=transfer.block_number,
+                block_hash=transfer.block_hash,
+                log_index=transfer.log_index,
+            )
+        except Exception:
+            logger.exception(
+                "promote_to_confirmed_failed",
+                event_id=existing_event_id,
+                tx_hash=tx_hash,
+            )
+            return {"status": "error", "reason": "promote_failed", "tx_hash": tx_hash}
+
+        if not updated:
+            logger.warning(
+                "promote_event_not_found",
+                event_id=existing_event_id,
+                tx_hash=tx_hash,
+            )
+            return {"status": "error", "reason": "event_not_found", "tx_hash": tx_hash}
+
+        # 2. Check finality on the real block
+        t0 = time.perf_counter()
+        try:
+            finality = await check_finality(transfer)
+        except Exception:
+            logger.exception("finality_check_failed", tx_hash=tx_hash)
+            finality = None
+        timings["finality_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        # 3. Determine webhook type based on finality
+        if finality and finality.is_finalized:
+            webhook_event_type = WebhookEventType.PAYMENT_FINALIZED
+        else:
+            webhook_event_type = WebhookEventType.PAYMENT_CONFIRMED
+
+        # 4. Identity resolution
+        t0 = time.perf_counter()
+        try:
+            identity = await self._resolver.resolve(
+                transfer.authorizer, transfer.chain_id.value
+            )
+        except Exception:
+            logger.warning("identity_resolve_failed", authorizer=transfer.authorizer)
+            identity = None
+        timings["identity_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+        # 5. Fetch linked endpoints from join table
+        try:
+            endpoint_ids = await asyncio.to_thread(
+                self._event_repo.get_endpoint_ids, existing_event_id
+            )
+        except Exception:
+            logger.exception(
+                "promote_endpoint_ids_fetch_failed",
+                event_id=existing_event_id,
+            )
+            endpoint_ids = []
+            # Fall back to legacy endpoint_id column
+            legacy_id = updated.get("endpoint_id")
+            if legacy_id:
+                endpoint_ids = [legacy_id]
+
+        if not endpoint_ids:
+            logger.info(
+                "promote_no_endpoints",
+                event_id=existing_event_id,
+                tx_hash=tx_hash,
+            )
+            total_ms = round((time.perf_counter() - pipeline_start) * 1000, 2)
+            return {
+                "status": "promoted",
+                "tx_hash": tx_hash,
+                "event_id": existing_event_id,
+                "webhook_type": webhook_event_type.value,
+                "endpoints_matched": 0,
+                "total_ms": total_ms,
+            }
+
+        # 6. Fetch full endpoint objects
+        endpoints: list[Endpoint] = []
+        for eid in endpoint_ids:
+            try:
+                ep = await asyncio.to_thread(self._endpoint_repo.get_by_id, eid)
+                if ep is not None and ep.active:
+                    endpoints.append(ep)
+            except Exception:
+                logger.exception(
+                    "promote_endpoint_fetch_failed",
+                    endpoint_id=eid,
+                )
+
+        if not endpoints:
+            total_ms = round((time.perf_counter() - pipeline_start) * 1000, 2)
+            return {
+                "status": "promoted",
+                "tx_hash": tx_hash,
+                "event_id": existing_event_id,
+                "webhook_type": webhook_event_type.value,
+                "endpoints_matched": 0,
+                "total_ms": total_ms,
+            }
+
+        # 7. Policy evaluation
+        from tripwire.webhook.dispatcher import build_transfer_data as _build_td
+        transfer_data = _build_td(transfer)
+        approved_endpoints: list[Endpoint] = []
+        for ep in endpoints:
+            policies = ep.policies or EndpointPolicies()
+            allowed, reason = evaluate_policy(transfer_data, identity, policies)
+            if allowed:
+                approved_endpoints.append(ep)
+            else:
+                logger.info(
+                    "promote_policy_rejected",
+                    endpoint_id=ep.id,
+                    tx_hash=tx_hash,
+                    reason=reason,
+                )
+
+        # 8. Dispatch webhooks
+        t0 = time.perf_counter()
+        message_ids: list[str] = []
+        execute_endpoints = [
+            ep for ep in approved_endpoints if ep.mode == EndpointMode.EXECUTE
+        ]
+        if execute_endpoints:
+            try:
+                message_ids = await dispatch_event(
+                    transfer=transfer,
+                    matched_endpoints=execute_endpoints,
+                    provider=self._webhook_provider,
+                    event_type=webhook_event_type,
+                    finality=finality,
+                    identity=identity,
+                )
+            except Exception:
+                logger.exception("promote_dispatch_failed", tx_hash=tx_hash)
+
+            for i, ep in enumerate(execute_endpoints):
+                msg_id = message_ids[i] if i < len(message_ids) else None
+                self._record_delivery(
+                    endpoint_id=ep.id,
+                    event_id=existing_event_id,
+                    provider_message_id=msg_id,
+                )
+
+        # Notify-mode endpoints
+        notify_endpoints = [
+            ep for ep in approved_endpoints if ep.mode == EndpointMode.NOTIFY
+        ]
+        notify_event_ids: list[str] = []
+        if notify_endpoints:
+            try:
+                notify_event_ids = await self._realtime_notifier.notify_batch(
+                    endpoints=notify_endpoints,
+                    transfer=transfer,
+                    event_type=webhook_event_type,
+                    finality=finality,
+                    identity=identity,
+                )
+            except Exception:
+                logger.exception("promote_notify_failed", tx_hash=tx_hash)
+
+        timings["dispatch_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+        timings["total_ms"] = round((time.perf_counter() - pipeline_start) * 1000, 2)
+
+        logger.info(
+            "event_promoted",
+            tx_hash=tx_hash,
+            event_id=existing_event_id,
+            webhook_type=webhook_event_type.value,
+            endpoints_matched=len(endpoints),
+            endpoints_approved=len(approved_endpoints),
+            webhooks_sent=len(message_ids),
+            notify_sent=len(notify_event_ids),
+            **timings,
+        )
+
+        return {
+            "status": "promoted",
+            "tx_hash": tx_hash,
+            "event_id": existing_event_id,
+            "webhook_type": webhook_event_type.value,
+            "endpoints_matched": len(endpoints),
+            "endpoints_approved": len(approved_endpoints),
+            "webhooks_sent": len(message_ids),
+            "notify_sent": len(notify_event_ids),
+            "message_ids": message_ids,
+        }
+
     # ── Generic dispatch pipeline (shared across event types) ──────
 
     async def _dispatch_for_transfer(
@@ -555,6 +802,7 @@ class EventProcessor:
         timings: dict[str, float],
         pipeline_start: float,
         event_type_override: WebhookEventType | None = None,
+        event_id: str | None = None,
     ) -> dict[str, Any]:
         """Run the generic stages shared across all transfer-like events.
 
@@ -563,6 +811,10 @@ class EventProcessor:
 
         If *event_type_override* is provided it takes precedence over the
         finality-based type derivation (used by the facilitator fast path).
+
+        If *event_id* is provided, it is used for the event record instead
+        of generating a new UUID (used by the facilitator fast path to
+        correlate the nonce record with the event).
         """
         tx_hash = transfer.tx_hash
 
@@ -580,26 +832,26 @@ class EventProcessor:
             logger.info("no_matching_endpoints", tx_hash=tx_hash)
             # Still record the event even if no endpoints match
             webhook_event_type = event_type_override or (WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING)
-            event_id = self._record_event(
-                transfer, finality, identity, event_type=webhook_event_type
+            recorded_id = self._record_event(
+                transfer, finality, identity, event_type=webhook_event_type, event_id=event_id
             )
             return {
                 "status": "no_endpoints",
                 "tx_hash": tx_hash,
-                "event_id": event_id,
+                "event_id": recorded_id,
             }
 
         matched = match_endpoints(transfer, endpoints)
         if not matched:
             logger.info("no_endpoints_matched_filters", tx_hash=tx_hash)
             webhook_event_type = event_type_override or (WebhookEventType.PAYMENT_CONFIRMED if (finality and finality.is_finalized) else WebhookEventType.PAYMENT_PENDING)
-            event_id = self._record_event(
-                transfer, finality, identity, event_type=webhook_event_type
+            recorded_id = self._record_event(
+                transfer, finality, identity, event_type=webhook_event_type, event_id=event_id
             )
             return {
                 "status": "no_match",
                 "tx_hash": tx_hash,
-                "event_id": event_id,
+                "event_id": recorded_id,
             }
 
         # 6. Policy evaluation — filter out endpoints that fail policy
@@ -624,6 +876,29 @@ class EventProcessor:
             policy_span.set_attribute("policy.approved", len(approved_endpoints))
         timings["policy_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
+        # 6b. Finality depth gate — defer endpoints whose configured
+        #     finality_depth exceeds the current confirmation count.
+        if finality is not None:
+            ready_endpoints: list[Endpoint] = []
+            for ep in approved_endpoints:
+                policies = ep.policies or EndpointPolicies()
+                ep_depth = policies.finality_depth
+                if ep_depth is not None:
+                    required = ep_depth
+                else:
+                    required = FINALITY_DEPTHS.get(transfer.chain_id, 3)
+                if finality.confirmations < required:
+                    logger.info(
+                        "endpoint_finality_deferred",
+                        endpoint_id=ep.id,
+                        tx_hash=tx_hash,
+                        confirmations=finality.confirmations,
+                        required=required,
+                    )
+                    continue
+                ready_endpoints.append(ep)
+            approved_endpoints = ready_endpoints
+
         # Determine event type based on finality (or use override)
         if event_type_override:
             webhook_event_type = event_type_override
@@ -634,9 +909,17 @@ class EventProcessor:
                 logger.warning("finality_unknown_defaulting_to_pending", tx_hash=tx_hash)
             webhook_event_type = WebhookEventType.PAYMENT_PENDING
 
-        # 7. Record the event (link to the first matched endpoint)
+        # 7. Record the event and link ALL matched endpoints via join table
         first_endpoint_id = matched[0].id if matched else None
-        event_id = self._record_event(transfer, finality, identity, webhook_event_type, endpoint_id=first_endpoint_id)
+        event_id = self._record_event(transfer, finality, identity, webhook_event_type, endpoint_id=first_endpoint_id, event_id=event_id)
+
+        # Link all matched endpoints via the event_endpoints join table (#7)
+        all_endpoint_ids = [ep.id for ep in matched]
+        if all_endpoint_ids:
+            try:
+                self._event_repo.link_endpoints(event_id, all_endpoint_ids)
+            except Exception:
+                logger.exception("link_endpoints_failed", event_id=event_id)
 
         # 8. Split approved endpoints by delivery mode
         execute_endpoints = [
@@ -801,9 +1084,15 @@ class EventProcessor:
             logger.exception("fetch_subscriptions_failed", endpoint_id=endpoint_id)
             return []
 
-    def _record_event(self, transfer, finality, identity, event_type, endpoint_id: str | None = None) -> str:
-        """Insert an event row into the events table via EventRepository."""
-        event_id = str(uuid.uuid4())
+    def _record_event(self, transfer, finality, identity, event_type, endpoint_id: str | None = None, event_id: str | None = None) -> str:
+        """Insert an event row into the events table via EventRepository.
+
+        If *event_id* is provided, it is used instead of generating a new UUID.
+        This is used by the facilitator fast path to ensure the event ID
+        matches the one stored in the nonces table for later correlation.
+        """
+        if event_id is None:
+            event_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
 
         # JSONB data column (used by the events API routes)
@@ -842,7 +1131,7 @@ class EventProcessor:
             "authorizer": transfer.authorizer,
             "nonce": transfer.nonce,
             "token": transfer.token,
-            "status": "confirmed" if (finality and finality.is_finalized) else "pending",
+            "status": "pre_confirmed" if event_type == WebhookEventType.PAYMENT_PRE_CONFIRMED else ("confirmed" if (finality and finality.is_finalized) else "pending"),
             "finality_depth": finality.confirmations if finality else 0,
         }
 

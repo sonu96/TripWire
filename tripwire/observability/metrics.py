@@ -41,6 +41,11 @@ tripwire_nonce_dedup_total = Counter(
     ["result"],
 )
 
+tripwire_redis_dlq_total = Counter(
+    "tripwire_redis_dlq_total",
+    "Total events consumed from the Redis Streams dead-letter queue",
+)
+
 # ── Histograms ────────────────────────────────────────────────
 
 tripwire_pipeline_duration_seconds = Histogram(
@@ -68,6 +73,11 @@ tripwire_webhook_delivery_duration_seconds = Histogram(
 tripwire_dlq_backlog = Gauge(
     "tripwire_dlq_backlog",
     "Number of failed deliveries in the dead-letter queue",
+)
+
+tripwire_convoy_circuit_state = Gauge(
+    "tripwire_convoy_circuit_state",
+    "Convoy circuit breaker state (0=closed, 1=open, 2=half_open)",
 )
 
 # ── Info ──────────────────────────────────────────────────────

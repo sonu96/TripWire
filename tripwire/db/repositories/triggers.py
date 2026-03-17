@@ -57,9 +57,14 @@ class TriggerRepository:
         return _active_triggers_cache
 
     def find_by_topic(self, topic: str) -> list[Trigger]:
-        """Return active triggers matching a topic/event_signature (cached, TTL 30s)."""
+        """Return active triggers matching a topic0 hash (cached, TTL 30s).
+
+        Queries the precomputed ``topic0`` column (keccak256 hash) instead of
+        the human-readable ``event_signature``.
+        """
+        topic_lower = topic.lower()
         now = time.monotonic()
-        cached = _topic_cache.get(topic)
+        cached = _topic_cache.get(topic_lower)
         if cached is not None:
             ts, triggers = cached
             if now - ts < _TOPIC_CACHE_TTL:
@@ -67,16 +72,24 @@ class TriggerRepository:
         result = (
             self._sb.table("triggers")
             .select("*")
-            .eq("event_signature", topic)
+            .eq("topic0", topic_lower)
             .eq("active", True)
             .execute()
         )
         triggers = [Trigger(**row) for row in result.data]
-        _topic_cache[topic] = (now, triggers)
+        _topic_cache[topic_lower] = (now, triggers)
         return triggers
 
     def create(self, data: dict[str, Any]) -> Trigger:
-        """Insert a new trigger and invalidate caches."""
+        """Insert a new trigger and invalidate caches.
+
+        Automatically computes and stores the ``topic0`` keccak256 hash from
+        the ``event_signature`` if not already present.
+        """
+        if "topic0" not in data and "event_signature" in data:
+            from tripwire.utils.topic import compute_topic0
+
+            data["topic0"] = compute_topic0(data["event_signature"])
         result = self._sb.table("triggers").insert(data).execute()
         invalidate_trigger_cache()
         return Trigger(**result.data[0])

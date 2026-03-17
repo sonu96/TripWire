@@ -41,6 +41,7 @@ from tripwire.observability.audit import AuditLogger
 from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.db.repositories.events import EventRepository
 from tripwire.db.repositories.nonces import NonceRepository
+from tripwire.db.repositories.triggers import TriggerRepository
 from tripwire.db.repositories.webhooks import WebhookDeliveryRepository
 from tripwire.identity.resolver import create_resolver
 from tripwire.ingestion.finality_poller import FinalityPoller
@@ -137,6 +138,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     endpoint_repo = EndpointRepository(supabase)
     event_repo = EventRepository(supabase)
     delivery_repo = WebhookDeliveryRepository(supabase)
+    trigger_repo = TriggerRepository(supabase)
 
     # Event processor — the end-to-end pipeline orchestrator
     processor = EventProcessor(
@@ -148,9 +150,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         realtime_notifier=realtime_notifier,
         webhook_provider=webhook_provider,
         supabase_client=supabase,
+        trigger_repo=trigger_repo,
     )
     app.state.processor = processor
     logger.info("event_processor_ready")
+
+    # ── Event Bus: Trigger Worker Pool ────────────────────────
+    redis_dlq_consumer = None
+    if settings.event_bus_enabled:
+        from tripwire.ingestion.event_bus import init_stream_keys
+        from tripwire.ingestion.trigger_worker import WorkerPool
+        from tripwire.ingestion.dlq_consumer import RedisDLQConsumer
+
+        # Populate known stream keys from Redis so MAX_STREAMS cap is accurate
+        try:
+            await init_stream_keys()
+        except Exception:
+            logger.exception("event_bus_init_stream_keys_failed")
+
+        worker_pool = WorkerPool(
+            num_workers=settings.event_bus_workers,
+            processor=app.state.processor,
+            trigger_repo=trigger_repo,
+        )
+        try:
+            await worker_pool.start()
+            app.state.worker_pool = worker_pool
+            logger.info("event_bus_workers_started", num_workers=settings.event_bus_workers)
+        except Exception:
+            logger.exception("event_bus_start_failed", msg="App will continue without event bus workers")
+
+        # Redis Streams DLQ consumer (reads permanently-failed events from tripwire:dlq)
+        try:
+            redis_dlq_consumer = RedisDLQConsumer(settings=settings)
+            await redis_dlq_consumer.start()
+            app.state.redis_dlq_consumer = redis_dlq_consumer
+            logger.info("redis_dlq_consumer_ready")
+        except Exception:
+            logger.exception("redis_dlq_consumer_start_failed")
 
     # Dead Letter Queue handler (background poller for failed Convoy deliveries)
     dlq_handler: DLQHandler | None = None
@@ -179,12 +216,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             delivery_repo=delivery_repo,
             webhook_provider=webhook_provider,
             settings=settings,
+            nonce_repo=nonce_repo,
         )
         await finality_poller.start()
         app.state.finality_poller = finality_poller
         logger.info("finality_poller_ready")
     else:
         logger.info("finality_poller_skipped", enabled=False)
+
+    # Nonce archiver (daily background task to move old nonces to archive)
+    from tripwire.db.archival import NonceArchiver
+
+    nonce_archiver: NonceArchiver | None = None
+    try:
+        nonce_archiver = NonceArchiver(supabase)
+        await nonce_archiver.start()
+        app.state.nonce_archiver = nonce_archiver
+        logger.info("nonce_archiver_ready")
+    except Exception:
+        logger.exception("nonce_archiver_start_failed")
 
     # Set Prometheus build info
     tripwire_build_info.info({"version": __version__, "env": settings.app_env})
@@ -197,9 +247,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
     # -- Shutdown ------------------------------------------------
+    # Stop Redis DLQ consumer before worker pool
+    if redis_dlq_consumer is not None:
+        await redis_dlq_consumer.stop()
+        logger.info("redis_dlq_consumer_stopped")
+
+    # Stop worker pool
+    if hasattr(app.state, "worker_pool"):
+        await app.state.worker_pool.stop()
+        logger.info("event_bus_workers_stopped")
+
     # Stop finality poller if running
     if finality_poller is not None:
         await finality_poller.stop()
+
+    # Stop nonce archiver if running
+    if nonce_archiver is not None:
+        await nonce_archiver.stop()
 
     # Stop DLQ handler if running
     if dlq_handler is not None:
@@ -472,6 +536,13 @@ def create_app() -> FastAPI:
                 "last_error": task_health.last_error,
             }
         components["background_tasks"] = bg_components
+
+        # Worker pool stats (event bus trigger workers)
+        if hasattr(request.app.state, "worker_pool"):
+            wp_stats = request.app.state.worker_pool.stats
+            all_running = all(w["running"] for w in wp_stats.get("workers", []))
+            wp_stats["status"] = "healthy" if all_running else "unhealthy"
+            components["worker_pool"] = wp_stats
 
         # Determine overall status
         statuses: list[str] = []

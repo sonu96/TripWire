@@ -45,8 +45,6 @@ class DLQHandler:
         self._delivery_repo = delivery_repo
         self._settings = settings
         self._task: asyncio.Task[None] | None = None
-        # Track per-delivery retry counts (convoy_delivery_uid -> count)
-        self._retry_counts: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -157,7 +155,12 @@ class DLQHandler:
             if not delivery_uid:
                 continue
 
-            current_count = self._retry_counts.get(delivery_uid, 0)
+            # Look up the local delivery record to use DB-persisted retry count
+            local_delivery = self._delivery_repo.get_by_provider_message_id(delivery_uid)
+            if local_delivery:
+                current_count = local_delivery.get("dlq_retry_count", 0)
+            else:
+                current_count = 0
 
             if current_count >= max_retries:
                 # Dead-lettered — mark and alert
@@ -166,11 +169,16 @@ class DLQHandler:
                     delivery_uid=delivery_uid,
                     event_id=event_id,
                 )
-                # Remove from tracking to avoid re-processing
-                self._retry_counts.pop(delivery_uid, None)
             else:
                 retryable_ids.append(delivery_uid)
-                self._retry_counts[delivery_uid] = current_count + 1
+                # Persist the incremented retry count in the database
+                if local_delivery:
+                    self._delivery_repo.increment_dlq_retry(local_delivery["id"])
+                else:
+                    logger.warning(
+                        "dlq_no_local_delivery_for_retry_count",
+                        delivery_uid=delivery_uid,
+                    )
 
         # Batch retry the retryable deliveries
         if retryable_ids:

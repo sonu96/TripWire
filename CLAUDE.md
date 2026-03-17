@@ -18,14 +18,14 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 
 ## Architecture Layers
 - L0 Chain: Base / Ethereum / Arbitrum (ERC-3009 transfers)
-- L1 Indexing: Goldsky Turbo → delivers events via webhook to TripWire's /ingest endpoint
+- L1 Indexing: Goldsky Turbo → delivers events via webhook to TripWire's /ingest endpoint; optionally routes through Redis Streams event bus for horizontal scaling
 - L2 Middleware: TripWire FastAPI (verification, deduplication, identity, policy engine)
 - L3 Delivery: Convoy + direct POST (webhook delivery with retries, HMAC signing, DLQ)
 - L4 Application: Developer's API (executes business logic on verified webhook)
 - L5 MCP: Agent interface (MCP tools for trigger management, middleware registration)
 
 ## Key Directories
-- `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking
+- `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking, event_bus.py (Redis Streams pub/sub), trigger_worker.py (TriggerIndex, TriggerWorker, WorkerPool)
 - `tripwire/api/` — FastAPI routes, endpoint registration, subscription management
 - `tripwire/webhook/` — Convoy integration, webhook dispatch
 - `tripwire/identity/` — ERC-8004 identity resolution (mock for MVP), reputation scoring
@@ -50,6 +50,25 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - Direct httpx path: used when latency is critical and at-least-once delivery can be handled by the caller
 - TripWire wraps both paths to add: policy evaluation, identity enrichment, event deduplication
 - docker-compose services: `convoy-server` (port 5005), `convoy-worker`, `convoy-postgres` (port 5433), `convoy-redis` (port 6380)
+
+## Event Bus (Redis Streams)
+- Optional partitioned event bus for horizontal scaling of event processing. Feature-flagged via `EVENT_BUS_ENABLED` (default: false).
+- Config: `EVENT_BUS_ENABLED` (bool, default false), `EVENT_BUS_WORKERS` (int, default 3)
+- Data flow: Goldsky → /ingest endpoint → `publish_batch()` → Redis Streams (partitioned by topic0) → TriggerWorkers → `EventProcessor.process_event()` → Convoy/webhook delivery
+- Key components (`tripwire/ingestion/`):
+  - `event_bus.py` — Redis Streams publish/consume/ack/claim primitives. Streams keyed by `tripwire:events:{topic0}`. Consumer group: `trigger-workers`. Max stream length: 100k. XAUTOCLAIM for stale messages idle >30s. `_known_groups` in-memory set caches which streams already have their consumer group created, avoiding redundant Redis calls. NOGROUP recovery: on NOGROUP error during consume or claim, invalidates `_known_groups` cache for the affected stream and re-creates the consumer group before retrying. topic0 validation: strict regex `^0x[0-9a-f]{64}$` (lowercase hex only); invalid topics route to `tripwire:events:unknown`. `_known_stream_keys` in-memory set tracks all distinct streams seen; used by `_check_stream_cap()` to enforce `MAX_STREAMS` at publish time (both `publish_event` and `publish_batch`).
+  - `trigger_worker.py` — `TriggerIndex` (in-memory O(1) lookup by topic0, refreshes from DB every 10s with lock-guarded double-check), `TriggerWorker` (XREADGROUP consumer loop with periodic stale-message claiming, batched ACK via Redis pipeline), `WorkerPool` (round-robin stream partitioning, 30s stream discovery loop for new event types, graceful shutdown with 30s timeout, `_on_worker_done` callback auto-restarts crashed workers unless pool is shutting down)
+- Safety mechanisms:
+  - **DLQ stream**: `tripwire:dlq` — permanently failed events (after `_MAX_RETRIES` = 5 attempts) are written here with source stream, message ID, raw log, error count, and timestamp before being ACKed from the source stream
+  - **Retry cap**: per-message failure count tracked in `_failure_counts` dict keyed by `(stream_key, message_id) → (count, timestamp)`; after 5 failures the message is sent to DLQ and ACKed. Stale entries are cleaned every 100 iterations (entries older than 300s are pruned to prevent memory leaks).
+  - **Stream cap**: `MAX_STREAMS = 500` enforced at BOTH publish time (`_check_stream_cap` in event_bus.py using `_known_stream_keys` set) AND discovery time (WorkerPool.start and _discover_streams_loop). Excess streams at publish time are routed to `tripwire:events:unknown`.
+  - **Per-worker stream cap**: `_MAX_STREAMS_PER_WORKER = 100` prevents a single worker from being overloaded
+  - **Batch size limit**: /ingest endpoint rejects payloads with >1000 logs (HTTP 400)
+  - **Exponential backoff**: on consecutive consume errors, workers sleep `min(2^n, 60)` seconds before retrying
+  - **Batched ACK**: successful and max-retried messages are ACKed together in a single Redis pipeline call
+- Consumer groups provide at-least-once delivery: messages are ACKed only after successful processing; unacked messages are reclaimed by other workers via XAUTOCLAIM
+- When `EVENT_BUS_ENABLED=false` (default), the /ingest endpoint processes events synchronously through EventProcessor — no Redis dependency required
+- **Graceful startup degradation**: if the event bus worker pool fails to start during app lifespan, the error is logged but the application continues running without event bus workers (the app does not crash)
 
 ## Database (Supabase)
 - Tables: endpoints, subscriptions, events, nonces, webhook_deliveries, audit_log

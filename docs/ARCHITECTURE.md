@@ -1,900 +1,1489 @@
 # TripWire Architecture
 
+Programmable onchain event triggers for AI agents.
+
+Built on Goldsky. Verified by TripWire. Delivered via Convoy.
+
+TripWire is the infrastructure layer between onchain events and application
+execution. It watches EVM chains for specific log events, decodes them,
+evaluates policies, resolves agent identity, and delivers structured webhooks
+or real-time notifications. x402 payment webhooks are the primary use case,
+but the trigger registry supports arbitrary EVM events.
+
+Last updated: 2026-03-17
+
+---
+
 ## 1. System Overview
 
-TripWire is a programmable onchain event trigger platform for AI agents -- the infrastructure layer between onchain events and application execution. While x402 payment webhooks are the founding use case ("Stripe Webhooks for x402"), the system now supports **any EVM event** through its dynamic trigger registry and MCP (Model Context Protocol) server.
+TripWire is organized into six architecture layers spanning two planes:
 
-TripWire is built for **AI agent developers** who need reliable, low-latency onchain event detection without running their own indexing infrastructure. An agent connects via MCP, registers triggers for the events it cares about (payments, swaps, mints, governance actions, or any custom event), and receives webhook callbacks whenever a matching event lands onchain.
+```
+─── CONTROL PLANE (MCP + API) ────────────────────────────────────────────
+L5  MCP            AI agent interface (8 tools, 3-tier auth, x402 Bazaar)
+L4  Application    Developer's API (receives structured webhook, executes logic)
+L3  Delivery       Convoy (execute mode) + Supabase Realtime (notify mode)
+L2  Middleware      TripWire FastAPI (decode, dedup, finality, identity, policy)
 
-Key design goals:
+─── DATA PLANE (event ingestion) ─────────────────────────────────────────
+L1  Indexing       Goldsky Turbo (SQL transform + webhook sink -> /ingest)
+L0  Chain          Base / Ethereum / Arbitrum (ERC-3009 + arbitrary EVM events)
+```
 
-- **Any-event triggers** via a dynamic trigger registry with ABI-driven decoding
-- **MCP-native** -- agents interact through 8 MCP tools, no REST API integration needed
-- **Multi-path ingestion** with different latency/reliability tradeoffs
-- **Sub-second detection** via the x402 facilitator fast path
-- **Finality awareness** with per-chain confirmation depths and reorg detection
-- **ERC-8004 agent identity** enrichment, reputation gating, and policy-based filtering
-- **Wallet-native authentication** using SIWE (EIP-4361) with no API keys
-- **Reliable delivery** through Convoy with exponential retry and dead-letter queues
-- **Bazaar marketplace** for discovering and activating pre-built trigger templates
+**Goldsky serves two distinct architectural roles:**
 
-The stack is Python (FastAPI + uvicorn), Supabase (PostgreSQL + Realtime), Redis (nonce replay prevention), Convoy (webhook delivery), MCP JSON-RPC server, and direct JSON-RPC calls for finality and identity resolution.
+| Role            | Product        | Function                                    |
+|-----------------|----------------|---------------------------------------------|
+| Event streaming | Goldsky Turbo  | Indexes raw EVM logs, runs SQL transforms, delivers decoded events via webhook to `/ingest/goldsky` |
+| RPC queries     | Goldsky Edge   | Managed JSON-RPC endpoints for finality polling (`eth_blockNumber`, `eth_getBlockByNumber`) and identity resolution (`eth_call` to ERC-8004) |
+
+Turbo is the data plane -- it pushes events to TripWire. Edge is the query
+plane -- TripWire pulls block data from it. Both are Goldsky products but
+serve different architectural roles and use different authentication.
+
+**Runtime stack:**
+
+| Component            | Technology                                         |
+|----------------------|----------------------------------------------------|
+| Language             | Python 3.11+                                       |
+| API framework        | FastAPI + Uvicorn                                  |
+| Database             | Supabase (managed PostgreSQL)                      |
+| Webhook delivery     | Convoy self-hosted (retries, HMAC, DLQ)            |
+| Notify delivery      | Supabase Realtime (WebSocket push on DB insert)    |
+| Event streaming (data plane) | Goldsky Turbo (SQL transform + webhook sink) |
+| RPC queries (query plane)   | Goldsky Edge (managed JSON-RPC endpoints)    |
+| ABI decoding         | eth-abi                                             |
+| Event bus (optional) | Redis Streams                                      |
+| Validation           | Pydantic v2                                         |
+| Logging              | structlog (structured JSON)                        |
+| Metrics              | Prometheus (prometheus_client)                     |
+| Tracing              | OpenTelemetry (optional)                           |
+| Error tracking       | Sentry (optional)                                  |
+| Auth                 | SIWE wallet signatures (no API keys)               |
+| Payment gating       | x402 protocol (ERC-3009 micropayments)             |
 
 ---
 
-## 2. Ingestion Paths
-
-TripWire supports three ingestion paths, each optimized for a different point on the latency-reliability spectrum.
-
-### 2a. Goldsky Turbo (Primary Path)
+## 2. Master Architecture Diagram
 
 ```
-Chain -> Goldsky Indexer -> Webhook -> POST /api/v1/ingest -> TripWire Pipeline
+═══ DATA PLANE (Goldsky Turbo → TripWire) ════════════════════════════════
+
+  L0: Blockchain (Base / Ethereum / Arbitrum)
+           |  raw EVM logs
+           v
+  L1: Goldsky Turbo (per-chain pipelines: tripwire-{chain}-erc3009)
+      |
+      +-- Source: {chain}.raw_logs dataset
+      +-- SQL Transform: _gs_log_decode()
+      |     INNER JOIN AuthorizationUsed + Transfer on same tx + contract
+      |     Filter: USDC contract address + topic0
+      |     Output: pre-decoded, pre-joined rows (authorizer, nonce,
+      |             from, to, value, block metadata)
+      +-- Sink: webhook POST to /api/v1/ingest/goldsky
+            Auth: Bearer GOLDSKY_WEBHOOK_SECRET
+            Mode: one_row_per_request
+           |
+           |  decoded events (~1-4s from block)
+           v
+═══ CONTROL PLANE (TripWire Engine) ══════════════════════════════════════
+
+                              AI Agents
+                                 |
+                        +--------+--------+
+                        |   MCP Server    |  POST /mcp (JSON-RPC 2.0)
+                        |  8 tools        |  3-tier auth: PUBLIC / SIWX / X402
+                        +--------+--------+
+                                 |
+   +-----------------------------+-----------------------------+
+   |                     FastAPI Application                   |
+   |                                                           |
+   |  +----------+  +----------+  +----------+  +-----------+ |
+   |  | /ingest  |  | /api/v1  |  | /health  |  | /metrics  | |
+   |  | goldsky  |  | endpoints|  | /ready   |  | prometheus| |
+   |  | event    |  | triggers |  | detailed |  |           | |
+   |  +----+-----+  | events   |  +----------+  +-----------+ |
+   |       |        | subs     |                               |
+   |       |        +----------+                               |
+   +-------+-----------------------------------------------+--+
+           |                                                |
+           v                                                |
+   +-------+--------+                                      |
+   | EVENT_BUS_     |  (feature-flagged, default OFF)      |
+   | ENABLED?       |                                      |
+   +---+--------+---+                                      |
+       |        |                                          |
+      YES       NO                                         |
+       |        |                                          |
+       v        |                                          |
+   +---+----+   |                                          |
+   | Redis  |   |                                          |
+   | Streams|   |    +-----------------------------------+ |
+   | topic0 |   |    |       EventProcessor              | |
+   | keyed  |   +--->|                                   | |
+   +---+----+        |  detect -> decode -> dedup        | |
+       |             |  -> finality + identity (parallel) | |
+       v             |  -> endpoint match -> policy      | |
+   +---+--------+    |  -> dispatch                      | |
+   | WorkerPool |    +-------+--------+---------+--------+ |
+   | N workers  |--->|       |        |         |          |
+   +------------+    |       v        v         v          |
+                     | +-----+--+ +---+----+ +--+-------+  |
+                     | | Convoy | | Realtime| | Events  |  |
+                     | | Provider| | Notifier| | Table   |  |
+                     | +-----+--+ +---+----+ +--+-------+  |
+                     +-------+--------+---------+--------+--+
+                             |        |         |
+                             v        v         v
+                        +---------+ +--------+ +---------+
+                        | Convoy  | |Supabase| |Supabase |
+                        | Server  | |Realtime| |Postgres |
+                        +---------+ +--------+ +---------+
+                             |
+                             v
+                      Developer's API
+                      (L4 Application)
+
+═══ QUERY PLANE (Goldsky Edge RPC) ═══════════════════════════════════════
+
+  Goldsky Edge (managed JSON-RPC, authenticated via GOLDSKY_EDGE_API_KEY)
+      |
+      +-- Finality Poller: eth_blockNumber + eth_getBlockByNumber
+      |     Per-chain poll loops for confirmation depth + reorg detection
+      +-- Identity Resolver: eth_call to ERC-8004 registry contracts
+      |     Agent identity + reputation score lookups
+      +-- Client: tripwire/rpc.py (shared httpx.AsyncClient singleton)
 ```
-
-- **Latency:** 2-4 seconds from block confirmation
-- **Reliability:** High. Goldsky handles reorgs, backfills, and delivery guarantees.
-- **Auth:** HMAC verification via `GOLDSKY_WEBHOOK_SECRET`
-- **Batch support:** Goldsky sends batches of decoded logs; TripWire processes them concurrently with a semaphore (max 10 concurrent) via `EventProcessor.process_batch()`.
-
-Goldsky's SQL transform JOINs the `Transfer` and `AuthorizationUsed` events from the same transaction, producing a pre-decoded row with both transfer fields and authorization fields.
-
-### 2b. x402 Facilitator (Fast Path)
-
-```
-Agent -> x402 Facilitator -> POST /api/v1/ingest/facilitator -> TripWire Pipeline
-```
-
-- **Latency:** ~100ms (pre-confirmation)
-- **Reliability:** Medium. The facilitator has verified the ERC-3009 signature but the transaction is NOT yet onchain.
-- **Auth:** Bearer token via `FACILITATOR_WEBHOOK_SECRET`
-- **Event type:** `payment.pre_confirmed`
-
-This path skips decode and finality (no tx hash or block number yet). A synthetic pseudo-tx-hash is generated for correlation. The pipeline still runs nonce dedup, identity resolution, policy evaluation, and dispatch. The finality poller later promotes the event to `confirmed` once the real transaction lands.
 
 ---
 
-## 3. Processing Pipeline
+## 3. Input Sources
 
-Every ingestion path feeds into the `EventProcessor`, which orchestrates the full pipeline. The processor handles two distinct paths: the **ERC-3009 path** (hardcoded, optimized for payments) and the **dynamic trigger path** (ABI-driven, supports any EVM event).
+TripWire accepts events through three input paths, each with different
+latency and trust characteristics.
 
-### Step 1: Event Type Detection (`_detect_event_type`)
+### 3.1 Goldsky Turbo (reliable path)
 
-The processor inspects `topic[0]` of the raw log through a two-tier lookup:
+```
+  EVM Chain (log emitted)
+       |  raw blocks with EVM logs
+       v
+  Goldsky Turbo Pipeline: tripwire-{chain}-erc3009
+       |
+       |  1. Source: {chain}.raw_logs dataset (raw_logs table)
+       |  2. SQL Transform (_gs_log_decode):
+       |     - Self-JOIN {chain}_logs on transaction_hash + address
+       |     - Left side: AuthorizationUsed events (topic0 filter)
+       |     - Right side: Transfer events (topic0 filter)
+       |     - WHERE: address = USDC contract for this chain
+       |     - _gs_log_decode() decodes indexed + data params from ABI
+       |     - Output columns: block_number, block_hash, tx_hash,
+       |       log_index, block_timestamp, chain_id, authorizer,
+       |       nonce, from_address, to_address, transfer value
+       |  3. Sink: webhook to TripWire
+       |
+       |  ~1-4s from block to delivery
+       v
+  POST /api/v1/ingest/goldsky
+       |  Verified via Bearer token (GOLDSKY_WEBHOOK_SECRET)
+       |  Batch max: 1000 logs per request
+       |  Mode: one_row_per_request (each decoded row = one HTTP POST)
+       v
+  EventProcessor.process_event()
+       |
+       v
+  detect -> decode -> dedup -> finality -> identity -> policy -> dispatch
+```
 
-1. **Hardcoded signatures:** Check against `_EVENT_SIGNATURES` dict. Currently `Transfer` and `AuthorizationUsed` topic signatures map to `erc3009_transfer`.
-2. **Dynamic trigger registry fallback:** If no hardcoded match, query the `triggers` table via `TriggerRepository.find_by_topic(topic0)` (cached with 30-second TTL). Results are further filtered locally by `chain_id` and `contract_address`. If triggers match, returns `("dynamic", matched_triggers)`.
+**Key insight**: TripWire receives pre-decoded, pre-joined events from
+Goldsky, not raw logs. The SQL transform (step 2 above) runs inside
+Goldsky's infrastructure before delivery. This means the
+`AuthorizationUsed + Transfer` JOIN happens at the indexing layer, and
+TripWire only needs to extract fields from the already-decoded payload.
 
-This two-tier approach means hardcoded ERC-3009 processing remains fast while any new event type can be supported by creating a trigger -- no code changes required.
+**Pipeline configuration** (`tripwire/ingestion/pipeline.py`):
 
-### Path A: ERC-3009 Pipeline (`_process_erc3009_event`)
+- Builds per-chain YAML configs programmatically
+- Pipeline naming convention: `tripwire-{chain}-erc3009`
+- Deployed via `goldsky turbo apply {config.yaml}`
+- Lifecycle helpers: `deploy_pipeline()`, `stop_pipeline()`,
+  `start_pipeline()`, `get_pipeline_status()`
 
-For `erc3009_transfer` events, the original optimized pipeline runs:
+The Goldsky path supports both hardcoded ERC-3009 events and dynamic
+triggers registered through the trigger registry.
 
-#### Step 2: Decode
+### 3.2 x402 Facilitator (fast path)
 
-`decoder.py` extracts structured data from the raw log:
+```
+  x402 Facilitator (verifies ERC-3009 signature off-chain)
+       |
+       v
+  POST /api/v1/ingest/facilitator
+       |  Verified via HMAC (FACILITATOR_WEBHOOK_SECRET)
+       |  ~100ms end-to-end target
+       v
+  EventProcessor.process_pre_confirmed_event()
+       |
+       v
+  dedup -> identity -> endpoint match -> policy -> dispatch
+  (SKIPS decode + finality -- tx not yet onchain)
+```
 
-- **Goldsky path:** Parses the pre-decoded row with `decoded` (authorizer, nonce) and `transfer` (from, to, value) fields.
-- **Raw path:** Uses `decode_erc3009_from_logs()` to decode both `Transfer(address,address,uint256)` and `AuthorizationUsed(address,bytes32)` from raw EVM log topics and data.
-- **Facilitator path:** Skipped entirely; data arrives pre-structured.
+The fast path achieves ~100ms by skipping decode (data is already structured
+from the facilitator) and finality (the transaction has not yet been mined).
+The event is recorded as `payment.pre_confirmed` with `block_number=0`.
 
-Chain ID is resolved from the raw log's `chain_id` field or by reverse-mapping the USDC contract address.
+**Unified event lifecycle (migration 020):** The facilitator and Goldsky paths
+now produce a SINGLE event that transitions states:
 
-#### Step 3: Nonce Deduplication
+```
+pre_confirmed → confirmed → finalized  (happy path)
+pre_confirmed → reorged                (reorg detected)
+```
 
-The `nonce` (bytes32) from the `AuthorizationUsed` event is checked against the `nonces` table, keyed by `(chain_id, nonce, authorizer)`. If already seen, the event is short-circuited as a duplicate. For plain Transfer events (no authorizer), deduplication uses `tx_hash:log_index`. This runs first because it is the cheapest rejection path.
+When the facilitator claims a nonce, it records `source="facilitator"` and
+the pre-generated `event_id` in the nonces table. When Goldsky later delivers
+the real onchain event for the same nonce, `record_nonce_or_correlate()`
+returns the existing event_id and source. The processor calls
+`_promote_pre_confirmed_event()` which updates the event row with real
+onchain data (tx_hash, block_number, block_hash, log_index) and dispatches
+`payment.confirmed` or `payment.finalized` depending on current finality.
+The finality poller then handles the `confirmed → finalized` transition.
 
-#### Step 4: Finality Check + Identity Resolution (Parallel)
+### 3.3 Dynamic Triggers (same Goldsky path)
 
-These two stages have zero data dependencies on each other and run concurrently via `asyncio.gather()`:
+Dynamic triggers use the same `/ingest/goldsky` endpoint. The difference is
+in event type detection: when a log's topic0 does not match any hardcoded
+signature in `_EVENT_SIGNATURES`, the processor falls back to the trigger
+registry and queries for matching triggers by topic0, chain_id, and
+contract_address.
 
-- **Finality:** `check_finality()` fetches the current block number via JSON-RPC and computes `confirmations = current_block - event.block_number`. Each chain has a configured finality depth (Ethereum: 12, Base: 3, Arbitrum: 1). Returns a `FinalityStatus` with `is_finalized` flag.
-- **Identity:** The `IdentityResolver` looks up the sender's ERC-8004 agent identity (see section 9).
+### 3.4 Goldsky Edge RPC (query plane)
 
-For the facilitator fast path, finality is skipped (returns `None`).
+While Goldsky Turbo pushes events to TripWire (data plane), Goldsky Edge
+provides the RPC endpoints that TripWire pulls data from (query plane).
 
-#### Steps 5-8: Endpoint Matching, Policy, Recording, Dispatch
+```
+  tripwire/rpc.py (shared httpx.AsyncClient singleton)
+       |  Authenticated via Bearer GOLDSKY_EDGE_API_KEY
+       |  Timeout: 10s per request
+       |
+       +-- eth_blockNumber(chain_id)
+       |     Used by: FinalityPoller (per-chain poll loops)
+       |     Returns: latest block height
+       |
+       +-- get_block_hash(chain_id, block_num)  [in finality.py, calls eth_getBlockByNumber]
+       |     Used by: FinalityPoller (reorg detection)
+       |     Returns: block hash for canonical chain comparison
+       |
+       +-- eth_call(chain_id, to, data)
+             Used by: ERC-8004 identity resolver, reputation service
+             Returns: contract read results (agent identity, scores)
+```
 
-These generic stages are shared with all transfer-like events via `_dispatch_for_transfer()`:
+**RPC URL configuration**: Per-chain URLs are set via `BASE_RPC_URL`,
+`ETHEREUM_RPC_URL`, and `ARBITRUM_RPC_URL` environment variables. These
+point to Goldsky Edge managed endpoints. The `GOLDSKY_EDGE_API_KEY` is
+attached as a Bearer token to all outbound RPC requests.
 
-- **Step 5 -- Endpoint Matching:** Active endpoints fetched by `recipient` address (30-second in-memory TTL cache), filtered by recipient match (case-insensitive), chain ID membership, and active status.
-- **Step 6 -- Policy Evaluation:** Each endpoint's `policies` evaluated against transfer data and identity: `min_amount`/`max_amount`, `allowed_senders`/`blocked_senders`, `required_agent_class`, `min_reputation_score`, `finality_depth`.
-- **Step 7 -- Event Recording:** Event row inserted into `events` table with all structured columns plus JSONB `data` and optional `identity_data`.
-- **Step 8 -- Dispatch:** Execute-mode endpoints get webhooks via Convoy; Notify-mode endpoints get events pushed via Supabase Realtime (subscription filters applied first).
+**Client lifecycle**: The async HTTP client is created lazily on first use
+and closed during application shutdown (`close_rpc_client()`).
 
-### Path B: Dynamic Trigger Pipeline (`_process_dynamic_event`)
+---
 
-For events matched by the trigger registry, a per-trigger pipeline runs. This path handles **any EVM event** -- DEX swaps, NFT mints, governance actions, etc.
+## 4. Processing Pipeline
+
+### 4.1 Event Type Router
+
+```python
+# tripwire/ingestion/processor.py :: _detect_event_type()
+
+topic0 = topics[0].lower()
+
+1. Check _EVENT_SIGNATURES dict (hardcoded):
+   - AuthorizationUsed topic -> "erc3009_transfer"
+   - Transfer topic          -> "erc3009_transfer"
+
+2. If no hardcoded match, check trigger registry:
+   - TriggerRepository.find_by_topic(topic0)
+   - Filter by chain_id and contract_address
+   - If matched: return ("dynamic", [triggers])
+
+3. Otherwise: return "unknown" (event is skipped)
+```
+
+### 4.2 ERC-3009 Pipeline
+
+```
+  Raw log
+    |
+    v
+  1. DECODE              decode_transfer_event()
+    |                    Extracts ERC3009Transfer from raw Goldsky log
+    |                    ~1ms
+    v
+  2. DEDUP               nonce_repo.record_nonce_or_correlate()
+    |                    Unique constraint: (chain_id, nonce, authorizer)
+    |                    Returns (is_new, existing_event_id, existing_source)
+    |                    If existing_source="facilitator": promotes pre_confirmed
+    |                    event instead of dropping as duplicate (see 4.5)
+    |                    Reorg-aware: reorged nonces can be reused
+    |                    Uses SELECT FOR UPDATE to prevent TOCTOU races
+    |                    ~2-5ms
+    v
+  3. FINALITY  ----+     check_finality() via JSON-RPC
+    |              |     eth_blockNumber -> compute confirmations
+    |              |     Accepts optional required_depth override
+    |              |     (from EndpointPolicies.finality_depth)
+    |              |     ~10-50ms (RPC round-trip)
+    |   [parallel] |
+  4. IDENTITY  ----+     resolver.resolve() via ERC-8004 registry
+    |                    Returns AgentIdentity or None
+    |                    ~5-30ms (RPC or cache hit)
+    v
+  5. ENDPOINT MATCH      list_by_recipient() with 30s TTL cache
+    |                    Filter: recipient + chain_id + active
+    |                    ~0-2ms (cached) or ~5-10ms (DB)
+    v
+  6. POLICY EVAL         evaluate_policy() per endpoint
+    |                    Checks: min/max amount, sender allowlists,
+    |                    agent class, reputation score
+    |                    ~<1ms
+    v
+  6b. FINALITY GATE      Per-endpoint finality_depth check
+    |                    EndpointPolicies.finality_depth (int | None)
+    |                    None = chain default from FINALITY_DEPTHS
+    |                    Defers endpoints whose required depth exceeds
+    |                    current confirmations (they wait for poller)
+    v
+  7. RECORD EVENT        Insert into events table + event_endpoints join
+    |                    ~3-8ms
+    v
+  8a. EXECUTE MODE       dispatch_event() via Convoy
+    |                    One message per matched endpoint
+    |                    ~20-80ms (Convoy API call)
+    |
+  8b. NOTIFY MODE        RealtimeNotifier.notify_batch()
+                         Insert into realtime_events table
+                         Supabase Realtime pushes via WebSocket
+                         ~sub-1ms (local DB insert)
+```
+
+Steps 3 and 4 (finality and identity) run in parallel via `asyncio.gather`
+since they have zero data dependencies on each other.
+
+### 4.3 Dynamic Trigger Pipeline
 
 For each matched trigger:
 
-1. **ABI Decode:** `decode_event_with_abi()` from the generic decoder uses the trigger's stored ABI fragment to decode indexed parameters from topics and non-indexed parameters from data. Returns a flat `field_name -> value` dict plus `_`-prefixed metadata (`_tx_hash`, `_block_number`, `_block_hash`, `_log_index`, `_address`, `_chain_id`).
-
-2. **Filter Evaluation:** The trigger's `filter_rules` are evaluated against the decoded event via the filter engine. All rules use AND logic. If any rule fails, the event is rejected for that trigger (but may still match other triggers for the same topic).
-
-3. **Deduplication:** Uses `tx_hash:log_index:trigger_id` as the dedup key, with authorizer set to `"dynamic_trigger"`.
-
-4. **Identity Resolution:** Scans decoded fields for the first Ethereum address value and resolves its ERC-8004 identity.
-
-5. **Endpoint Fetch:** Retrieves the endpoint linked to `trigger.endpoint_id` and checks it is active.
-
-6. **Dispatch:** Builds a payload with the full decoded event data, trigger ID, and idempotency key (`dyn_{tx_hash}_{log_index}_{trigger_id}`). Dispatches via Convoy if the endpoint has a `convoy_project_id`.
-
-7. **Event Recording:** Inserts into the `events` table with identity data if resolved.
-
----
-
-## 4. Webhook Delivery
-
-### Convoy Integration
-
-All Execute-mode webhook deliveries route through [Convoy](https://getconvoy.io/), a self-hosted webhook gateway. TripWire uses the Convoy REST API via `convoy_client.py`:
-
-- **Project creation:** Each registered endpoint gets a Convoy project (`create_application`) with exponential retry configured (10 retries, 10s base duration).
-- **Endpoint registration:** The webhook URL is registered with Convoy along with an HMAC signing secret.
-- **Event dispatch:** `send_webhook()` posts the event payload to the Convoy project, targeting the specific endpoint. Convoy handles delivery, retries, and logging.
-
-### Retry Strategy
-
-Convoy is configured with exponential backoff: 10 retries starting at 10 seconds. Failed deliveries land in Convoy's dead-letter queue.
-
-### Dead Letter Queue
-
-The `DLQHandler` runs as a background poller (configurable interval, default 60s) that queries Convoy for failed deliveries and can trigger batch retries via `force_resend()`.
-
-### HMAC Signatures
-
-Each endpoint gets a unique webhook secret (64-character hex token generated via `secrets.token_hex(32)`). This secret is passed to Convoy at endpoint creation time and used for HMAC signature headers on every delivery. The secret is returned to the caller exactly once at registration time.
-
-### Idempotency
-
-Every webhook delivery includes a deterministic idempotency key derived from `SHA256(chain_id:tx_hash:log_index:endpoint_id:event_type)`. This prevents duplicate deliveries even if the same event is processed multiple times.
-
-### Webhook Payload Structure
-
-```json
-{
-  "id": "uuid",
-  "idempotency_key": "idem_<sha256_prefix>",
-  "type": "payment.confirmed",
-  "mode": "execute",
-  "timestamp": 1710000000,
-  "data": {
-    "transfer": {
-      "chain_id": 8453,
-      "tx_hash": "0x...",
-      "block_number": 12345678,
-      "from_address": "0x...",
-      "to_address": "0x...",
-      "amount": "1000000",
-      "nonce": "0x...",
-      "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    },
-    "finality": {
-      "confirmations": 3,
-      "required_confirmations": 3,
-      "is_finalized": true
-    },
-    "identity": {
-      "address": "0x...",
-      "agent_class": "trading-bot",
-      "deployer": "0x...",
-      "capabilities": ["swap", "limit-order"],
-      "reputation_score": 85.0,
-      "registered_at": 1738108800,
-      "metadata": {}
-    }
-  }
-}
+```
+  1. DECODE              decode_event_with_abi(raw_log, trigger.abi)
+                         Generic ABI decoder using eth-abi
+  2. FILTER              evaluate_filters(decoded, trigger.filter_rules)
+                         JMESPath-based filter engine (AND logic)
+  3. DEDUP               tx_hash:log_index:trigger_id as nonce key
+  4. IDENTITY            First address field in decoded data
+  5. ENDPOINT FETCH      endpoint_repo.get_by_id(trigger.endpoint_id)
+  6. DISPATCH            webhook_provider.send() via Convoy
+  7. RECORD              events table + event_endpoints join
 ```
 
-### Event Types
+### 4.4 Batch Processing
 
-| Type | Meaning |
-|------|---------|
-| `payment.pre_confirmed` | Facilitator fast path; ERC-3009 signature verified, tx not yet onchain |
-| `payment.pending` | Onchain but below finality depth |
-| `payment.confirmed` | Reached required finality depth |
-| `payment.reorged` | Block hash mismatch detected by finality poller |
-| `payment.failed` | Processing failure |
+The `/ingest/goldsky` endpoint accepts arrays of up to 1000 logs.
+`EventProcessor.process_batch()` processes them concurrently with a
+semaphore of 10 to bound downstream pressure.
 
----
+### 4.5 Pre-Confirmed Event Promotion
 
-## 5. Authentication
-
-TripWire uses **SIWE (Sign-In with Ethereum, EIP-4361)** for all API authentication. There are no API keys.
-
-### Flow
-
-1. **Get nonce:** `GET /auth/nonce` returns a cryptographically random nonce stored in Redis with a 5-minute TTL.
-2. **Sign message:** The client constructs an EIP-4361 message with the method, path, and SHA-256 body hash as the statement, then signs it with `personal_sign`.
-3. **Send request:** Every authenticated request includes five headers:
-   - `X-TripWire-Address` -- the Ethereum address
-   - `X-TripWire-Signature` -- the EIP-191 signature
-   - `X-TripWire-Nonce` -- the nonce from step 1
-   - `X-TripWire-Issued-At` -- ISO-8601 timestamp
-   - `X-TripWire-Expiration` -- ISO-8601 expiration
-
-### Verification (`require_wallet_auth`)
-
-1. **Expiration check:** Reject if the current time is past the expiration.
-2. **Body hash binding:** Read the full request body and compute `SHA-256(body)`. The hash is embedded in the SIWE statement as `METHOD /path <body_hash>`, binding the signature to the exact request content.
-3. **Signature recovery:** Reconstruct the SIWE message and recover the signer address via `eth_account.Account.recover_message`.
-4. **Address comparison:** Case-insensitive comparison of the recovered address with the claimed address.
-5. **Nonce consumption:** Atomically delete the nonce key from Redis. If the key does not exist (already used or expired), the request is rejected. This prevents replay attacks.
-
-### Ingestion Auth
-
-The Goldsky and facilitator ingestion paths use separate shared-secret authentication (HMAC bearer tokens) rather than SIWE, since they are server-to-server.
-
----
-
-## 6. Payment
-
-### x402 Protocol
-
-Endpoint registration (`POST /api/v1/endpoints`) is gated by the [x402 payment protocol](https://x402.org). When `TRIPWIRE_TREASURY_ADDRESS` is configured, the `PaymentMiddlewareASGI` middleware intercepts the request and requires an x402 payment proof.
-
-### Configuration
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `x402_facilitator_url` | `https://x402.org/facilitator` | Coinbase x402 facilitator URL |
-| `x402_registration_price` | `$1.00` | USDC payment required to register an endpoint |
-| `x402_network` | `eip155:8453` | Base mainnet |
-| `tripwire_treasury_address` | (empty) | USDC recipient; empty disables payment gating |
-
-### Flow
-
-1. Client sends `POST /api/v1/endpoints` without payment proof.
-2. Middleware returns 402 Payment Required with payment options.
-3. Client pays via the x402 facilitator and retries with the payment proof header.
-4. Middleware verifies the payment using `ExactEvmServerScheme`.
-5. The endpoint is created and the payment tx hash is recorded on the endpoint row.
-
----
-
-## 7. Data Model
-
-### Endpoints
-
-The core registration entity. Each endpoint represents a webhook URL that receives payment notifications for a specific recipient address.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | TEXT PK | nanoid (21 chars) |
-| `url` | TEXT | Webhook delivery URL |
-| `mode` | TEXT | `execute` (webhook) or `notify` (Supabase Realtime) |
-| `chains` | JSONB | Array of chain IDs to monitor |
-| `recipient` | TEXT | Ethereum address receiving payments |
-| `owner_address` | TEXT | Wallet address that owns this endpoint (SIWE auth) |
-| `policies` | JSONB | Policy configuration (min/max amount, sender filters, etc.) |
-| `active` | BOOLEAN | Soft-delete flag |
-| `convoy_project_id` | TEXT | Convoy project ID for webhook delivery |
-| `convoy_endpoint_id` | TEXT | Convoy endpoint ID |
-| `webhook_secret` | TEXT | Per-endpoint HMAC signing secret |
-| `registration_tx_hash` | TEXT | x402 payment transaction hash |
-| `registration_chain_id` | INTEGER | Chain where x402 payment was made |
-
-### Subscriptions
-
-Notify-mode filter configuration. Each subscription defines which events should be pushed to the parent endpoint via Supabase Realtime.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | TEXT PK | nanoid |
-| `endpoint_id` | TEXT FK | Parent endpoint |
-| `filters` | JSONB | Filter criteria (chains, senders, recipients, min_amount, agent_class) |
-| `active` | BOOLEAN | Active flag |
-
-### Events
-
-Every processed payment event, regardless of whether it matched any endpoints.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | TEXT PK | UUID |
-| `chain_id` | INTEGER | Chain ID |
-| `tx_hash` | TEXT | Transaction hash |
-| `block_number` | BIGINT | Block number |
-| `block_hash` | TEXT | Block hash (used for reorg detection) |
-| `log_index` | INTEGER | Log index within the transaction |
-| `from_address` | TEXT | Transfer sender |
-| `to_address` | TEXT | Transfer recipient |
-| `amount` | TEXT | Transfer value (string for USDC 6-decimal precision) |
-| `authorizer` | TEXT | ERC-3009 authorization signer |
-| `nonce` | TEXT | ERC-3009 bytes32 nonce |
-| `token` | TEXT | USDC contract address |
-| `status` | TEXT | `pending`, `confirmed`, or `reorged` |
-| `finality_depth` | INTEGER | Current confirmation count |
-| `identity_data` | JSONB | ERC-8004 agent identity snapshot |
-| `endpoint_id` | TEXT FK | First matched endpoint |
-| `confirmed_at` | TIMESTAMPTZ | When the event reached finality |
-
-### Webhook Deliveries
-
-Tracks every webhook dispatch attempt.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | TEXT PK | UUID |
-| `endpoint_id` | TEXT FK | Target endpoint |
-| `event_id` | TEXT FK | Source event |
-| `provider_message_id` | TEXT | Convoy event/delivery ID |
-| `status` | TEXT | `pending`, `sent`, `delivered`, `failed` |
-
-### Nonces
-
-Deduplication table for ERC-3009 authorization nonces.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `chain_id` | INTEGER | Chain ID |
-| `nonce` | TEXT | bytes32 hex nonce |
-| `authorizer` | TEXT | Authorizer address |
-| UNIQUE | | `(chain_id, nonce, authorizer)` |
-
-### Triggers
-
-Dynamic trigger definitions created by agents via MCP. Each trigger watches for a specific EVM event signature and routes matching events to its parent endpoint.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | UUID PK | Auto-generated |
-| `owner_address` | TEXT | Agent wallet that owns this trigger |
-| `endpoint_id` | TEXT FK | Parent endpoint for webhook delivery |
-| `name` | TEXT | Human-readable trigger name |
-| `event_signature` | TEXT | Solidity event signature (e.g. `Transfer(address,address,uint256)`) |
-| `abi` | JSONB | ABI fragment array for decoding the event |
-| `contract_address` | TEXT | Specific contract to watch (null = any contract) |
-| `chain_ids` | JSONB | Array of chain IDs to monitor |
-| `filter_rules` | JSONB | Array of `{field, op, value}` filter predicates |
-| `webhook_event_type` | TEXT | Event type string sent in webhook payload |
-| `reputation_threshold` | FLOAT | Minimum ERC-8004 reputation score (0-100) |
-| `batch_id` | UUID | Groups triggers created in one `register_middleware` call |
-| `active` | BOOLEAN | Soft-delete flag |
-
-### Trigger Templates
-
-Pre-built trigger templates for the Bazaar marketplace. Templates define reusable event configurations that agents can instantiate with custom parameters.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | UUID PK | Auto-generated |
-| `name` | TEXT | Display name |
-| `slug` | TEXT UNIQUE | URL-safe identifier (e.g. `whale-transfer`, `dex-swap`) |
-| `description` | TEXT | Human-readable description |
-| `category` | TEXT | Category for browsing (`defi`, `payments`, `nft`, `governance`) |
-| `event_signature` | TEXT | Solidity event signature |
-| `abi` | JSONB | ABI fragment for decoding |
-| `default_chains` | JSONB | Default chain IDs |
-| `default_filters` | JSONB | Default filter rules |
-| `parameter_schema` | JSONB | Schema for customizable parameters |
-| `webhook_event_type` | TEXT | Default webhook event type |
-| `reputation_threshold` | FLOAT | Minimum reputation to use this template |
-| `author_address` | TEXT | Template author's wallet |
-| `is_public` | BOOLEAN | Visible in Bazaar |
-| `install_count` | BIGINT | Number of activations (auto-incremented via DB trigger) |
-
-### Trigger Instances
-
-Tracks template activations. Each instance links a template to a specific endpoint with custom parameters. A DB trigger auto-increments the parent template's `install_count`.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `id` | UUID PK | Auto-generated |
-| `template_id` | UUID FK | Parent template |
-| `owner_address` | TEXT | Agent wallet |
-| `endpoint_id` | TEXT FK | Target endpoint |
-| `contract_address` | TEXT | Overridden contract address |
-| `chain_ids` | JSONB | Overridden chain IDs |
-| `parameters` | JSONB | Custom parameter values |
-| `resolved_filters` | JSONB | Final filter rules after parameter resolution |
-| `active` | BOOLEAN | Active flag |
-
----
-
-## 8. Security
-
-### Row Level Security (RLS)
-
-All four main tables (`endpoints`, `subscriptions`, `events`, `webhook_deliveries`) have RLS enabled and forced. Policies use the session variable `app.current_wallet` (set via `SET LOCAL` before each request) to restrict access:
-
-- **endpoints:** Direct `owner_address` match.
-- **subscriptions, events, webhook_deliveries:** JOIN through `endpoints.owner_address` for ownership verification.
-
-A `set_wallet_context(wallet_address)` PostgreSQL function (SECURITY DEFINER) sets the session variable.
-
-### Ownership Enforcement
-
-Every API route that accesses a specific resource verifies ownership at the application layer:
-
-- Endpoint routes: `owner_address` must match the authenticated wallet.
-- Event routes: Ownership verified through the parent endpoint.
-- Delivery routes: Ownership verified through the parent endpoint.
-- Subscription routes: Ownership verified through the parent endpoint.
-
-### Secret Management
-
-- All secrets use Pydantic `SecretStr` to prevent accidental logging.
-- Production startup validates that critical secrets are set (`supabase_service_role_key`, `convoy_api_key`, `tripwire_treasury_address`).
-- Per-endpoint webhook secrets are generated with `secrets.token_hex(32)` and returned exactly once at registration.
-
-### Fail-Secure Defaults
-
-- Missing `GOLDSKY_WEBHOOK_SECRET` in production causes ingest endpoints to reject all requests.
-- Missing `FACILITATOR_WEBHOOK_SECRET` in production returns 500 (refuses to operate without auth).
-- The webhook provider falls back to `LogOnlyProvider` (no delivery) when `CONVOY_API_KEY` is missing.
-- Identity resolution failures return `None` (event still processes, but identity-dependent policies will reject).
-- Finality check failures default to `pending` status (never falsely confirms).
-
-### Input Validation
-
-- Endpoint URLs are validated via `validate_endpoint_url()`.
-- Facilitator payloads validate that `token` is a known USDC contract and `chain_id` is supported.
-- `signature_verified` must be `true` on facilitator payloads.
-
-### Rate Limiting
-
-SlowAPI middleware with configurable limits per route category (CRUD operations and ingestion endpoints).
-
----
-
-## 9. Identity (ERC-8004)
-
-TripWire resolves onchain AI agent identities via the [ERC-8004](https://eips.ethereum.org/EIPS/eip-8004) standard. The `IdentityRegistry` contract is an ERC-721 where each token represents a registered agent.
-
-### Resolution Flow
-
-1. `balanceOf(senderAddress)` -- check if the sender owns an ERC-8004 NFT.
-2. `tokenOfOwnerByIndex(senderAddress, 0)` -- get the agent's token ID.
-3. **Parallel RPC calls** (all depend only on `agentId`):
-   - `tokenURI(agentId)` -- agent metadata URI
-   - `getMetadata(agentId, "agentClass")` -- agent classification
-   - `getMetadata(agentId, "capabilities")` -- comma-separated capability list
-   - `ownerOf(agentId)` -- deployer address
-   - `getSummary(agentId, [])` -- reputation score from the `ReputationRegistry`
-
-### Contract Addresses
-
-Both registries use CREATE2 and share the same address on all supported chains:
-
-- **IdentityRegistry:** `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`
-- **ReputationRegistry:** `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63`
-
-### AgentIdentity Model
-
-```python
-class AgentIdentity(BaseModel):
-    address: EthAddress
-    agent_class: str             # e.g., "trading-bot", "payment-agent"
-    deployer: EthAddress
-    capabilities: list[str]      # e.g., ["swap", "limit-order"]
-    reputation_score: float      # 0-100 (derived from basis points)
-    registered_at: int           # token ID as registration order proxy
-    metadata: dict[str, Any]     # agent_id, agent_uri
-```
-
-### Caching
-
-Resolved identities are cached in-memory with a configurable TTL (default 300 seconds). Cache key is `chain_id:address`.
-
-### Policy Integration
-
-Identity data feeds into the policy engine:
-
-- `required_agent_class` -- only allow events from agents of a specific class.
-- `min_reputation_score` -- reject agents below a reputation threshold.
-
-In development, a `MockResolver` provides three pre-configured test agents.
-
----
-
-## 10. Database Schema
-
-### Entity Relationship Diagram
+When Goldsky delivers an onchain event whose nonce was already claimed by
+the facilitator fast path, the processor promotes the existing event instead
+of dropping it as a duplicate:
 
 ```
-endpoints (PK: id)
-    |-- owner_address (wallet auth)
-    |-- recipient (payment matching)
-    |-- convoy_project_id, convoy_endpoint_id (webhook wiring)
+  Goldsky delivers real onchain event
     |
-    |--< subscriptions (FK: endpoint_id)
-    |       |-- filters (JSONB: chains, senders, recipients, min_amount, agent_class)
+    v
+  1. DECODE              decode_transfer_event()
     |
-    |--< triggers (FK: endpoint_id)
-    |       |-- owner_address, event_signature, abi
-    |       |-- contract_address, chain_ids, filter_rules
-    |       |-- webhook_event_type, reputation_threshold
-    |       |-- active (soft delete)
-    |
-    |--< trigger_instances (FK: endpoint_id, template_id)
-    |       |-- parameters, resolved_filters
-    |       |-- contract_address, chain_ids
-    |
-    |--< events (FK: endpoint_id)
-    |       |-- chain_id, tx_hash, block_number, block_hash
-    |       |-- from_address, to_address, amount, authorizer, nonce
-    |       |-- status (pending -> confirmed | reorged)
-    |       |-- finality_depth, identity_data
-    |       |
-    |       |--< webhook_deliveries (FK: event_id, endpoint_id)
-    |               |-- provider_message_id (Convoy)
-    |               |-- status (pending -> sent -> delivered | failed)
-    |
-trigger_templates (PK: id)
-    |-- slug (UNIQUE), name, category, event_signature, abi
-    |-- default_chains, default_filters, parameter_schema
-    |-- is_public, install_count (auto-incremented)
-    |
-    |--< trigger_instances (FK: template_id)
-    |
-nonces (UNIQUE: chain_id, nonce, authorizer)
-    |-- deduplication table, no FK relationships
-    |
-audit_log
-    |-- entity_type, entity_id, action, metadata
+    v
+  2. DEDUP               record_nonce_or_correlate(source="goldsky")
+    |                    Returns (False, existing_event_id, "facilitator")
+    v
+  3. PROMOTE             _promote_pre_confirmed_event()
+    |                    Updates event row with real tx_hash, block_number,
+    |                    block_hash, log_index via promote_to_confirmed()
+    v
+  4. FINALITY CHECK      check_finality() on the real block
+    |                    Determines: confirmed or already finalized
+    v
+  5. IDENTITY            resolver.resolve() for the authorizer
+    v
+  6. ENDPOINT FETCH      Fetches linked endpoints from event_endpoints join table
+    v
+  7. POLICY EVAL         evaluate_policy() per endpoint
+    v
+  8. DISPATCH            payment.confirmed or payment.finalized webhook
 ```
 
-### Indexes
-
-Key indexes optimized for the access patterns:
-
-- `idx_endpoints_recipient` -- endpoint matching during event processing
-- `idx_endpoints_owner_address` -- wallet-scoped queries
-- `idx_events_chain_tx` -- tx lookup
-- `idx_events_nonce` -- composite `(chain_id, nonce, authorizer)` for dedup
-- `idx_events_status` -- finality poller queries for pending events
-- `idx_events_block` -- composite `(chain_id, block_number)` for finality polling
-- `idx_webhook_deliveries_status` -- DLQ handler queries
-- `idx_triggers_event_sig` -- topic0 lookup during dynamic event detection
-- `idx_triggers_contract` -- partial index on `contract_address` where not null
-- `idx_triggers_active` -- partial index on active triggers only
-- `idx_triggers_chain_ids` -- GIN index for chain_id containment queries
-- `idx_triggers_owner` -- owner-scoped trigger queries
-- `idx_trigger_templates_slug` -- slug lookup for template activation
-- `idx_trigger_templates_category` -- category browsing in Bazaar
-- `idx_trigger_templates_public` -- partial index for public templates
-
-### Finality Poller
-
-The `FinalityPoller` runs as a background asyncio task with one coroutine per chain:
-
-| Chain | Finality Depth | Poll Interval |
-|-------|---------------|---------------|
-| Arbitrum | 1 confirmation | 5 seconds |
-| Base | 3 confirmations | 10 seconds |
-| Ethereum | 12 confirmations | 30 seconds |
-
-Each poll cycle:
-
-1. Fetches pending events for the chain.
-2. Gets the current block number (single RPC call per cycle).
-3. For each event: checks block hash for reorg, then checks confirmation count.
-4. Transitions events to `confirmed` (fires `payment.confirmed` webhook) or `reorged` (fires `payment.reorged` webhook).
-
-### Supported Chains
-
-| Chain | Chain ID | USDC Contract |
-|-------|----------|---------------|
-| Ethereum | 1 | `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48` |
-| Base | 8453 | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
-| Arbitrum | 42161 | `0xaf88d065e77c8cC2239327C5EDb3A432268e5831` |
+The nonce table's `record_nonce_or_correlate()` function (migration 020)
+uses `SELECT FOR UPDATE` to prevent TOCTOU races when two sources claim the
+same nonce concurrently.
 
 ---
 
-## 11. Trigger Registry
+## 5. Execution Guarantees
 
-The trigger registry is the core data layer that makes TripWire event-agnostic. Instead of hardcoding event types, agents define triggers dynamically -- each trigger specifies an EVM event signature, an ABI fragment for decoding, optional contract/chain filters, and filter predicates on decoded fields.
+This section defines TripWire's formal trust model, deduplication semantics,
+and delivery guarantees. These properties are what make TripWire suitable for
+production financial infrastructure.
 
-### Three Tables
+### 5.1 Trust Levels
 
-| Table | Purpose | Created By |
-|-------|---------|------------|
-| `trigger_templates` | Pre-built recipes in the Bazaar marketplace | Platform operators / community |
-| `triggers` | Active trigger definitions (custom or from templates) | Agents via MCP |
-| `trigger_instances` | Tracks which templates were activated and with what params | Agents via `activate_template` |
+Every event that flows through TripWire carries an implicit trust level.
+The trust level determines what actions are safe to take in response.
 
-### How Dynamic Triggers Work
+```
+PROVISIONAL (confidence ~0.99)
+  → x402 facilitator fast path
+  → Signature verified, tx NOT yet onchain
+  → Trust boundary: facilitator's signature verification
+  → Event type: payment.pre_confirmed
 
-1. An agent creates a trigger (via `register_middleware` with `template_slugs`/`custom_triggers`, or via `create_trigger`). The trigger row stores: `event_signature` (keccak256 topic0), `abi` (JSON ABI fragment), `contract_address` (optional), `chain_ids`, and `filter_rules`.
+CONFIRMED (confidence 1.0, single block)
+  → Goldsky reliable path, 1+ block confirmation
+  → Event type: payment.confirmed
+  → Safe for: low-value actions, dashboard updates
 
-2. When a raw log arrives at the `EventProcessor`, `_detect_event_type` checks `topic0` against hardcoded signatures first, then falls back to `TriggerRepository.find_by_topic(topic0)`. The topic lookup is cached with a 30-second TTL.
+FINALIZED (confidence 1.0, chain-specific depth)
+  → Meets full finality threshold per chain
+  → Arbitrum: 1 block (~250ms)
+  → Base: 3 blocks (~6s)
+  → Ethereum: 12 blocks (~2.5 min)
+  → Event type: payment.finalized (dedicated event type)
+  → Safe for: irreversible actions, fund transfers
 
-3. Matched triggers are filtered locally by `chain_id` and `contract_address`. Each surviving trigger's ABI is used to decode the event, its filter rules are evaluated, and the event is dispatched to the trigger's linked endpoint.
+REORGED (confidence 0.0)
+  → Block hash mismatch detected by finality poller
+  → Nonce invalidated (reorged_at set, reusable)
+  → Event type: payment.reorged
+  → Action: roll back any provisional actions
+```
 
-### Caching
+These trust levels are encoded in the `WebhookEventType` enum
+(`tripwire/types/models.py`) and surfaced explicitly in every webhook
+payload via three new fields:
 
-- **Active triggers:** Module-level cache, invalidated on any create/deactivate operation.
-- **Topic lookup:** Per-topic cache with 30-second TTL (`_topic_cache`).
-- **Public templates:** Module-level cache, invalidated on trigger cache invalidation.
+- **`execution_state`**: `ExecutionState` enum -- `provisional`, `confirmed`,
+  `finalized`, or `reorged`. Derived from event type and finality data by
+  `derive_execution_metadata()`.
+- **`safe_to_execute`**: `bool` -- `true` only when `execution_state` is
+  `finalized`. Tells the consumer whether irreversible actions are safe.
+- **`trust_source`**: `TrustSource` enum -- `facilitator` (pre_confirmed
+  events) or `onchain` (all others).
 
-All caches are invalidated atomically via `invalidate_trigger_cache()`.
+The `WebhookEventType` enum now includes six event types:
+`payment.pre_confirmed`, `payment.pending`, `payment.confirmed`,
+`payment.finalized`, `payment.failed`, `payment.reorged`.
 
-### The Bazaar
+All payloads also carry `version: "v1"` for forward compatibility.
 
-The Bazaar is the marketplace for trigger templates. Seed templates ship with the platform:
+### 5.2 The Two Trust Models
 
-| Template | Slug | Category | Event |
-|----------|------|----------|-------|
-| Whale Transfer Monitor | `whale-transfer` | defi | `Transfer(address,address,uint256)` |
-| DEX Swap Monitor | `dex-swap` | defi | `Swap(address,address,int256,int256,uint160,uint128,int24)` |
-| NFT Mint Monitor | `nft-mint` | nft | `Transfer(address,address,uint256)` with `from == 0x0` filter |
-| ERC-3009 Payment | `erc3009-payment` | payments | `AuthorizationUsed(address,bytes32)` |
-| Ownership Transfer | `ownership-transfer` | governance | `OwnershipTransferred(address,address)` |
+TripWire operates two fundamentally different trust models. The developer
+chooses which to act on based on their risk tolerance.
 
-Templates with `reputation_threshold > 0` require the activating agent to have a minimum ERC-8004 reputation score (e.g., `ownership-transfer` requires 25).
+**Goldsky path (chain-derived trust):**
+
+```
+event → decode → dedup → finality check → identity → policy → dispatch
+```
+
+Trust is derived from the chain itself: block confirmations measured against
+`FINALITY_DEPTHS` (Arbitrum: 1, Base: 3, Ethereum: 12). The finality check
+calls `eth_blockNumber` via JSON-RPC to compute `confirmations =
+current_block - event.block_number`. The guarantee: a `payment.confirmed`
+webhook only fires after N confirmations have been observed.
+
+**Facilitator fast path (facilitator-derived trust):**
+
+```
+facilitator verifies ERC-3009 signature → TripWire skips decode + finality
+  → dedup → identity → policy → dispatch
+```
+
+Trust is derived from the facilitator's signature verification, not from
+the chain. The transaction has not been mined yet. The guarantee: the
+webhook fires in ~100ms, but the event is PROVISIONAL. The real
+confirmation comes later when Goldsky delivers the onchain event.
+
+**The fast path trades finality for speed.** The developer chooses which
+webhooks to act on:
+
+- Act on `payment.pre_confirmed` (~100ms) for low-risk actions like
+  showing a success screen, unlocking a download, or updating a dashboard.
+- Wait for `payment.confirmed` (~500ms-13s depending on chain) for
+  medium-risk actions like unlocking content or updating balances.
+- Wait for `payment.finalized` (chain-specific depth) for irreversible
+  actions like transferring funds, minting tokens, or granting permanent
+  access. The `safe_to_execute` flag is `true` only on finalized events.
+- The developer's endpoint receives up to THREE events for the same payment
+  (`pre_confirmed` → `confirmed` → `finalized`). Deduplication across
+  the paths is handled via the `idempotency_key` (see below). Each event
+  type gets its own key, so all arrive, but replays of the same event
+  type are suppressed.
+
+### 5.3 Deduplication Guarantees
+
+TripWire enforces deduplication at two levels:
+
+**Nonce dedup (prevents duplicate processing):**
+
+PostgreSQL UNIQUE constraint on `(chain_id, nonce, authorizer)` in the
+`nonces` table. Two PL/pgSQL functions handle deduplication:
+
+- `record_nonce_with_reorg()`: Simple insert-or-reject with reorg reclaim.
+- `record_nonce_or_correlate()` (migration 020): Correlation-aware variant
+  that returns `(is_new, existing_event_id, existing_source)`. On conflict,
+  it uses `SELECT FOR UPDATE` to lock the row before reading, preventing
+  TOCTOU races when the facilitator and Goldsky paths claim the same nonce
+  concurrently. If the existing nonce was created by the facilitator, the
+  Goldsky path promotes the pre_confirmed event instead of dropping it.
+
+**Event dedup (prevents duplicate delivery):**
+
+The `idempotency_key` is a deterministic SHA-256 hash:
+
+```
+idempotency_key = SHA256(chain_id : tx_hash : log_index : endpoint_id : event_type)
+```
+
+The same event always produces the same key. Because `event_type` is part
+of the hash, a `payment.pre_confirmed` and `payment.confirmed` for the
+same transaction produce different keys -- both are delivered. But two
+deliveries of `payment.confirmed` for the same tx+endpoint are identical
+and can be deduplicated by the consumer.
+
+**Reorg recovery:**
+
+When the finality poller detects a reorg (block hash mismatch between the
+stored event and the canonical chain), it sets `reorged_at` on the nonce
+via `invalidate_by_event_id()`. This allows the re-broadcast transaction
+to be processed as a new event when it reappears in a different block.
+
+### 5.4 Delivery Guarantees
+
+- **At-least-once delivery via Convoy**: Convoy retries failed webhook
+  deliveries with exponential backoff (10 retries, base duration 10s).
+  After exhaustion, the delivery enters Convoy's dead-letter queue.
+  TripWire's DLQ handler polls for failed deliveries and retries up to
+  3 additional times before marking them `dead_lettered` and firing an
+  alert.
+- **At-least-once processing via Redis Streams**: When the event bus is
+  enabled, consumer groups ensure messages are ACKed only after successful
+  processing. Unacked messages are reclaimed by other workers via
+  XAUTOCLAIM after 30s idle. Messages that fail 5 times are written to
+  the `tripwire:dlq` stream and ACKed from the source.
+- **Idempotency keys enable exactly-once semantics at the consumer**:
+  TripWire delivers at-least-once, but every webhook payload includes a
+  deterministic `idempotency_key`. Consumers that store and check this
+  key achieve exactly-once processing semantics.
+- **DLQ for permanently failed deliveries**: Both Convoy (webhook-level)
+  and Redis Streams (processing-level) have dead-letter mechanisms with
+  alerting and manual replay capability.
+
+### 5.5 What TripWire Does NOT Guarantee
+
+- **No exactly-once delivery.** TripWire provides at-least-once delivery
+  only. The consumer is responsible for deduplication via the
+  `idempotency_key` included in every webhook payload.
+- **No distributed finality poller coordination.** The finality poller is
+  single-instance only. In a multi-instance deployment, each instance runs
+  its own poller, which can produce duplicate confirmation webhooks for the
+  same event. Mitigation: run a single instance, or add a Redis/Postgres
+  advisory lock (see Known Limitations P1).
+- **Pre-confirmed events can strand.** If the facilitator fast path creates
+  a `payment.pre_confirmed` event but the transaction never lands onchain,
+  the event remains in `pre_confirmed` status indefinitely. The unified
+  lifecycle (migration 020) ensures promotion when Goldsky delivers the
+  real tx, but if the authorization expires and the tx is never mined, the
+  event has no cleanup mechanism yet (see Known Limitations P2).
+- **30s cache TTL means new triggers are invisible for up to 30 seconds.**
+  The endpoint cache (`processor.py`), trigger topic cache
+  (`triggers.py`), and TriggerIndex (`trigger_worker.py`) all use
+  in-process TTL caches. A newly created trigger will not be evaluated
+  against incoming events until the cache refreshes.
+
+**"Goldsky tells you what happened. TripWire decides if it's safe to act. Convoy makes sure you hear about it."**
 
 ---
 
-## 12. Generic Event Decoder
+## 6. Delivery Layer
 
-The generic decoder (`tripwire/ingestion/generic_decoder.py`) enables ABI-driven decoding for **any** EVM event, replacing the need for hardcoded decoders when processing dynamic triggers.
+### 6.1 Execute Mode: Convoy (webhook POST)
 
-### `decode_event_with_abi(raw_log, abi_fragment)`
+All execute-mode delivery is routed through Convoy. There is NO direct
+httpx delivery path in the current codebase. Direct httpx fast-path
+delivery is PLANNED but NOT implemented.
 
-Given a raw Goldsky log and a JSON ABI fragment array:
+```
+  EventProcessor
+       |
+       v
+  dispatch_event()             Build WebhookPayload per endpoint
+       |                       Deterministic idempotency key:
+       |                       sha256(chain_id:tx_hash:log_index:endpoint_id:event_type)
+       v
+  WebhookProvider.send()       Protocol interface
+       |
+       v
+  ConvoyProvider.send()        POST to Convoy API
+       |                       convoy_project_id = endpoint.convoy_project_id
+       |                       convoy_endpoint_id = endpoint.convoy_endpoint_id
+       v
+  Convoy Server                Handles:
+       |                       - Exponential backoff retries
+       |                       - HMAC signature signing (sole signer)
+       |                       - Delivery logging
+       |                       - Dead letter queue
+       v
+  Developer's API endpoint
+```
 
-1. Finds the first entry with `type == "event"` in the ABI fragment.
-2. Separates inputs into indexed (decoded from `topics[1:]`) and non-indexed (decoded from `data`).
-3. **Indexed parameters:** Parsed by type -- `address` extracts the last 40 hex chars, `uint`/`int` converts from hex, `bytes32` kept as hex, `bool` checks non-zero.
-4. **Non-indexed parameters:** Decoded via `eth_abi.decode()` using the type list. Bytes values are hex-encoded.
-5. Attaches metadata as `_`-prefixed fields: `_tx_hash`, `_block_number`, `_block_hash`, `_log_index`, `_address`, `_chain_id`.
+Convoy is the sole HMAC signer. The `webhook_secret` column was dropped
+from the endpoints table in migration 016. Secrets are managed entirely
+within Convoy.
 
-Returns a flat `dict[str, Any]` where keys are the ABI input names.
+**Circuit breaker** (`tripwire/webhook/convoy_client.py`):
 
-### Design
+A module-level state machine protects against Convoy being down:
 
-- Uses `eth-abi` for data decoding (lightweight, no web3.py dependency).
-- Reuses `_parse_topics` and `_to_int` from the existing ERC-3009 decoder.
-- Errors in data decoding are logged but do not crash the pipeline -- partially decoded events still propagate.
+```
+  closed (normal) ──[5 consecutive failures]──> open (reject fast)
+                                                    |
+                                              [30s recovery timeout]
+                                                    |
+  closed <──[probe succeeds]── half_open (allow one probe)
+                                    |
+                              [probe fails]──> open
+```
+
+| Parameter          | Value | Description                          |
+|--------------------|-------|--------------------------------------|
+| FAILURE_THRESHOLD  | 5     | Consecutive failures to trip circuit |
+| RECOVERY_TIMEOUT   | 30s   | Wait before allowing probe request   |
+| HALF_OPEN_TIMEOUT  | 10s   | Shorter timeout for probe requests   |
+
+All Convoy API calls (`create_application`, `create_endpoint`, `send_webhook`)
+check the circuit via `_guard_circuit()` and raise `ConvoyCircuitOpenError`
+when the circuit is open. Successful calls reset the circuit to closed.
+Circuit state is exposed via `get_circuit_state()` for diagnostics and
+tracked as a Prometheus gauge (`tripwire_convoy_circuit_state`).
+
+**Provider abstraction** (`tripwire/webhook/provider.py`):
+
+- `WebhookProvider` -- Protocol interface with `send()`, `create_app()`,
+  `create_endpoint()`
+- `ConvoyProvider` -- Production implementation backed by Convoy API
+- `LogOnlyProvider` -- Development fallback when `CONVOY_API_KEY` is not set
+
+**DLQ Handler** (`tripwire/webhook/dlq_handler.py`):
+
+Background poller that queries Convoy for failed deliveries per endpoint.
+Retries up to `dlq_max_retries` (default 3) via `force_resend()`. After
+exhaustion, marks the delivery as `dead_lettered` in the local
+`webhook_deliveries` table and fires an alert to `dlq_alert_webhook_url`.
+
+### 6.2 Notify Mode: Supabase Realtime
+
+```
+  EventProcessor
+       |
+       v
+  RealtimeNotifier.notify_batch()
+       |
+       v
+  INSERT into realtime_events table (bulk)
+       |
+       v
+  Supabase Realtime detects INSERT
+       |
+       v
+  WebSocket push to subscribed clients
+```
+
+Latency is sub-1ms from the application's perspective (local DB insert).
+Supabase Realtime handles the WebSocket fan-out.
+
+Subscription filtering: each notify-mode endpoint can have subscriptions
+with filters (chains, senders, recipients, min_amount, agent_class). If
+no subscriptions are defined, the endpoint receives all events
+(backwards-compatible).
 
 ---
 
-## 13. Filter Engine
+## 7. Event Bus (Redis Streams)
 
-The filter engine (`tripwire/ingestion/filter_engine.py`) evaluates trigger-specific predicates against decoded event fields. All filter rules use **AND logic** -- every rule must pass for the event to match.
+The event bus is an optional async processing layer that provides backpressure between Goldsky ingestion and trigger evaluation. When enabled, events are buffered in Redis Streams partitioned by topic0, allowing horizontal scaling of event processing without overwhelming the database or downstream services. When disabled (default), events flow synchronously through the processor.
 
-### Filter Rule Schema
+Feature-flagged via `EVENT_BUS_ENABLED` (default: `false`). When enabled,
+the `/ingest` endpoint publishes to Redis Streams instead of processing
+synchronously. When disabled, events are processed inline through
+`EventProcessor`.
 
-Each rule is a `TriggerFilter` with three fields:
+### 7.1 Architecture
 
-```python
-class TriggerFilter(BaseModel):
-    field: str      # decoded event field name (e.g. "value", "from", "amount0")
-    op: str = "eq"  # operator
-    value: Any      # target value
+```
+  /ingest/goldsky
+       |
+       v
+  EVENT_BUS_ENABLED?
+       |
+      YES -----> publish_batch() -----> Redis Streams
+       |                                     |
+       |                          +----------+----------+
+       |                          |          |          |
+       |                       worker-0  worker-1  worker-2
+       |                          |          |          |
+       |                          +----------+----------+
+       |                                     |
+       |                          EventProcessor.process_event()
+       |
+      NO ------> EventProcessor.process_batch() (synchronous)
 ```
 
-### Supported Operators
+### 7.2 Stream Topology
 
-| Operator | Description | Example |
-|----------|-------------|---------|
-| `eq` | Equals (case-insensitive for addresses, numeric-aware) | `{"field": "to", "op": "eq", "value": "0xabc..."}` |
-| `neq` | Not equals | `{"field": "from", "op": "neq", "value": "0x000..."}` |
-| `gt` | Greater than (numeric) | `{"field": "value", "op": "gt", "value": "1000000"}` |
-| `gte` | Greater than or equal | `{"field": "value", "op": "gte", "value": "1000000000"}` |
-| `lt` | Less than (numeric) | `{"field": "tick", "op": "lt", "value": "100"}` |
-| `lte` | Less than or equal | `{"field": "amount0", "op": "lte", "value": "0"}` |
-| `in` | Value in list | `{"field": "to", "op": "in", "value": ["0xabc...", "0xdef..."]}` |
-| `not_in` | Value not in list | `{"field": "from", "op": "not_in", "value": ["0x000..."]}` |
-| `between` | Value in range [lo, hi] inclusive | `{"field": "value", "op": "between", "value": ["1000000", "10000000"]}` |
-| `contains` | Substring match (case-insensitive) | `{"field": "name", "op": "contains", "value": "usdc"}` |
-| `regex` | Regular expression match | `{"field": "symbol", "op": "regex", "value": "^USD.*"}` |
+Streams are keyed by topic0 (the keccak256 hash of the event signature):
 
-### Normalization
+```
+  tripwire:events:0xabc123...   (one stream per unique event type)
+  tripwire:events:0xdef456...
+  tripwire:events:unknown        (fallback for invalid/capped topics)
+  tripwire:dlq                  (dead-letter stream)
+```
 
-- Ethereum addresses are lowercased before comparison.
-- String-encoded numbers and hex values (`0x...`) are converted to `Decimal` for numeric operations.
-- Missing fields cause immediate rejection (fail-closed).
+**Constants:**
+
+| Parameter          | Value   | Description                                 |
+|--------------------|---------|---------------------------------------------|
+| STREAM_PREFIX      | `tripwire:events:` | Key prefix for event streams     |
+| CONSUMER_GROUP     | `trigger-workers`  | Shared consumer group name       |
+| MAX_STREAM_LEN     | 100,000 | Max entries per stream (approximate trim)   |
+| MAX_STREAMS        | 500     | Global cap on distinct streams              |
+| BLOCK_MS           | 2,000   | XREADGROUP block timeout                    |
+| CLAIM_IDLE_MS      | 30,000  | XAUTOCLAIM idle threshold                   |
+
+### 7.3 Topic0 Validation
+
+Topics are validated with strict regex: `^0x[0-9a-f]{64}$` (lowercase hex
+only). Invalid topics are routed to `tripwire:events:unknown`.
+
+### 7.4 Worker Pool
+
+```
+  WorkerPool
+    |
+    +-- TriggerIndex (shared, refreshes every 10s with lock-guarded double-check)
+    |
+    +-- worker-0  (assigned streams via round-robin)
+    +-- worker-1
+    +-- worker-2  (default: EVENT_BUS_WORKERS=3)
+    |
+    +-- Stream discovery loop (every 30s, scans for new streams)
+```
+
+**TriggerIndex**: In-memory dict mapping `topic0 -> [Trigger]`. Rebuilt
+from the database every 10 seconds. Uses an asyncio lock with double-check
+to prevent concurrent refreshes.
+
+**TriggerWorker**: Each worker runs an XREADGROUP consumer loop:
+
+1. Consume batch from assigned streams
+2. Every 10 iterations, claim stale messages via XAUTOCLAIM
+3. Process each message through `EventProcessor.process_event()`
+4. Batch ACK all successful messages via Redis pipeline
+5. On failure: increment per-message failure counter
+6. After 5 failures: write to DLQ stream and ACK the source message
+
+**Worker restart**: Crashed workers are automatically restarted with
+exponential backoff (base 2s, max 120s). Restart counter resets after 300s
+of stability.
+
+### 7.5 Safety Mechanisms
+
+| Mechanism                  | Implementation                                     |
+|----------------------------|----------------------------------------------------|
+| DLQ stream + consumer      | `tripwire:dlq` -- permanently failed events after 5 retries; consumed by `RedisDLQConsumer` |
+| Process event timeout      | 30s timeout on `process_event()` via `asyncio.wait_for`; timeouts count as failures toward retry/DLQ |
+| Retry cap                  | Per-message failure count dict; entries pruned after 300s |
+| Stream cap (publish)       | `_known_stream_keys` set; excess routed to `unknown` |
+| Stream cap (discovery)     | WorkerPool caps at MAX_STREAMS during scan          |
+| Per-worker stream cap      | 100 streams max per worker                          |
+| Batch size limit           | /ingest rejects payloads > 1000 logs (HTTP 400)     |
+| Exponential backoff        | On consecutive consume errors: min(2^n, 60) seconds |
+| Batched ACK                | Pipeline ACK for success + DLQ'd messages           |
+| Graceful shutdown          | 30s timeout, then cancel                            |
+| Fallback on bus failure    | /ingest falls back to synchronous processing        |
+| NOGROUP recovery           | Invalidates `_known_groups` cache, re-creates group |
+| Poison message handling    | Malformed messages are ACKed immediately             |
+| Startup degradation        | If worker pool fails to start, app continues without it |
+
+### 7.6 Consumer Group Semantics
+
+- **At-least-once delivery**: Messages are ACKed only after successful
+  processing or DLQ write.
+- **XAUTOCLAIM**: Stale messages (idle > 30s) are reclaimed by other
+  workers every 10 iterations.
+- **Consumer group**: `trigger-workers` -- shared across all workers in
+  the pool. Created on-demand with MKSTREAM.
+
+### 7.7 DLQ Consumer
+
+`RedisDLQConsumer` (`tripwire/ingestion/dlq_consumer.py`) is a background
+task that reads permanently-failed events from the `tripwire:dlq` stream.
+Started only when `EVENT_BUS_ENABLED=true`.
+
+- Uses XREAD (not consumer groups) since it is a single consumer
+- Polls every 30s, reads up to 50 messages per cycle
+- For each message: logs the dead-lettered event, fires an alert webhook
+  to `DLQ_ALERT_WEBHOOK_URL` (if configured), increments a Prometheus
+  counter (`tripwire_redis_dlq_total`)
+- Trims the DLQ stream to 10,000 entries after processing 100+ messages
+- Tracks position via last-seen message ID (survives poll cycles but not
+  restarts -- will replay from beginning on restart)
 
 ---
 
-## 14. MCP Server
+## 8. Trigger Registry
 
-TripWire exposes a **Model Context Protocol** (MCP) server mounted at `/mcp` as a FastAPI sub-application. This is the primary interface for AI agents to interact with TripWire programmatically.
+The trigger registry allows AI agents to create triggers for any EVM event
+via MCP tools or the REST API, without deploying new infrastructure.
 
-### Protocol
+### 8.1 Data Model
 
-- **Transport:** HTTP POST (JSON-RPC 2.0)
-- **Protocol version:** `2024-11-05`
-- **Methods:** `initialize`, `tools/list`, `tools/call`
+Three tables, introduced in migration 013:
 
-### Authentication
+**trigger_templates** -- Pre-built templates for the Bazaar:
 
-Bearer token containing the agent's Ethereum address (`Authorization: Bearer 0x...`). The MCP server extracts and validates the address format. Full SIWE verification is planned for a future release.
+| Column              | Type        | Description                           |
+|---------------------|-------------|---------------------------------------|
+| id                  | UUID PK     | Auto-generated                        |
+| name                | TEXT        | Human-readable name                   |
+| slug                | TEXT UNIQUE | URL-safe identifier                   |
+| description         | TEXT        | Template description                  |
+| category            | TEXT        | e.g. 'defi', 'payments', 'nft'       |
+| event_signature     | TEXT        | Solidity signature (e.g. `Transfer(address,address,uint256)`) |
+| topic0              | TEXT        | Precomputed keccak256 hash (migration 017) |
+| abi                 | JSONB       | ABI fragment for decoding             |
+| default_chains      | JSONB       | Default chain IDs                     |
+| default_filters     | JSONB       | Default filter rules                  |
+| parameter_schema    | JSONB       | User-configurable parameters          |
+| webhook_event_type  | TEXT        | Event type string for webhooks        |
+| reputation_threshold| FLOAT       | Min reputation score to use           |
+| author_address      | TEXT        | Template author                       |
+| is_public           | BOOLEAN     | Visible in Bazaar                     |
+| install_count       | BIGINT      | Active installations (balanced counter) |
 
-### 8 Tools
+Seeded templates: `whale-transfer`, `dex-swap`, `nft-mint`,
+`erc3009-payment`, `ownership-transfer`.
 
-| Tool | Description | Required Params |
-|------|-------------|-----------------|
-| `register_middleware` | Create endpoint + triggers in one call | `url` |
-| `create_trigger` | Add a trigger to an existing endpoint | `endpoint_id`, `event_signature` |
-| `list_triggers` | List agent's triggers (with active_only filter) | -- |
-| `delete_trigger` | Soft-delete a trigger | `trigger_id` |
-| `list_templates` | Browse Bazaar templates (with category filter) | -- |
-| `activate_template` | Instantiate a template for an endpoint | `slug`, `endpoint_id` |
-| `get_trigger_status` | Check trigger health and event count | `trigger_id` |
-| `search_events` | Query recent events across agent's endpoints | -- |
+**triggers** -- Active trigger definitions:
 
-### Reputation Gating
+| Column              | Type        | Description                           |
+|---------------------|-------------|---------------------------------------|
+| id                  | UUID PK     | Auto-generated                        |
+| owner_address       | TEXT        | Wallet that created the trigger       |
+| endpoint_id         | TEXT FK     | Target endpoint for delivery          |
+| name                | TEXT        | Human-readable name                   |
+| event_signature     | TEXT        | Solidity event signature              |
+| topic0              | TEXT        | Precomputed keccak256 hash (migration 017) |
+| abi                 | JSONB       | ABI fragment for decoding             |
+| contract_address    | TEXT        | Optional: specific contract to watch  |
+| chain_ids           | JSONB       | Chain IDs to monitor (GIN indexed)    |
+| filter_rules        | JSONB       | JMESPath filter predicates            |
+| webhook_event_type  | TEXT        | Event type string for webhooks        |
+| reputation_threshold| FLOAT       | Min reputation score                  |
+| batch_id            | UUID        | Groups triggers created together      |
+| active              | BOOLEAN     | Soft-delete flag                      |
 
-Each tool definition has a `min_reputation` threshold (default 0.0). When a tool requires reputation > 0, the server resolves the agent's ERC-8004 identity and checks `reputation_score >= min_reputation` before execution. Agents below the threshold receive a `-32001 REPUTATION_TOO_LOW` JSON-RPC error.
+**trigger_instances** -- Template installations (M2M between templates and endpoints):
 
-### Audit Logging
+| Column              | Type        | Description                           |
+|---------------------|-------------|---------------------------------------|
+| id                  | UUID PK     | Auto-generated                        |
+| template_id         | UUID FK     | Source template                       |
+| owner_address       | TEXT        | Installing agent                      |
+| endpoint_id         | TEXT FK     | Target endpoint                       |
+| contract_address    | TEXT        | Optional override                     |
+| chain_ids           | JSONB       | Chain override                        |
+| parameters          | JSONB       | User-supplied params                  |
+| resolved_filters    | JSONB       | Computed filters after param merge    |
+| active              | BOOLEAN     | Active flag                           |
 
-Every `tools/call` invocation is recorded via `AuditLogger` with: action (`mcp.tools.<tool_name>`), actor (agent address), arguments, success/failure, and client IP. Audit writes are fire-and-forget to avoid blocking the response.
+Unique partial index: one active instance per (template_id, owner_address).
+The `install_count` on `trigger_templates` is maintained by a balanced
+INSERT/UPDATE/DELETE trigger function (migration 015).
 
-### Ownership Enforcement
+### 8.2 Lookup Path
 
-All tool handlers verify that the authenticated agent owns the resources being accessed:
-- `create_trigger`, `activate_template`: endpoint `owner_address` must match agent.
-- `delete_trigger`, `get_trigger_status`: trigger `owner_address` must match agent.
-- `search_events`: only returns events for the agent's own endpoints.
+```
+  topic0 from raw log
+       |
+       v
+  TriggerRepository.find_by_topic(topic0)
+       |  Queries: SELECT * FROM triggers WHERE topic0 = $1 AND active = true
+       |  Cached with 30s TTL (module-level dict)
+       v
+  Filter locally by chain_id and contract_address
+       |
+       v
+  [matched triggers]
+```
+
+The TriggerIndex (used by event bus workers) maintains an in-memory dict
+rebuilt from the database every 10 seconds. Uses the precomputed `topic0`
+column (keccak256 hash), added in migration 017.
+
+### 8.3 Generic ABI Decoder
+
+`decode_event_with_abi()` in `tripwire/ingestion/generic_decoder.py`:
+
+- Accepts any ABI event fragment
+- Decodes indexed params from topics[1:] (address, uint, bytes32, bool)
+- Decodes non-indexed params from data via `eth_abi.decode()`
+- Returns flat dict of `field_name -> value` plus `_`-prefixed metadata
+
+### 8.4 JMESPath Filter Engine
+
+`evaluate_filters()` in `tripwire/ingestion/filter_engine.py`:
+
+All filters use AND logic. Supported operators:
+
+| Operator  | Description                                    |
+|-----------|------------------------------------------------|
+| eq        | Equality (case-insensitive for addresses)      |
+| neq       | Not equal                                      |
+| gt/gte    | Greater than / greater-or-equal (numeric)      |
+| lt/lte    | Less than / less-or-equal (numeric)            |
+| in        | Value in list                                  |
+| not_in    | Value not in list                              |
+| between   | Value between [lo, hi] inclusive               |
+| contains  | Substring match (case-insensitive)             |
+| regex     | Regular expression match                       |
+| jmespath  | Full JMESPath expression (must eval to truthy) |
+
+Field paths support JMESPath syntax (e.g. `args.recipient`). Hex values
+are auto-converted to Decimal for numeric comparisons.
 
 ---
 
-## 15. The `register_middleware` Flow
+## 9. Database Schema
 
-This is the key onboarding flow for AI agents. A single MCP tool call sets up the full middleware pipeline.
+All tables live in Supabase-managed PostgreSQL. Row Level Security is
+enabled on `endpoints`, `subscriptions`, `events`, and `webhook_deliveries`
+(migration 011) using the session variable `app.current_wallet`.
+
+### 9.1 Core Tables
 
 ```
-Agent                          MCP Server                      Supabase
-  |                                |                              |
-  |-- tools/call: register_middleware -->                          |
-  |   {url, mode, chains,         |                              |
-  |    template_slugs,             |                              |
-  |    custom_triggers}            |                              |
-  |                                |-- INSERT endpoint ---------->|
-  |                                |                              |
-  |                                |-- For each template_slug:    |
-  |                                |   GET template by slug ----->|
-  |                                |   INSERT trigger ----------->|
-  |                                |                              |
-  |                                |-- For each custom_trigger:   |
-  |                                |   INSERT trigger ----------->|
-  |                                |                              |
-  |<-- {endpoint_id,              |                              |
-  |     webhook_secret,            |                              |
-  |     trigger_ids, mode, url}    |                              |
+  +------------------+       +------------------+       +------------------+
+  |   endpoints      |       |  subscriptions   |       |  events          |
+  +------------------+       +------------------+       +------------------+
+  | id          PK   |<------| endpoint_id  FK  |       | id          PK   |
+  | url              |       | filters    JSONB |       | type             |
+  | mode             |       | active           |       | data       JSONB |
+  | chains     JSONB |       | created_at       |       | chain_id         |
+  | recipient        |       +------------------+       | tx_hash          |
+  | owner_address    |                                  | block_number     |
+  | policies   JSONB |       +------------------+       | block_hash       |
+  | active           |       | event_endpoints  |       | log_index        |
+  | convoy_project_id|       +------------------+       | from_address     |
+  | convoy_endpoint_id|      | event_id     FK  |------>| to_address       |
+  | registration_tx  |       | endpoint_id  FK  |------>| amount           |
+  | registration_chain|      | created_at       |       | authorizer       |
+  | created_at       |       +------------------+       | nonce            |
+  | updated_at       |              (M2M join)          | token            |
+  +--------+---------+                                  | status           |
+           |                                            | finality_depth   |
+           |        +------------------+                | identity_data    |
+           |        | webhook_deliveries|               | endpoint_id (legacy)|
+           |        +------------------+                | confirmed_at     |
+           +------->| endpoint_id  FK  |                | created_at       |
+                    | event_id     FK  |                +------------------+
+                    | provider_msg_id  |
+                    | status           |
+                    | created_at       |
+                    +------------------+
 ```
 
-### Steps
+### 9.2 endpoints
 
-1. **Endpoint creation:** A new endpoint row is inserted with a nanoid, the agent's webhook URL, delivery mode, chain IDs, recipient address (defaults to agent address), and endpoint policies. A unique webhook secret (`secrets.token_hex(32)`) is generated.
+| Column              | Type        | Notes                                  |
+|---------------------|-------------|----------------------------------------|
+| id                  | TEXT PK     |                                        |
+| url                 | TEXT        | Webhook target URL                     |
+| mode                | TEXT        | 'notify' or 'execute'                  |
+| chains              | JSONB       | Array of chain IDs to monitor          |
+| recipient           | TEXT        | Watched recipient address              |
+| owner_address       | TEXT        | Wallet that registered (migration 010) |
+| policies            | JSONB       | EndpointPolicies object                |
+| active              | BOOLEAN     | Soft-delete flag                       |
+| convoy_project_id   | TEXT        | Convoy project ID (migration 008)      |
+| convoy_endpoint_id  | TEXT        | Convoy endpoint ID (migration 008)     |
+| registration_tx_hash| TEXT        | x402 payment tx (migration 010)        |
+| registration_chain_id| INTEGER   | Payment chain (migration 010)          |
+| created_at          | TIMESTAMPTZ |                                        |
+| updated_at          | TIMESTAMPTZ |                                        |
 
-2. **Template triggers:** For each `template_slug`, the server looks up the template by slug, then creates a trigger row inheriting the template's `event_signature`, `abi`, `default_filters`, `webhook_event_type`, and `reputation_threshold`. Chain IDs come from the request or fall back to the template's defaults.
+Key indexes: `recipient`, `owner_address`, `(recipient) WHERE active`,
+`(active) WHERE active`, `mode`.
 
-3. **Custom triggers:** For each entry in `custom_triggers`, a trigger row is created with the provided `event_signature`, optional `abi`, `contract_address`, `chain_ids`, `filter_rules`, and `webhook_event_type`.
+Dropped columns: `api_key_hash` (migration 010), `webhook_secret`
+(migration 016).
 
-4. **Response:** Returns `endpoint_id`, `webhook_secret` (one-time), all `trigger_ids`, `mode`, and `url`. The middleware is now live -- incoming events matching these triggers will be decoded, filtered, and dispatched to the agent's URL.
+### 9.3 events
 
-### Example
+| Column              | Type        | Notes                                  |
+|---------------------|-------------|----------------------------------------|
+| id                  | TEXT PK     |                                        |
+| type                | TEXT        | e.g. 'payment.confirmed' (migration 002)|
+| data                | JSONB       | Full event payload (migration 002)     |
+| chain_id            | INTEGER     |                                        |
+| tx_hash             | TEXT        |                                        |
+| block_number        | BIGINT      | Nullable (migration 002)               |
+| block_hash          | TEXT        | Nullable                               |
+| log_index           | INTEGER     | Nullable                               |
+| from_address        | TEXT        | Nullable                               |
+| to_address          | TEXT        | Nullable                               |
+| amount              | TEXT        | String for USDC 6-decimal precision    |
+| authorizer          | TEXT        | Nullable                               |
+| nonce               | TEXT        | Nullable                               |
+| token               | TEXT        | Nullable                               |
+| status              | TEXT        | 'pre_confirmed', 'pending', 'confirmed', 'finalized', 'reorged' |
+| finality_depth      | INTEGER     | Current confirmation count             |
+| identity_data       | JSONB       | Resolved AgentIdentity                 |
+| endpoint_id         | TEXT        | Legacy single-endpoint FK              |
+| confirmed_at        | TIMESTAMPTZ |                                        |
+| created_at          | TIMESTAMPTZ |                                        |
 
-An agent that wants to monitor whale USDC transfers and Uniswap swaps on Base:
+Key indexes: `(chain_id, tx_hash)`, `to_address`, `from_address`,
+`authorizer`, `(chain_id, nonce, authorizer)`, `status`,
+`(chain_id, block_number)`, `type`, `(endpoint_id, created_at DESC)`.
 
-```json
-{
-  "url": "https://my-agent.example.com/webhook",
-  "chains": [8453],
-  "template_slugs": ["whale-transfer", "dex-swap"],
-  "custom_triggers": [
-    {
-      "event_signature": "OwnershipTransferred(address,address)",
-      "name": "Ownership Watch",
-      "contract_address": "0x1234...",
-      "filter_rules": [{"field": "newOwner", "op": "neq", "value": "0x0000000000000000000000000000000000000000"}]
-    }
-  ]
-}
-```
+### 9.4 event_endpoints (M2M join table, migration 014)
+
+| Column      | Type        | Notes                                       |
+|-------------|-------------|---------------------------------------------|
+| event_id    | TEXT FK PK  | References events(id)                       |
+| endpoint_id | TEXT FK PK  | References endpoints(id)                    |
+| created_at  | TIMESTAMPTZ |                                             |
+
+Resolves the issue where `events.endpoint_id` only recorded the first
+matched endpoint. Backfilled from existing data on creation.
+
+### 9.5 nonces (deduplication)
+
+| Column      | Type        | Notes                                       |
+|-------------|-------------|---------------------------------------------|
+| chain_id    | INTEGER     |                                             |
+| nonce       | TEXT        |                                             |
+| authorizer  | TEXT        |                                             |
+| event_id    | TEXT        | Links to originating event (migration 018)  |
+| source      | TEXT        | `"facilitator"` or `"goldsky"` (migration 020) |
+| reorged_at  | TIMESTAMPTZ | Set when reorg invalidates (migration 018)  |
+| created_at  | TIMESTAMPTZ |                                             |
+
+UNIQUE constraint: `(chain_id, nonce, authorizer)`.
+
+Reorg-aware dedup (migration 018): The `record_nonce_with_reorg()` PL/pgSQL
+function checks for reorged nonces and allows reuse. Also checks the
+`nonces_archive` table for archived entries.
+
+Correlation-aware dedup (migration 020): The `record_nonce_or_correlate()`
+function returns `(is_new, existing_event_id, existing_source)` on conflict.
+Uses `SELECT FOR UPDATE` to lock the row, preventing TOCTOU races. This
+enables the Goldsky path to detect that the facilitator already claimed a
+nonce and promote the pre_confirmed event to confirmed.
+
+### 9.6 nonces_archive (migration 019)
+
+| Column      | Type        | Notes                                       |
+|-------------|-------------|---------------------------------------------|
+| chain_id    | INTEGER     |                                             |
+| nonce       | TEXT        |                                             |
+| authorizer  | TEXT        |                                             |
+| event_id    | TEXT        |                                             |
+| reorged_at  | TIMESTAMPTZ |                                             |
+| created_at  | TIMESTAMPTZ |                                             |
+| archived_at | TIMESTAMPTZ | When the nonce was moved to archive         |
+
+The `archive_old_nonces()` PL/pgSQL function moves confirmed nonces older
+than 30 days (default) in batches of 5000, using `FOR UPDATE SKIP LOCKED`
+for concurrency safety. The `NonceArchiver` background task runs this daily.
+
+### 9.7 webhook_deliveries
+
+| Column              | Type        | Notes                                  |
+|---------------------|-------------|----------------------------------------|
+| id                  | TEXT PK     |                                        |
+| endpoint_id         | TEXT FK     |                                        |
+| event_id            | TEXT FK     |                                        |
+| provider_message_id | TEXT        | Convoy message/delivery ID             |
+| status              | TEXT        | 'pending', 'sent', 'failed', 'dead_lettered' |
+| dlq_retry_count     | INTEGER     | Persistent DLQ retry count (migration 021, default 0) |
+| created_at          | TIMESTAMPTZ |                                        |
+
+Key indexes: `(endpoint_id, status, created_at DESC)`,
+`(event_id, created_at DESC)`, `provider_message_id WHERE NOT NULL`.
+
+### 9.8 subscriptions
+
+| Column      | Type        | Notes                                       |
+|-------------|-------------|---------------------------------------------|
+| id          | TEXT PK     |                                             |
+| endpoint_id | TEXT FK     |                                             |
+| filters     | JSONB       | SubscriptionFilter (chains, senders, etc.)  |
+| active      | BOOLEAN     |                                             |
+| created_at  | TIMESTAMPTZ |                                             |
+
+### 9.9 audit_log (migration 012)
+
+| Column        | Type        | Notes                                     |
+|---------------|-------------|-------------------------------------------|
+| id            | UUID PK     | Auto-generated                            |
+| action        | TEXT        | e.g. 'mcp.tools.create_trigger'           |
+| actor         | TEXT        | Wallet address or 'anonymous'             |
+| resource_type | TEXT        |                                           |
+| resource_id   | TEXT        |                                           |
+| details       | JSONB       | Tool arguments, auth tier, etc.           |
+| ip_address    | TEXT        |                                           |
+| created_at    | TIMESTAMPTZ |                                           |
+
+### 9.10 realtime_events
+
+Used by Supabase Realtime for notify-mode delivery. Rows are inserted by
+`RealtimeNotifier` and automatically pushed to WebSocket subscribers.
+
+| Column      | Type        | Notes                                       |
+|-------------|-------------|---------------------------------------------|
+| id          | TEXT PK     |                                             |
+| endpoint_id | TEXT        |                                             |
+| type        | TEXT        | Event type string                           |
+| data        | JSONB       | Transfer + finality + identity              |
+| chain_id    | INTEGER     |                                             |
+| recipient   | TEXT        |                                             |
+| created_at  | TIMESTAMPTZ |                                             |
+
+### 9.11 Trigger Registry Tables
+
+See Section 8.1 for `trigger_templates`, `triggers`, and
+`trigger_instances`.
 
 ---
 
-## 16. x402 Bazaar and Service Discovery
+## 10. MCP Server
 
-TripWire publishes a machine-readable service manifest at `/.well-known/x402-manifest.json` for agent discovery.
+Mounted at `/mcp` as a FastAPI sub-application. Implements JSON-RPC 2.0
+per the Model Context Protocol specification (version `2024-11-05`).
 
-### Manifest Structure
+### 10.1 Authentication Tiers
 
-```json
-{
-  "@context": "https://x402.org/context",
-  "name": "TripWire",
-  "description": "Programmable onchain event triggers for AI agents",
-  "version": "1.0.0",
-  "identity": {
-    "protocol": "ERC-8004",
-    "registry": "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432"
-  },
-  "mcp": {
-    "endpoint": "/mcp",
-    "transport": "streamable-http",
-    "tools": ["register_middleware", "create_trigger", "list_triggers", ...]
-  },
-  "services": [
-    {"name": "register_middleware", "price": "$0.003", "network": "eip155:8453"},
-    {"name": "create_trigger", "price": "$0.003", "network": "eip155:8453"},
-    {"name": "activate_template", "price": "$0.001", "network": "eip155:8453"}
-  ],
-  "supported_chains": [
-    {"chain_id": 8453, "name": "Base"},
-    {"chain_id": 1, "name": "Ethereum"},
-    {"chain_id": 42161, "name": "Arbitrum"}
-  ],
-  "trigger_templates": "/mcp (use list_templates tool)"
-}
+```
+  PUBLIC   No auth required (initialize, tools/list)
+  SIWX     Wallet signature via SIWE (free tools)
+  X402     Per-call x402 micropayment (paid tools, settled after execution)
 ```
 
-### Discovery Flow
+Per-address rate limiting: 60 calls/minute via Redis counter. Fails open
+if Redis is unavailable.
 
-1. An agent (or agent framework) fetches `/.well-known/x402-manifest.json`.
-2. The manifest advertises MCP endpoint, available tools, pricing, and supported chains.
-3. The agent calls `POST /mcp` with `initialize` to start an MCP session.
-4. The agent calls `tools/list` to discover available tools and their input schemas.
-5. The agent calls `register_middleware` (or individual tools) to set up triggers.
+Reputation gating: Tools with `min_reputation > 0` require the caller's
+ERC-8004 reputation score to meet the threshold.
 
-This follows the emerging x402 service discovery pattern where AI agents can autonomously discover, evaluate, and pay for infrastructure services.
+### 10.2 Tool Registry
+
+| Tool               | Auth Tier | Price   | Description                           |
+|--------------------|-----------|---------|---------------------------------------|
+| register_middleware| X402      | $0.003  | Create endpoint + triggers in one call|
+| create_trigger     | X402      | $0.003  | Create custom trigger for endpoint    |
+| list_triggers      | SIWX      | free    | List caller's active triggers         |
+| delete_trigger     | SIWX      | free    | Soft-delete a trigger                 |
+| list_templates     | SIWX      | free    | Browse Bazaar templates               |
+| activate_template  | X402      | $0.001  | Instantiate template for endpoint     |
+| get_trigger_status | SIWX      | free    | Check trigger health + event count    |
+| search_events      | SIWX      | free    | Query recent events                   |
+
+### 10.3 x402 Payment Flow
+
+For X402-tier tools:
+
+1. Client includes `X-PAYMENT` header with x402 payment proof
+2. `build_auth_context()` validates the payment proof and deduplicates
+   via Redis key `x402:payment:{hash}:{tool_name}`
+3. Tool executes
+4. `settle_payment()` settles the x402 payment on success
+5. If settlement fails, the dedup key is cleaned up so the payer can
+   retry, and the tool result is withheld
+
+### 10.4 x402 Bazaar
+
+The `/.well-known/x402-manifest.json` endpoint exposes the service
+discovery manifest for agent marketplaces.
 
 ---
 
-## 17. Full System Flow
+## 11. Finality Poller
 
-```
-                                  ┌──────────────────────────────────┐
-                                  │         AI Agent                 │
-                                  │  (Claude, GPT, custom agent)     │
-                                  └──────────┬───────────────────────┘
-                                             │
-                          ┌──────────────────┼──────────────────┐
-                          │  1. Discover      │  5. Receive      │
-                          │  /.well-known/    │  webhooks        │
-                          │  x402-manifest    │                  │
-                          ▼                  │                  ▼
-              ┌───────────────────┐          │     ┌──────────────────┐
-              │  MCP Server       │          │     │  Agent's API     │
-              │  POST /mcp        │          │     │  (webhook URL)   │
-              │                   │          │     └──────────────────┘
-              │  Tools:           │          │              ▲
-              │  register_middleware          │              │
-              │  create_trigger   │          │     ┌────────┴─────────┐
-              │  list_templates   │          │     │  Convoy          │
-              │  activate_template│          │     │  (retry + DLQ)   │
-              │  ...              │          │     └────────┬─────────┘
-              └───────┬───────────┘          │              │
-                      │ 2. Create            │     6. Dispatch
-                      │ endpoint + triggers   │              │
-                      ▼                      │     ┌────────┴─────────┐
-              ┌───────────────────┐          │     │  EventProcessor  │
-              │  Supabase         │          │     │                  │
-              │                   │◄─────────┘     │  detect → decode │
-              │  endpoints        │                │  → filter → dedup│
-              │  triggers         │◄───────────────│  → identity      │
-              │  trigger_templates│  3. Query       │  → dispatch      │
-              │  events           │  triggers       └────────┬─────────┘
-              │  nonces           │                          │
-              └───────────────────┘                 4. Ingest│
-                                                            │
-                                              ┌─────────────┴──────────┐
-                                              │                        │
-                                    ┌─────────┴───────┐    ┌───────────┴──────┐
-                                    │ Goldsky Turbo    │    │ x402 Facilitator │
-                                    │ (2-4s latency)   │    │ (~100ms latency) │
-                                    └─────────┬───────┘    └───────────┬──────┘
-                                              │                        │
-                                    ┌─────────┴────────────────────────┴──────┐
-                                    │          EVM Chains                     │
-                                    │    Base / Ethereum / Arbitrum           │
-                                    └────────────────────────────────────────┘
-```
+Background task that promotes pending events to confirmed once they reach
+the required block depth. Spawns one asyncio task per chain. All RPC calls
+go through Goldsky Edge managed endpoints (see Section 3.4).
 
-### End-to-End Sequence
+### 11.1 Per-Chain Configuration
 
-1. **Discover:** Agent fetches `/.well-known/x402-manifest.json` to find the MCP endpoint and available tools.
-2. **Register:** Agent calls `register_middleware` via MCP, creating an endpoint and triggers (from templates or custom definitions). Receives `endpoint_id`, `webhook_secret`, and `trigger_ids`.
-3. **Index:** Goldsky Turbo indexes EVM chains and delivers raw logs to `POST /api/v1/ingest`. The x402 facilitator delivers pre-confirmed payments to `POST /api/v1/ingest/facilitator`.
-4. **Process:** `EventProcessor._detect_event_type` checks topic0 against hardcoded signatures, then falls back to the trigger registry. Matched triggers route to `_process_dynamic_event`; ERC-3009 events route to `_process_erc3009_event`.
-5. **Decode + Filter:** Dynamic events are decoded with the trigger's ABI via `decode_event_with_abi()`, then filtered with `evaluate_filters()`. ERC-3009 events use the dedicated decoder.
-6. **Dispatch:** Approved events are sent to the agent's webhook URL via Convoy (with retries, HMAC signing, and DLQ) or pushed via Supabase Realtime for Notify-mode endpoints.
+| Chain    | Chain ID | Finality Depth | Poll Interval | Block Time |
+|----------|----------|----------------|---------------|------------|
+| Arbitrum | 42161    | 1 confirmation | 5s            | ~250ms     |
+| Base     | 8453     | 3 confirmations| 10s           | ~2s        |
+| Ethereum | 1        | 12 confirmations| 30s          | ~12s       |
+
+### 11.2 Poll Cycle
+
+The poller queries events with status IN (`pending`, `confirmed`) that have
+`block_number > 0`. This excludes `pre_confirmed` events (which have
+`block_number=0` since they have no onchain tx yet) and picks up `confirmed`
+events that need finalization promotion.
+
+For each event on a given chain:
+
+1. Fetch current block number via `eth_blockNumber` JSON-RPC (once per cycle)
+2. Fetch canonical block hashes for unique block numbers (batch, for reorg detection)
+3. Compare stored `block_hash` vs canonical hash:
+   - **Mismatch**: reorg detected -- mark event `reorged`, invalidate nonce,
+     dispatch `payment.reorged` webhook to all linked endpoints
+   - **Match**: compute `confirmations = current_block - event.block_number`
+4. Two finality transitions:
+   - **pending → confirmed**: first finality threshold crossed; dispatch
+     `payment.confirmed` webhook
+   - **confirmed → finalized**: full finality reached; dispatch
+     `payment.finalized` webhook
+5. Otherwise: update `finality_depth` column (for dashboard visibility)
+
+### 11.3 Reorg Handling
+
+When a reorg is detected:
+
+1. Event status set to `reorged`
+2. Nonce invalidated via `nonce_repo.invalidate_by_event_id()` so it can
+   be reused when the event re-appears
+3. `payment.reorged` webhook dispatched to all linked endpoints via the
+   `event_endpoints` join table
+
+---
+
+## 12. Latency Map
+
+Estimated end-to-end latencies from event emission to webhook delivery:
+
+### 12.1 x402 Facilitator Fast Path
+
+| Stage              | Latency     | Notes                             |
+|--------------------|-------------|-----------------------------------|
+| Facilitator notify | ~10ms       | HTTP POST to TripWire             |
+| Dedup              | ~2-5ms      | Supabase nonce insert             |
+| Identity           | ~5-30ms     | ERC-8004 lookup (or cache)        |
+| Policy eval        | <1ms        | In-memory evaluation              |
+| Convoy dispatch    | ~20-80ms    | Convoy API call                   |
+| **Total**          | **~40-125ms**|                                  |
+
+### 12.2 Goldsky Reliable Path (ERC-3009)
+
+| Stage              | Latency     | Notes                             |
+|--------------------|-------------|-----------------------------------|
+| Block to Goldsky   | ~1-4s       | Goldsky Turbo indexing             |
+| Decode             | ~1ms        | In-process ABI decode             |
+| Dedup              | ~2-5ms      | Supabase nonce insert             |
+| Finality + Identity| ~10-50ms    | Parallel: RPC call + ERC-8004     |
+| Endpoint match     | ~0-2ms      | 30s TTL cache                     |
+| Policy eval        | <1ms        | In-memory                         |
+| Convoy dispatch    | ~20-80ms    | Convoy API call                   |
+| **Total**          | **~1.0-4.2s**| Dominated by Goldsky indexing    |
+
+### 12.3 Dynamic Trigger Path
+
+| Stage              | Latency     | Notes                             |
+|--------------------|-------------|-----------------------------------|
+| Block to Goldsky   | ~1-4s       | Goldsky Turbo indexing             |
+| ABI decode         | ~1-5ms      | Generic eth-abi decode            |
+| Filter evaluation  | ~1-2ms      | JMESPath engine                   |
+| Dedup              | ~2-5ms      | Supabase nonce insert             |
+| Identity           | ~5-30ms     | ERC-8004 lookup (or cache)        |
+| Endpoint fetch     | ~5-10ms     | Single endpoint by ID             |
+| Convoy dispatch    | ~20-80ms    | Convoy API call                   |
+| **Total**          | **~1.0-4.2s**| Dominated by Goldsky indexing    |
+
+### 12.4 Per-Chain Finality Promotion
+
+Additional time from first delivery (pending) to confirmed webhook:
+
+| Chain    | Finality Depth | Typical Time to Finality        |
+|----------|----------------|---------------------------------|
+| Arbitrum | 1 block        | ~250ms + 5s poll interval       |
+| Base     | 3 blocks       | ~6s + 10s poll interval         |
+| Ethereum | 12 blocks      | ~144s + 30s poll interval       |
+
+---
+
+## 13. Known Limitations
+
+### PENDING Issues
+
+**P1. Finality poller has no distributed lock.**
+Multiple TripWire instances will each run their own finality poller,
+causing duplicate confirmation webhooks for the same event. Mitigation:
+run a single instance, or add a Redis/Postgres advisory lock.
+
+**P2. Stranded pre_confirmed events.**
+If the facilitator fast path creates a `pre_confirmed` event but the
+transaction never lands onchain, the event stays in `pre_confirmed` status
+indefinitely. The unified lifecycle (migration 020) ensures that when
+Goldsky delivers the real tx, the event is promoted. However, if the tx
+is NEVER mined (e.g. authorization expired), the event still has no
+cleanup mechanism. Needs a TTL-based sweeper for pre_confirmed events
+older than a configurable threshold.
+
+**P3. In-process caches are not shared across instances.**
+The endpoint cache (30s TTL in `processor.py`), trigger topic cache
+(30s TTL in `triggers.py`), and the TriggerIndex (10s refresh in
+`trigger_worker.py`) are all in-process dicts. Multiple instances will
+have independent caches with potential staleness after writes.
+
+**P4. No per-wallet trigger cap.**
+A single wallet can create an unlimited number of triggers. Combined
+with the 500-stream cap, this could starve other users. Needs a
+per-owner-address limit enforced at the API/MCP layer.
+
+**P5. Identity cache is in-process only.**
+The ERC-8004 identity resolver caches results in-process with a
+configurable TTL (default 300s). In a multi-instance deployment, each
+instance makes redundant RPC calls. A shared Redis cache would reduce
+RPC load.
+
+### RESOLVED Issues
+
+| Issue | Description                                     | Resolution           |
+|-------|-------------------------------------------------|----------------------|
+| #7    | events.endpoint_id only records first match     | Migration 014 (event_endpoints join table) |
+| #8    | DB breach exposes webhook signing secrets        | Migration 016 (dropped webhook_secret; Convoy is sole HMAC signer) |
+| #9    | topic0 key mismatch (human sig vs keccak hash)  | Migration 017 (precomputed topic0 column) |
+| #14   | Gameable install_count on templates              | Migration 015 (balanced trigger + unique partial index) |
+| #15   | nonces table grows forever                       | Migration 019 (nonces_archive + daily archival task) |
+| #2    | Reorged nonces unrecoverable                     | Migration 018 (reorged_at column + reorg-aware dedup function) |
+| #16   | Facilitator-claimed nonce silently drops Goldsky event | Migration 020 (unified event lifecycle: `record_nonce_or_correlate` with SELECT FOR UPDATE + event promotion) |
+| #17   | Nonce TOCTOU race between facilitator and Goldsky | Migration 020 (`SELECT FOR UPDATE` in `record_nonce_or_correlate`) |
+| #18   | Redis DLQ stream never consumed                  | `RedisDLQConsumer` in `tripwire/ingestion/dlq_consumer.py` |
+| #19   | DLQ retry counts lost on restart                 | Migration 021 (`dlq_retry_count` column on webhook_deliveries) |
+
+---
+
+## 14. Configuration Reference
+
+All settings are loaded via `pydantic-settings` from environment variables
+or `.env` file. See `tripwire/config/settings.py`.
+
+| Variable                      | Default                | Description                          |
+|-------------------------------|------------------------|--------------------------------------|
+| APP_ENV                       | production             | development / production             |
+| APP_PORT                      | 3402                   | HTTP listen port                     |
+| APP_BASE_URL                  | http://localhost:3402  | Public base URL                      |
+| LOG_LEVEL                     | info                   | Logging level                        |
+| SUPABASE_URL                  | (required in prod)     | Supabase project URL                 |
+| SUPABASE_SERVICE_ROLE_KEY     | (required in prod)     | Supabase service role key            |
+| CONVOY_API_KEY                | (required in prod)     | Convoy API key                       |
+| CONVOY_URL                    | http://localhost:5005  | Convoy server URL                    |
+| GOLDSKY_WEBHOOK_SECRET        |                        | Validates inbound Goldsky Turbo webhooks |
+| GOLDSKY_EDGE_API_KEY          |                        | Goldsky Edge RPC auth (Bearer token) |
+| FACILITATOR_WEBHOOK_SECRET    |                        | Validates x402 facilitator webhooks  |
+| BASE_RPC_URL                  |                        | Base chain RPC (Goldsky Edge endpoint) |
+| ETHEREUM_RPC_URL              |                        | Ethereum RPC (Goldsky Edge endpoint) |
+| ARBITRUM_RPC_URL              |                        | Arbitrum RPC (Goldsky Edge endpoint) |
+| EVENT_BUS_ENABLED             | false                  | Enable Redis Streams event bus       |
+| EVENT_BUS_WORKERS             | 3                      | Number of trigger workers            |
+| REDIS_URL                     | redis://localhost:6379 | Redis connection URL                 |
+| FINALITY_POLLER_ENABLED       | true                   | Enable finality confirmation poller  |
+| FINALITY_POLL_INTERVAL_ARBITRUM| 5                     | Seconds between Arbitrum polls       |
+| FINALITY_POLL_INTERVAL_BASE   | 10                     | Seconds between Base polls           |
+| FINALITY_POLL_INTERVAL_ETHEREUM| 30                    | Seconds between Ethereum polls       |
+| DLQ_ENABLED                   | true                   | Enable Convoy DLQ handler            |
+| DLQ_POLL_INTERVAL_SECONDS     | 60                     | DLQ poll interval                    |
+| DLQ_MAX_RETRIES               | 3                      | Max Convoy retries before dead-letter|
+| DLQ_ALERT_WEBHOOK_URL         |                        | URL for DLQ alert webhooks (Redis + Convoy) |
+| IDENTITY_CACHE_TTL            | 300                    | ERC-8004 cache TTL (seconds)         |
+| TRIPWIRE_TREASURY_ADDRESS     | (required in prod)     | x402 payment recipient               |
+| X402_FACILITATOR_URL          | https://x402.org/facilitator | Facilitator endpoint          |
+| X402_REGISTRATION_PRICE       | $1.00                  | Endpoint registration price          |
+| X402_NETWORK                  | eip155:8453            | Payment network                      |
+| SIWE_DOMAIN                   | tripwire.dev           | SIWE domain for auth                 |
+| AUTH_TIMESTAMP_TOLERANCE_SECONDS| 300                  | SIWE timestamp tolerance             |
+| OTEL_ENABLED                  | false                  | Enable OpenTelemetry tracing         |
+| SENTRY_DSN                    |                        | Sentry error tracking DSN            |
+| METRICS_BEARER_TOKEN          |                        | Protect /metrics endpoint            |
+
+---
+
+## 15. Background Tasks
+
+The application lifespan starts and stops these background tasks:
+
+| Task             | Condition                        | Interval  | Description                    |
+|------------------|----------------------------------|-----------|--------------------------------|
+| FinalityPoller   | FINALITY_POLLER_ENABLED          | Per-chain | Promotes pending→confirmed→finalized |
+| WorkerPool       | EVENT_BUS_ENABLED                | Continuous| Redis Streams consumers        |
+| RedisDLQConsumer | EVENT_BUS_ENABLED                | 30s       | Consumes dead-lettered events from tripwire:dlq |
+| DLQHandler       | DLQ_ENABLED + CONVOY_API_KEY set | 60s       | Retries failed Convoy deliveries|
+| NonceArchiver    | Always                           | 24h       | Archives old nonces            |
+| Stream discovery | EVENT_BUS_ENABLED                | 30s       | Discovers new Redis streams    |
+
+Graceful shutdown order: WorkerPool -> RedisDLQConsumer -> FinalityPoller ->
+NonceArchiver -> DLQHandler -> RPC client close -> OTel flush.
+
+---
+
+## 16. Middleware Stack
+
+FastAPI/Starlette middleware wraps last-added as outermost. The execution
+order for an inbound request is:
+
+1. **PaymentMiddlewareASGI** (conditional) -- x402 payment gating on
+   `POST /api/v1/endpoints` when `TRIPWIRE_TREASURY_ADDRESS` is set
+2. **CORSMiddleware** -- Configurable allowed origins
+3. **SlowAPIMiddleware** -- Rate limiting via slowapi
+4. **RequestLoggingMiddleware** -- Structured request/response logging
+
+Global exception handlers: PostgrestAPIError (maps PG error codes to HTTP),
+httpx.ConnectError (503), httpx.TimeoutException (503), catch-all (500 +
+Sentry capture).
+
+---
+
+## 17. API Routes
+
+| Method | Path                              | Auth      | Description                  |
+|--------|-----------------------------------|-----------|------------------------------|
+| POST   | /api/v1/ingest/goldsky            | Goldsky   | Batch event ingestion        |
+| POST   | /api/v1/ingest/event              | Goldsky   | Single event ingestion       |
+| POST   | /api/v1/ingest/facilitator        | HMAC      | x402 facilitator fast path   |
+| POST   | /api/v1/endpoints                 | SIWE+x402 | Register endpoint            |
+| GET    | /api/v1/endpoints                 | SIWE      | List endpoints               |
+| POST   | /api/v1/subscriptions             | SIWE      | Create subscription          |
+| GET    | /api/v1/events                    | SIWE      | Query events                 |
+| GET    | /api/v1/deliveries                | SIWE      | Query webhook deliveries     |
+| GET    | /api/v1/stats                     | SIWE      | Dashboard statistics         |
+| POST   | /auth/verify                 | None      | SIWE signature verification  |
+| GET    | /auth/nonce                  | None      | SIWE nonce generation        |
+| POST   | /mcp                              | 3-tier    | MCP JSON-RPC endpoint        |
+| GET    | /.well-known/x402-manifest.json   | None      | x402 Bazaar manifest         |
+| GET    | /health                           | None      | Basic health check           |
+| GET    | /health/detailed                  | None      | Deep health with components  |
+| GET    | /ready                            | None      | Readiness probe              |
+| GET    | /metrics                          | Bearer    | Prometheus metrics           |

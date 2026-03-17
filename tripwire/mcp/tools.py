@@ -22,6 +22,7 @@ from tripwire.db.repositories.triggers import (
     TriggerTemplateRepository,
 )
 from tripwire.types.models import EndpointMode, EndpointPolicies
+from tripwire.utils.topic import compute_topic0
 
 logger = structlog.get_logger(__name__)
 
@@ -82,7 +83,6 @@ async def register_middleware(
         "recipient": recipient.lower(),
         "owner_address": ctx.agent_address.lower(),
         "policies": EndpointPolicies(**policies).model_dump(),
-        "webhook_secret": webhook_secret,
         "active": True,
         "created_at": now,
         "updated_at": now,
@@ -114,6 +114,7 @@ async def register_middleware(
             "endpoint_id": endpoint_id,
             "name": template.name,
             "event_signature": template.event_signature,
+            "topic0": compute_topic0(template.event_signature),
             "abi": template.abi,
             "contract_address": None,
             "chain_ids": chains or template.default_chains,
@@ -142,6 +143,7 @@ async def register_middleware(
             "endpoint_id": endpoint_id,
             "name": ct.get("name"),
             "event_signature": ct["event_signature"],
+            "topic0": compute_topic0(ct["event_signature"]),
             "abi": ct.get("abi", []),
             "contract_address": ct.get("contract_address"),
             "chain_ids": ct.get("chain_ids", chains),
@@ -196,6 +198,7 @@ async def create_trigger(
         "endpoint_id": endpoint_id,
         "name": params.get("name"),
         "event_signature": params["event_signature"],
+        "topic0": compute_topic0(params["event_signature"]),
         "abi": params.get("abi", []),
         "contract_address": params.get("contract_address"),
         "chain_ids": params.get("chain_ids", endpoint.chains),
@@ -353,6 +356,7 @@ async def activate_template(
         "endpoint_id": endpoint_id,
         "name": f"{template.name} (from template)",
         "event_signature": template.event_signature,
+        "topic0": compute_topic0(template.event_signature),
         "abi": template.abi,
         "contract_address": contract_address,
         "chain_ids": chain_ids,
@@ -459,15 +463,29 @@ async def search_events(
     if not endpoint_ids:
         return {"events": [], "count": 0}
 
-    # Build query
+    # Build query using event_endpoints join table (#7)
     limit = min(params.get("limit", 50), 100)
     status_filter = params.get("status")
     chain_id_filter = params.get("chain_id")
 
+    # Get event IDs linked to the agent's endpoints via join table
+    ee_result = (
+        supabase.table("event_endpoints")
+        .select("event_id")
+        .in_("endpoint_id", endpoint_ids)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    event_ids = list({row["event_id"] for row in ee_result.data})
+
+    if not event_ids:
+        return {"events": [], "count": 0}
+
     query = (
         supabase.table("events")
         .select("*")
-        .in_("endpoint_id", endpoint_ids)
+        .in_("id", event_ids)
         .order("created_at", desc=True)
         .limit(limit)
     )
@@ -483,7 +501,6 @@ async def search_events(
     for e in events_result.data:
         events.append({
             "id": e.get("id"),
-            "endpoint_id": e.get("endpoint_id"),
             "tx_hash": e.get("tx_hash"),
             "chain_id": e.get("chain_id"),
             "status": e.get("status"),

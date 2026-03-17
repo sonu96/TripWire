@@ -17,7 +17,7 @@
 │  │  initialize / tools/list         │  │  /.well-known/x402-manifest.json         │  │
 │  │  tools/call → 8 tools            │  │  Lists services, prices, MCP endpoint    │  │
 │  │                                  │  │                                          │  │
-│  │  Auth: Bearer <eth_address>      │  │  Agents discover TripWire, then call     │  │
+│  │  Auth: 3-tier (SIWE + x402)      │  │  Agents discover TripWire, then call     │  │
 │  │  Reputation gating per tool      │  │  MCP tools to register + configure       │  │
 │  │  Audit log every call            │  │                                          │  │
 │  └────────────────┬─────────────────┘  └──────────────────────────────────────────┘  │
@@ -104,22 +104,22 @@
 │                                                                                     │
 │  ┌───────────────────────┐  ┌───────────────────────┐  ┌─────────────────────────┐  │
 │  │  EXECUTE MODE         │  │  EXECUTE MODE         │  │  NOTIFY MODE            │  │
-│  │  (Reliable Path)      │  │  (Fast Path)          │  │                         │  │
-│  │                       │  │                       │  │  Supabase Realtime      │  │
-│  │  Convoy self-hosted   │  │  Direct httpx POST    │  │  WebSocket push         │  │
+│  │  (Convoy — active)    │  │  (Direct httpx)       │  │                         │  │
+│  │                       │  │  *** PLANNED ***       │  │  Supabase Realtime      │  │
+│  │  Convoy self-hosted   │  │  Not yet implemented  │  │  WebSocket push         │  │
 │  │  ┌─────────────────┐  │  │                       │  │                         │  │
-│  │  │ HMAC-SHA256 sign│  │  │  HTTP/2 + pre-warmed  │  │  No server needed       │  │
-│  │  │ Retry 6x (17h)  │  │  │  connection pool      │  │  Client subscribes      │  │
-│  │  │ DLQ on failure   │  │  │                       │  │  with filters           │  │
-│  │  │ Delivery logs    │  │  │  ~2-5ms delivery      │  │                         │  │
-│  │  └─────────────────┘  │  │                       │  │  ~sub-1ms delivery      │  │
+│  │  │ HMAC-SHA256 sign│  │  │  Target: HTTP/2 +     │  │  No server needed       │  │
+│  │  │ Retry 6x (17h)  │  │  │  pre-warmed pool      │  │  Client subscribes      │  │
+│  │  │ DLQ on failure   │  │  │  ~2-5ms target        │  │  with filters           │  │
+│  │  │ Delivery logs    │  │  │                       │  │                         │  │
+│  │  │ ~20-80ms         │  │  │  All delivery currently│  │  ~sub-1ms delivery      │  │
+│  │  └─────────────────┘  │  │  goes through Convoy  │  │                         │  │
 │  │                       │  │                       │  │                         │  │
-│  │  Fires simultaneously │◄─┤  via asyncio.gather   │  │                         │  │
-│  └───────────┬───────────┘  └───────────┬───────────┘  └────────────┬────────────┘  │
-│              │                          │                           │                │
-└──────────────┼──────────────────────────┼───────────────────────────┼────────────────┘
-               │                          │                           │
-               ▼                          ▼                           ▼
+│  └───────────┬───────────┘  └───────────────────────┘  └────────────┬────────────┘  │
+│              │                                                      │                │
+└──────────────┼──────────────────────────────────────────────────────┼────────────────┘
+               │                                                      │
+               ▼                                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                           YOUR APPLICATION / AI AGENT                                │
 │                                                                                     │
@@ -364,8 +364,8 @@ YOUR DASHBOARD:
 │  Lookup (30s TTL cache) ~3-10ms(miss) ~3-10ms(miss)  ~3-10ms(miss)    │
 │                                                                        │
 │  ─────────────────────────────────────────────────────────────────────  │
-│  Webhook Delivery       ~2-5ms        ~2-5ms         ~2-5ms            │
-│  (HTTP/2 pre-warmed)                                                   │
+│  Webhook Delivery       ~20-80ms      ~20-80ms       ~20-80ms          │
+│  (Convoy dispatch)      [~2-5ms target for planned direct httpx path]  │
 │                                                                        │
 │  Realtime Push          ~sub-1ms      ~sub-1ms       ~sub-1ms          │
 │  (WebSocket)                                                           │
@@ -380,9 +380,9 @@ YOUR DASHBOARD:
 │  ─────────────────────────────────────────────────────────────────────  │
 │  TOTAL END-TO-END                                                      │
 │                                                                        │
-│  Fast path (facilitator)  ~107-115ms   ~107-115ms    ~107-115ms        │
-│  Reliable path (Goldsky)  ~507ms-1s    ~1-2s         ~12.5s            │
-│  Dynamic trigger path     ~510ms-1s    ~1-2s         ~12.5s            │
+│  Fast path (facilitator)  ~125-190ms   ~125-190ms    ~125-190ms        │
+│  Reliable path (Goldsky)  ~525ms-1.1s  ~1-2.1s       ~12.6s            │
+│  Dynamic trigger path     ~525ms-1.1s  ~1-2.1s       ~12.6s            │
 │  (same as Goldsky, +<1ms filter overhead)                              │
 │                                                                        │
 │  * Base Flashblocks = 200ms mini-blocks (requires Flashblocks RPC)     │
@@ -558,13 +558,15 @@ YOUR DASHBOARD:
 │                 │                                                    │
 │                 ▼                                                    │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │  5. DISPATCH  (fires all paths simultaneously)               │   │
+│  │  5. DISPATCH  (by endpoint mode)                             │   │
 │  │                                                              │   │
-│  │  asyncio.gather(                                             │   │
-│  │    convoy.send_webhook(payload),        # reliable, ~20-80ms │   │
-│  │    convoy.direct_deliver(payload),      # fast, ~2-5ms       │   │
-│  │    realtime.notify(payload),            # push, ~sub-1ms     │   │
-│  │  )                                                           │   │
+│  │  if endpoint.mode == "execute":                              │   │
+│  │    await convoy.send_webhook(payload)      # ~20-80ms        │   │
+│  │  elif endpoint.mode == "notify":                             │   │
+│  │    await realtime.notify(payload)          # ~sub-1ms        │   │
+│  │                                                              │   │
+│  │  # Note: direct httpx delivery is PLANNED but not yet        │   │
+│  │  # implemented. All execute-mode delivery goes via Convoy.   │   │
 │  │                                                              │   │
 │  │  + background: asyncio.create_task(record_event())           │   │
 │  │  + background: asyncio.create_task(record_delivery())        │   │
@@ -580,34 +582,30 @@ YOUR DASHBOARD:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                    DUAL-PATH DELIVERY SYSTEM                        │
+│                       DELIVERY SYSTEM                               │
 │                                                                     │
 │  WebhookPayload ready                                               │
 │  │                                                                  │
 │  ├─── EXECUTE MODE ──────────────────────────────────────────────── │
 │  │                                                                  │
 │  │    ┌──────────────────────┐    ┌──────────────────────────┐      │
-│  │    │  CONVOY (Reliable)   │    │  DIRECT httpx (Fast)     │      │
-│  │    │                      │    │                          │      │
-│  │    │  POST /messages      │    │  POST to endpoint URL    │      │
-│  │    │  Convoy signs HMAC   │    │  TripWire signs HMAC     │      │
-│  │    │  Convoy delivers     │    │  HTTP/2 multiplexed      │      │
-│  │    │  Convoy retries on   │    │  Pre-warmed TCP+TLS      │      │
-│  │    │  failure (6 attempts)│    │  orjson serialization    │      │
+│  │    │  CONVOY (Active)     │    │  DIRECT httpx            │      │
+│  │    │                      │    │  *** PLANNED ***         │      │
+│  │    │  POST /messages      │    │                          │      │
+│  │    │  Convoy signs HMAC   │    │  Not yet implemented.    │      │
+│  │    │  Convoy delivers     │    │  All execute-mode        │      │
+│  │    │  Convoy retries on   │    │  delivery currently      │      │
+│  │    │  failure (6 attempts)│    │  goes through Convoy.    │      │
 │  │    │  DLQ after exhausted │    │                          │      │
-│  │    │                      │    │  Headers:                │      │
-│  │    │  ~20-80ms            │    │   X-TripWire-Signature   │      │
-│  │    │                      │    │   X-TripWire-ID          │      │
-│  │    │                      │    │   X-TripWire-Timestamp   │      │
-│  │    │                      │    │                          │      │
-│  │    │                      │    │  ~2-5ms                  │      │
-│  │    └──────────┬───────────┘    └──────────┬───────────────┘      │
-│  │               │                           │                      │
-│  │               │    fire simultaneously    │                      │
-│  │               │    via asyncio.gather     │                      │
-│  │               ▼                           ▼                      │
+│  │    │  Delivery logs       │    │  Target design:          │      │
+│  │    │                      │    │   HTTP/2 multiplexed     │      │
+│  │    │  ~20-80ms            │    │   Pre-warmed TCP+TLS     │      │
+│  │    │                      │    │   ~2-5ms target latency  │      │
+│  │    └──────────┬───────────┘    └──────────────────────────┘      │
+│  │               │                                                  │
+│  │               ▼                                                  │
 │  │            Developer's HTTPS endpoint                            │
-│  │            receives BOTH (deduplicates via idempotency_key)      │
+│  │            receives signed webhook from Convoy                   │
 │  │                                                                  │
 │  ├─── NOTIFY MODE ───────────────────────────────────────────────── │
 │  │                                                                  │
@@ -660,11 +658,13 @@ YOUR DASHBOARD:
 │                                                                     │
 │  API SECURITY                                                       │
 │  ─────────────                                                      │
-│  API key:                Hashed (never stored plaintext)             │
-│  Key rotation:           24h grace period for old key               │
+│  SIWE auth:              EIP-191 wallet signature + body hash        │
+│  Nonce replay:           Redis atomic delete (single-use nonces)    │
 │  Rate limiting:          100 req/min ingest, 30 req/min CRUD        │
+│  MCP rate limit:         60 tool calls/min per address              │
 │  CORS:                   Configurable allowed origins (no wildcard)  │
 │  Supabase:               Service role key (backend only, not anon)  │
+│  x402 payment:           Per-call payment verification + settlement  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -673,47 +673,61 @@ YOUR DASHBOARD:
 ## Database Schema (Entity Relationships)
 
 ```
-┌─────────────────┐       ┌──────────────────┐       ┌──────────────────┐
-│   endpoints     │       │   subscriptions  │       │   events         │
-│                 │       │                  │       │                  │
-│ id          PK  │──┐    │ id           PK  │       │ id           PK  │──┐
-│ url             │  │    │ endpoint_id  FK  │←──────│ chain_id         │  │
-│ mode            │  │    │ filters  (JSONB) │       │ tx_hash          │  │
-│ chains  (JSONB) │  │    │ active           │       │ block_number     │  │
-│ recipient       │  │    │ created_at       │       │ from_address     │  │
-│ policies(JSONB) │  │    └──────────────────┘       │ to_address       │  │
-│ api_key_hash    │  │                               │ amount           │  │
-│ webhook_secret  │  │                               │ nonce            │  │
-│ active          │  │                               │ status           │  │
-│ created_at      │  │                               │ identity  (JSON) │  │
-│ updated_at      │  │                               │ created_at       │  │
-└─────────────────┘  │                               └──────────────────┘  │
-                     │                                                     │
-                     │    ┌──────────────────────┐                         │
-                     └───→│ webhook_deliveries   │←────────────────────────┘
-                          │                      │
-                          │ id               PK  │
-                          │ endpoint_id      FK  │
-                          │ event_id         FK  │
-                          │ convoy_message_id    │
-                          │ status               │
-                          │ created_at           │
-                          └──────────────────────┘
+┌──────────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│   endpoints          │     │   subscriptions  │     │   events         │
+│                      │     │                  │     │                  │
+│ id             PK    │──┐  │ id           PK  │     │ id           PK  │──┐
+│ url                  │  │  │ endpoint_id  FK  │     │ chain_id         │  │
+│ mode                 │  │  │ filters  (JSONB) │     │ tx_hash          │  │
+│ chains       (JSONB) │  │  │ active           │     │ block_number     │  │
+│ recipient            │  │  │ created_at       │     │ from_address     │  │
+│ policies     (JSONB) │  │  └──────────────────┘     │ to_address       │  │
+│ owner_address        │  │                           │ amount           │  │
+│ registration_tx_hash │  │                           │ nonce            │  │
+│ registration_chain_id│  │                           │ status           │  │
+│ convoy_project_id    │  │                           │ identity  (JSON) │  │
+│ convoy_endpoint_id   │  │                           │ type             │  │
+│ active               │  │                           │ data     (JSONB) │  │
+│ created_at           │  │                           │ finality_depth   │  │
+│ updated_at           │  │                           │ created_at       │  │
+└──────────────────────┘  │                           └──────────────────┘  │
+                          │                                                │
+                          │  ┌──────────────────────┐                      │
+                          │  │  event_endpoints     │                      │
+                          │  │  (M2M join, mig 014) │                      │
+                          │  │                      │                      │
+                          │  │ event_id     FK,PK   │◄─────────────────────┘
+                          ├─→│ endpoint_id  FK,PK   │
+                          │  │ created_at           │
+                          │  └──────────────────────┘
+                          │
+                          │  ┌──────────────────────┐
+                          └─→│ webhook_deliveries   │
+                             │                      │
+                             │ id               PK  │
+                             │ endpoint_id      FK  │
+                             │ event_id         FK  │
+                             │ convoy_message_id    │
+                             │ status               │
+                             │ created_at           │
+                             └──────────────────────┘
 
-┌──────────────────┐       ┌──────────────────┐
-│   nonces         │       │   audit_log      │
-│                  │       │                  │
-│ chain_id         │       │ id           PK  │
-│ nonce            │       │ action           │
-│ authorizer       │       │ entity_type      │
-│ created_at       │       │ entity_id        │
-│                  │       │ metadata  (JSON) │
-│ UNIQUE(chain_id, │       │ created_at       │
-│  nonce,authorizer│       └──────────────────┘
-└──────────────────┘
+┌──────────────────────┐     ┌──────────────────┐     ┌──────────────────────┐
+│   nonces             │     │   audit_log      │     │   nonces_archive     │
+│                      │     │                  │     │   (migration 019)    │
+│ chain_id             │     │ id           PK  │     │                      │
+│ nonce                │     │ action           │     │ chain_id             │
+│ authorizer           │     │ actor            │     │ nonce                │
+│ event_id         FK  │     │ entity_type      │     │ authorizer           │
+│ reorged_at           │     │ entity_id        │     │ event_id             │
+│ created_at           │     │ metadata  (JSON) │     │ reorged_at           │
+│                      │     │ ip_address       │     │ created_at           │
+│ UNIQUE(chain_id,     │     │ created_at       │     │ archived_at          │
+│  nonce,authorizer)   │     └──────────────────┘     └──────────────────────┘
+└──────────────────────┘
 
-TRIGGER REGISTRY TABLES (Migration 013)
-────────────────────────────────────────
+TRIGGER REGISTRY TABLES (Migrations 013-017)
+─────────────────────────────────────────────
 
 ┌──────────────────────┐      ┌──────────────────────┐      ┌──────────────────────┐
 │  trigger_templates   │      │  triggers            │      │  trigger_instances   │
@@ -723,25 +737,28 @@ TRIGGER REGISTRY TABLES (Migration 013)
 │ slug       UNIQUE    │      │ endpoint_id    FK    │──────│ owner_address        │
 │ description          │      │ name                 │      │ endpoint_id    FK    │
 │ category             │      │ event_signature      │      │ contract_address     │
-│ event_signature      │      │ abi        (JSONB)   │      │ chain_ids   (JSONB)  │
-│ abi        (JSONB)   │      │ contract_address     │      │ parameters  (JSONB)  │
-│ default_chains(JSONB)│      │ chain_ids   (JSONB)  │      │ resolved_filters     │
-│ default_filters(JSONB)      │ filter_rules(JSONB)  │      │ active               │
-│ parameter_schema     │      │ webhook_event_type   │      │ created_at           │
-│ webhook_event_type   │      │ reputation_threshold │      │ updated_at           │
-│ reputation_threshold │      │ batch_id             │      └──────────────────────┘
-│ author_address       │      │ active               │
-│ is_public            │      │ created_at           │
-│ install_count        │      │ updated_at           │
+│ event_signature      │      │ topic0               │      │ chain_ids   (JSONB)  │
+│ topic0               │      │ abi        (JSONB)   │      │ parameters  (JSONB)  │
+│ abi        (JSONB)   │      │ contract_address     │      │ resolved_filters     │
+│ default_chains(JSONB)│      │ chain_ids   (JSONB)  │      │ active               │
+│ default_filters(JSONB)      │ filter_rules(JSONB)  │      │ created_at           │
+│ parameter_schema     │      │ webhook_event_type   │      │ updated_at           │
+│ webhook_event_type   │      │ reputation_threshold │      │                      │
+│ reputation_threshold │      │ batch_id             │      │ UNIQUE(template_id,  │
+│ author_address       │      │ active               │      │  owner_address)      │
+│ is_public            │      │ created_at           │      │  WHERE active=TRUE   │
+│ install_count        │      │ updated_at           │      └──────────────────────┘
 │ created_at           │      └──────────────────────┘
 │ updated_at           │
 └──────────────────────┘
 
-Triggers:
-  - DB triggers auto-increment install_count on trigger_instances INSERT
+Triggers & Indexes:
+  - DB triggers: balanced install_count increment/decrement on instance activate/deactivate
   - DB triggers auto-update updated_at on UPDATE for all 3 tables
   - GIN index on triggers.chain_ids for JSONB containment queries
+  - Composite index on (topic0, active) for hash-based O(1) lookups
   - Partial index on active=TRUE for efficient hot-path queries
+  - Unique partial index on trigger_instances(template_id, owner_address) WHERE active=TRUE
 ```
 
 ---
@@ -758,36 +775,49 @@ PHASE 1 — Foundation (DONE)                   PHASE 2 — Turbo Hybrid (DONE)
   Finality tracking ✅                           Filter engine (10 operators) ✅
   ERC-8004 identity ✅                           x402 Bazaar manifest ✅
   Policy engine ✅                               Bazaar trigger templates ✅
-  Convoy + direct delivery ✅                    Dynamic trigger routing ✅
+  Convoy delivery ✅                    Dynamic trigger routing ✅
   Supabase Realtime ✅                           TTL-cached registry lookups ✅
   Generic event processor ✅                     Reputation-gated MCP tools ✅
   CI/CD ✅                                       Audit logging for all MCP calls ✅
 
-  Latency: ~1-4s (Goldsky path)               Latency: ~100ms (fast path)
+  Latency: ~1-4s (Goldsky path)               Latency: ~120-180ms (fast path)
                                                         ~1-2s (reliable)
                                                         +<1ms filter overhead
+                                                        (all via Convoy ~20-80ms)
 
-PHASE 3 — Platform                            PHASE 4 — Scale
-━━━━━━━━━━━━━━━━━━                            ━━━━━━━━━━━━━━━━
+PHASE 3 — Platform (IN PROGRESS)               PHASE 4 — Scale
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━               ━━━━━━━━━━━━━━━━
 
-  SIWE auth for MCP (replace                    Edge deployment
-    MVP Bearer address)                         (Cloudflare Workers)
+  SIWE auth for MCP ✅                            Edge deployment
+    (3-tier: PUBLIC/SIWX/X402)                  (Cloudflare Workers)
 
-  Goldsky pipeline provisioning                 More EVM chains
-    per-trigger (auto-create                    (Optimism, Polygon,
-    Goldsky sources on register)                 Avalanche)
+  Event bus (Redis Streams) ✅                    More EVM chains
+    Partitioned by topic0                       (Optimism, Polygon,
+    Worker pool + auto-restart                   Avalanche)
 
-  Wire SDK:                                     Non-EVM chains
-   client.create_wire(                          (Solana, Aptos)
+  Nonce reorg recovery ✅                         Non-EVM chains
+    (migration 018)                             (Solana, Aptos)
+
+  Nonce archival ✅                               Multi-tenant
+    (migration 019, 30-day cutoff)              white-label
+
+  Event-endpoints M2M ✅                          Agent-to-agent
+    (migration 014)                             payment routing
+
+  Goldsky pipeline provisioning                 Marketplace for
+    per-trigger (auto-create                    wire templates
+    Goldsky sources on register)
+
+  Wire SDK:
+   client.create_wire(
      contract="0x...",
-     event="PoolStateChanged",                  Multi-tenant
-     condition={"apr": {"lt": 9}},              white-label
+     event="PoolStateChanged",
+     condition={"apr": {"lt": 9}},
      webhook_url="https://..."
-   )                                            Agent-to-agent
-                                               payment routing
+   )
+
   Template marketplace
-  (community-authored templates)                Marketplace for
-                                               wire templates
+  (community-authored templates)
 ```
 
 ---
@@ -800,13 +830,13 @@ PHASE 3 — Platform                            PHASE 4 — Scale
 ├────────────────────┼──────────────┼──────────────┼──────────────┤
 │                    │              │              │              │
 │ x402 payment       │              │              │              │
-│ (with facilitator) │  ~100ms      │  ~100ms      │  ~100ms      │
+│ (with facilitator) │  ~120-180ms  │  ~120-180ms  │  ~120-180ms  │
 │                    │              │              │              │
 │ x402 payment       │              │              │              │
-│ (Goldsky only)     │  ~500ms      │  ~2s         │  ~13s        │
+│ (Goldsky only)     │  ~520ms-1.1s │  ~2.1s       │  ~13.1s      │
 │                    │              │              │              │
 │ Dynamic trigger    │              │              │              │
-│ (registry-matched) │  ~500ms      │  ~2s         │  ~13s        │
+│ (registry-matched) │  ~520ms-1.1s │  ~2.1s       │  ~13.1s      │
 │                    │              │              │              │
 │ MCP registration   │              │              │              │
 │ (one-time setup)   │  ~50-150ms   │  ~50-150ms   │  ~50-150ms   │
@@ -858,14 +888,25 @@ TripWire exposes a Model Context Protocol (MCP) server at `/mcp` for AI agent in
 │  └────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │  ┌────────────────────────────────────────────────────────────────┐  │
-│  │  AUTH + REPUTATION GATING                                      │  │
+│  │  3-TIER AUTH + REPUTATION GATING                                │  │
 │  │                                                                │  │
-│  │  1. Extract agent address from Authorization: Bearer <addr>    │  │
-│  │  2. If tool.min_reputation > 0:                                │  │
+│  │  Tier 1 — PUBLIC: No auth (initialize, tools/list)             │  │
+│  │  Tier 2 — SIWX: SIWE wallet signature (free tools)            │  │
+│  │    → 5 headers: X-TripWire-{Address,Signature,Nonce,           │  │
+│  │      Issued-At,Expiration}                                     │  │
+│  │    → EIP-191 signature recovery via eth_account                │  │
+│  │    → Body-hash binding: SHA256(body) in SIWE statement         │  │
+│  │    → Redis nonce: atomic delete prevents replay                │  │
+│  │    → Timestamp tolerance check                                 │  │
+│  │  Tier 3 — X402: Per-call payment verification (paid tools)     │  │
+│  │    → Verifies x402 payment proof + payer address               │  │
+│  │                                                                │  │
+│  │  Post-auth:                                                    │  │
+│  │  1. If tool.min_reputation > 0:                                │  │
 │  │     → resolve ERC-8004 identity (5-min TTL cache)              │  │
 │  │     → reject if reputation < threshold                         │  │
-│  │  3. Execute tool handler with (params, agent_address, repos)   │  │
-│  │  4. Audit log: action, actor, resource, arguments, IP          │  │
+│  │  2. Execute tool handler with (params, agent_address, repos)   │  │
+│  │  3. Audit log: action, actor, resource, arguments, IP          │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │  Error codes:                                                        │
@@ -881,7 +922,7 @@ TripWire exposes a Model Context Protocol (MCP) server at `/mcp` for AI agent in
 - The MCP server is a separate FastAPI sub-app mounted on the main app. This isolates routing and middleware.
 - Every `tools/call` invocation is audit-logged via `fire_and_forget` (non-blocking background task).
 - Tool handlers are pure async functions with signature `(params, agent_address, repos) -> dict`. Repos are constructed per-request from the parent app's Supabase client.
-- Auth is MVP (Bearer address). SIWE verification is planned for production.
+- Auth uses a 3-tier model: PUBLIC (no auth for initialize/list), SIWX (SIWE wallet signature with body-hash binding and Redis nonce replay protection for free tools), and X402 (per-call payment verification for paid tools). All tool calls that modify state require cryptographic wallet authentication.
 
 ---
 
@@ -1071,9 +1112,9 @@ AI Agent                    MCP Server                  Supabase
    │  }                        │                           │
    │ ─────────────────────────►│                           │
    │                           │                           │
-   │                    1. AUTH │                           │
-   │                    Extract agent address               │
-   │                    from Bearer header                  │
+   │                    1. AUTH (3-tier)                     │
+   │                    SIWX: verify SIWE signature         │
+   │                    → recover agent address              │
    │                           │                           │
    │                    2. REPUTATION CHECK                 │
    │                    (skipped if min_reputation == 0)    │
@@ -1199,3 +1240,203 @@ TripWire publishes a service manifest at `/.well-known/x402-manifest.json` for d
 ```
 
 **Pricing model:** Bazaar services are priced in USDC on Base (eip155:8453). Template activation is cheaper ($0.001) than custom trigger creation ($0.003) to incentivize reuse of battle-tested templates.
+
+---
+
+## Event Bus (Redis Streams)
+
+The event bus is an optional async processing layer between Goldsky ingestion and trigger evaluation. When enabled (`EVENT_BUS_ENABLED=true`), events are published to Redis Streams partitioned by `topic0` (event signature hash), then consumed by a pool of trigger workers for horizontal scaling.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    EVENT BUS ARCHITECTURE                             │
+│                                                                     │
+│  PUBLISH PATH (ingest routes)                                       │
+│  ─────────────────────────────                                      │
+│  /api/v1/ingest/goldsky ──┐                                         │
+│  /api/v1/ingest/event ────┤                                         │
+│                           ▼                                         │
+│               publish_event() / publish_batch()                      │
+│                           │                                         │
+│               topic0 = keccak256(event_signature)                    │
+│               stream_key = tripwire:events:{topic0}                  │
+│                           │                                         │
+│               XADD stream_key {payload: JSON}                        │
+│               (maxlen ~100,000, pipelined for batches)               │
+│                                                                     │
+│  CONSUME PATH (WorkerPool → N × TriggerWorker)                      │
+│  ──────────────────────────────────────────────                      │
+│  WorkerPool.start()                                                 │
+│    ├─ TriggerIndex.refresh() — O(1) lookup by topic0                │
+│    ├─ scan_streams("tripwire:events:*")                              │
+│    ├─ Partition streams across N workers (round-robin)               │
+│    └─ Launch N asyncio tasks + stream discovery loop (30s)           │
+│                                                                     │
+│  TriggerWorker.start() (per worker)                                 │
+│    ├─ XREADGROUP (consumer group, block 2s)                          │
+│    ├─ XAUTOCLAIM stale messages (every 10 iterations, 30s idle)      │
+│    ├─ EventProcessor.process_event(raw_log)                          │
+│    ├─ Batch XACK on success                                          │
+│    └─ DLQ (tripwire:dlq) after 5 failed retries                     │
+│                                                                     │
+│  SAFETY MECHANISMS                                                   │
+│  ─────────────────                                                   │
+│  • topic0 hex validation: ^0x[0-9a-f]{64}$ (no arbitrary keys)      │
+│  • MAX_STREAMS = 500 (enforced at publish + discovery)               │
+│  • MAX_STREAMS_PER_WORKER = 100                                      │
+│  • Batch size limit: 1000 events per ingest request                  │
+│  • Poison message handling: ACK on deserialization failure            │
+│  • NOGROUP recovery: cache invalidation + group re-creation          │
+│  • Worker auto-restart with exponential backoff (2s–120s)            │
+│  • Graceful startup degradation: pool failure doesn't crash app      │
+│  • DLQ write-before-ACK: only ACK after DLQ write succeeds          │
+│  • Fallback to sync processing when Redis publish fails              │
+│                                                                     │
+│  FEATURE FLAG                                                       │
+│  ────────────                                                       │
+│  EVENT_BUS_ENABLED=false (default) — zero impact, sync processing    │
+│  EVENT_BUS_ENABLED=true  — async via Redis Streams                   │
+│  EVENT_BUS_WORKERS=3     — number of consumer tasks                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Observability Stack
+
+TripWire includes a full observability stack for production monitoring. All components are optional and degrade gracefully when not configured.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    OBSERVABILITY                                      │
+│                                                                     │
+│  PROMETHEUS METRICS (/metrics)                                       │
+│  ──────────────────────────────                                      │
+│  Counters:                                                          │
+│    events_processed_total      — by chain, event_type, status        │
+│    webhooks_sent_total         — by endpoint, event_type             │
+│    errors_total                — by component, error_type            │
+│    auth_requests_total         — by method, status                   │
+│    nonce_dedup_total           — by chain, result (new/duplicate)    │
+│  Histograms:                                                        │
+│    pipeline_duration_seconds   — end-to-end processing latency       │
+│    request_duration_seconds    — HTTP request latency                │
+│    webhook_delivery_duration   — dispatch to delivery time           │
+│  Gauges:                                                            │
+│    dlq_backlog                 — current DLQ depth                   │
+│  Info:                                                              │
+│    tripwire_build_info         — version, environment                │
+│                                                                     │
+│  Optional auth: METRICS_BEARER_TOKEN protects /metrics in prod       │
+│                                                                     │
+│  OPENTELEMETRY TRACING                                               │
+│  ─────────────────────                                               │
+│  OTEL_ENABLED=true + OTEL_ENDPOINT=<collector>                       │
+│  Batch span processor, OTLP exporter                                 │
+│  Falls back to NullTracer when not installed                         │
+│                                                                     │
+│  SENTRY ERROR TRACKING                                               │
+│  ─────────────────────                                               │
+│  SENTRY_DSN=<dsn> enables error capture                              │
+│  before_send hook strips SecretStr values from events                │
+│  Tags: service=tripwire, env=environment                             │
+│  Configurable traces_sample_rate (default 0.1)                       │
+│                                                                     │
+│  AUDIT LOGGING                                                       │
+│  ──────────────                                                      │
+│  Fire-and-forget async writes to Supabase audit_log table            │
+│  Actions: endpoint.*, trigger.*, mcp.tool_call, auth.*               │
+│  Actor sanitization validates Ethereum addresses                     │
+│  Never blocks request processing                                     │
+│                                                                     │
+│  BACKGROUND TASK HEALTH                                              │
+│  ─────────────────────                                               │
+│  health_registry tracks last_run_at, error_count, running state      │
+│  /health/detailed probes all components + background tasks           │
+│  Worker pool stats: per-worker processed/errors/stream counts        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Known Limitations & Planned Improvements
+
+The following are documented architectural limitations, tracked with resolution status. Items marked RESOLVED were addressed on the `feature/trigger-registry-mcp` branch.
+
+### Critical — Pre-Scale Blockers
+
+**1. Finality poller has no distributed coordination** — PENDING
+
+The finality poller and DLQ handler run as in-process asyncio tasks. In multi-instance deployments (multiple K8s pods, multiple uvicorn workers), every instance runs its own poller, causing duplicate `payment.confirmed` webhooks for the same event.
+
+*Mitigation:* Run a single instance for now. Before horizontal scaling, add a Redis-based distributed lock (`SET NX EX` on a poller lease key) or leader-election pattern.
+
+**2. ~~Reorged nonces are unrecoverable~~** — RESOLVED (migration 018)
+
+Added `reorged_at` and `event_id` columns to `nonces` table. The `record_nonce_with_reorg()` Postgres function now handles atomic reorg recovery — when a reorg is detected, the nonce is marked with `reorged_at` timestamp, allowing it to be reused when the re-broadcast transaction lands. The finality poller cascades nonce invalidation on reorg detection.
+
+**3. Pre-confirmed events can get stranded** — PENDING
+
+The x402 facilitator fast path generates a synthetic pseudo-tx-hash for pre-confirmed payments. The finality poller later promotes the event to `confirmed` once the real transaction lands. But if the tx never lands (dropped mempool, RPC failure), `payment.pre_confirmed` events sit in `pending` state indefinitely.
+
+*Mitigation:* Add a cleanup job that fires `payment.failed` on pre-confirmed events older than N minutes (suggested: 15 min for L2, 30 min for Ethereum).
+
+### Medium — Horizontal Scaling
+
+**4. In-process caches don't survive multi-instance deployments** — PENDING
+
+Three in-process cache layers exist: trigger index (30s TTL), trigger repository cache (invalidated on mutation), and identity resolver cache (300s TTL). In horizontal deployments, a trigger created on instance A isn't visible to instance B's cache until the TTL expires. `invalidate_trigger_cache()` only flushes the local process.
+
+*Mitigation:* Add a Redis pub/sub channel for cache invalidation signals. All instances subscribe and flush on receiving a message. Identity cache should move to Redis for shared access.
+
+**5. ~~`events.endpoint_id` only records the first matched endpoint~~** — RESOLVED (migration 014)
+
+Added `event_endpoints` many-to-many join table with composite primary key `(event_id, endpoint_id)`. Events are now linked to all matched endpoints. Existing data was backfilled from `events.endpoint_id`. The `search_events` MCP tool queries via this join table for correct multi-endpoint results.
+
+**6. ~~Webhook secrets stored in plaintext in the database~~** — RESOLVED (migration 016)
+
+Dropped the `webhook_secret` column from `endpoints`. Convoy is now the sole source of truth for HMAC signing secrets. Secrets are only returned once at endpoint registration time and never persisted in TripWire's database.
+
+**7. ~~Trigger `event_signature` vs `topic0` ambiguity~~** — RESOLVED (migration 017)
+
+Added a precomputed `topic0` column to both `triggers` and `trigger_templates` tables. The column is populated at insert time via `keccak256(event_signature)`. A composite index `idx_triggers_topic0_active` on `(topic0, active)` enables O(1) hash-based lookups. The `TriggerIndex` in the event bus worker now keys by `topic0` directly.
+
+**8. No per-wallet rate limiting on trigger creation** — PENDING
+
+SlowAPI rate limiting is per-route (30/minute CRUD), but MCP tool calls bypass HTTP rate limits. A single agent could register thousands of triggers, making `find_by_topic()` return massive result sets and flooding caches. MCP server has per-address rate limiting (60 calls/min), but no per-owner trigger count cap.
+
+*Mitigation:* Add a `max_triggers_per_owner` config with a DB-level check before insert.
+
+### Lower Priority
+
+**9. Per-instance identity RPC cost at scale** — PENDING
+
+5 parallel RPC calls per identity resolution × N instances = redundant RPC load at scale. The 300s in-process TTL doesn't help across instances.
+
+*Mitigation:* Move identity cache to Redis with a longer TTL (identity data changes infrequently). Also note: `registered_at` uses token ID as a registration order proxy — this is an acknowledged approximation.
+
+**10. ~~Bazaar `install_count` is gameable~~** — RESOLVED (migration 015)
+
+Added a unique partial index on `(template_id, owner_address) WHERE active = true` to prevent duplicate active instances. Install count now uses balanced increment/decrement DB triggers — activating increments, deactivating decrements. The count was recalculated from actual active instances during migration.
+
+**11. ~~`nonces` table grows unbounded~~** — RESOLVED (migration 019)
+
+Added `nonces_archive` table and `archive_old_nonces()` Postgres function. A background `NonceArchiver` task runs every 24 hours, moving confirmed nonces older than 30 days to the archive table in batches of 5,000. The `record_nonce_with_reorg()` function checks the archive before allowing nonce reuse.
+
+---
+
+### Summary
+
+| # | Issue | Status | Resolution |
+|---|-------|--------|------------|
+| 1 | Finality poller no distributed coordination | PENDING | Need Redis distributed lock / leader election |
+| 2 | Reorged nonces unrecoverable | RESOLVED | Migration 018: `reorged_at` + `record_nonce_with_reorg()` |
+| 3 | Pre-confirmed events stranded | PENDING | Need cleanup job for stale `payment.pre_confirmed` events |
+| 4 | In-process caches cross-instance | PENDING | Need Redis pub/sub cache invalidation |
+| 5 | Single endpoint_id on events | RESOLVED | Migration 014: `event_endpoints` join table |
+| 6 | Webhook secrets in plaintext | RESOLVED | Migration 016: dropped column, Convoy is source of truth |
+| 7 | topic0 vs event_signature ambiguity | RESOLVED | Migration 017: precomputed `topic0` column + index |
+| 8 | No per-wallet trigger creation limit | PENDING | Need `max_triggers_per_owner` config |
+| 9 | Identity RPC cost at scale | PENDING | Need Redis-backed identity cache |
+| 10 | install_count gameable | RESOLVED | Migration 015: unique partial index + balanced triggers |
+| 11 | Nonces table unbounded growth | RESOLVED | Migration 019: `nonces_archive` + background archiver |

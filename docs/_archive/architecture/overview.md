@@ -21,6 +21,9 @@ TripWire is a programmable onchain event trigger platform that watches ERC-3009 
 9. [Policy Engine](#policy-engine)
 10. [Database Schema](#database-schema)
 11. [Security Model](#security-model)
+12. [Event Bus (Redis Streams)](#event-bus-redis-streams)
+13. [Observability](#observability)
+14. [Known Limitations](#known-limitations)
 
 ---
 
@@ -94,6 +97,11 @@ graph TB
 | Validation | Pydantic v2 | Input/output schema validation |
 | Logging | structlog | Structured JSON logging |
 | HTTP Client | httpx (async) | All outbound HTTP calls |
+| Event Bus | Redis Streams (optional) | Async event processing, horizontal worker scaling |
+| Metrics | Prometheus (prometheus_client) | Pipeline, request, and delivery latency metrics |
+| Tracing | OpenTelemetry (optional) | Distributed tracing with OTLP export |
+| Error Tracking | Sentry (optional) | Exception capture with SecretStr scrubbing |
+| MCP Auth | SIWE (eth_account) + x402 | 3-tier wallet auth for AI agent tools |
 
 ---
 
@@ -116,7 +124,7 @@ When `transferWithAuthorization` is called on a USDC contract, two events are em
 
 ### L1 -- Goldsky Indexing Layer
 
-Goldsky Turbo reads raw logs from each chain, applies a SQL transform that filters for `AuthorizationUsed` events on USDC contracts, decodes them using `_gs_log_decode()`, and delivers the decoded events via webhook POST to TripWire's `/api/v1/ingest` endpoint. This is a fully managed pipeline -- Goldsky handles all chain indexing and delivers events directly to TripWire.
+Goldsky Turbo reads raw logs from each chain, applies a SQL transform that filters for `AuthorizationUsed` events on USDC contracts, decodes them using `_gs_log_decode()`, and delivers the decoded events via webhook POST to TripWire's `/api/v1/ingest` endpoint. This is a fully managed pipeline -- Goldsky handles all chain indexing and delivers events directly to TripWire. When the optional event bus is enabled, events are published to Redis Streams for async processing by a pool of trigger workers.
 
 ### L2 -- TripWire Middleware Layer
 
@@ -703,7 +711,7 @@ The function returns `(allowed: bool, reason: str | None)`. If `allowed` is `Fal
 
 ## Database Schema
 
-TripWire uses Supabase (managed PostgreSQL) with the following schema, defined in `tripwire/db/migrations/001_initial.sql`.
+TripWire uses Supabase (managed PostgreSQL). The schema is built up through incremental migrations in `tripwire/db/migrations/` (001 through 019 as of this writing).
 
 ### ER Diagram
 
@@ -712,6 +720,8 @@ erDiagram
     endpoints ||--o{ subscriptions : "has"
     endpoints ||--o{ webhook_deliveries : "receives"
     events ||--o{ webhook_deliveries : "triggers"
+    events ||--o{ event_endpoints : "matched by"
+    endpoints ||--o{ event_endpoints : "matched to"
 
     endpoints {
         text id PK
@@ -720,7 +730,6 @@ erDiagram
         jsonb chains
         text recipient
         jsonb policies
-        text api_key_hash
         boolean active
         timestamptz created_at
         timestamptz updated_at
@@ -754,11 +763,26 @@ erDiagram
         timestamptz confirmed_at
     }
 
+    event_endpoints {
+        text event_id FK
+        text endpoint_id FK
+        timestamptz matched_at
+    }
+
     nonces {
         integer chain_id
         text nonce
         text authorizer
         timestamptz created_at
+        timestamptz reorged_at "NULL unless reorged"
+    }
+
+    nonces_archive {
+        integer chain_id
+        text nonce
+        text authorizer
+        timestamptz created_at
+        timestamptz archived_at
     }
 
     webhook_deliveries {
@@ -783,7 +807,7 @@ erDiagram
 ### Table Descriptions
 
 #### `endpoints`
-Developer-registered webhook endpoints. Each endpoint specifies a URL, delivery mode (execute or notify), the chains to monitor, the USDC recipient address, and optional policies. The `api_key_hash` stores a hashed API key for authenticating management requests.
+Developer-registered webhook endpoints. Each endpoint specifies a URL, delivery mode (execute or notify), the chains to monitor, the USDC recipient address, and optional policies. Management requests are authenticated via SIWE wallet signature (api_key columns were removed in migration 010).
 
 **Key indexes**: `recipient` (for matching transfers), `active` (partial index on `TRUE`), `mode`.
 
@@ -795,8 +819,14 @@ Combined ERC-3009 event data: Transfer fields (`from_address`, `to_address`, `am
 
 **Key indexes**: `(chain_id, tx_hash)` for transaction lookup, `to_address` and `from_address` for address-based queries, `(chain_id, nonce, authorizer)` for deduplication cross-reference, `(chain_id, block_number)` for finality range scans, `created_at` for cursor pagination.
 
+#### `event_endpoints`
+M2M join table (added migration 014) linking a processed event to every endpoint it matched. Replaces the old single `endpoint_id` foreign key on `events`, allowing one event to fan out to multiple endpoints. `webhook_deliveries` is the authoritative delivery record; `event_endpoints` provides the match index.
+
 #### `nonces`
-Deduplication table. The `UNIQUE (chain_id, nonce, authorizer)` constraint enforces that each ERC-3009 authorization nonce can only be processed once per chain and authorizer. INSERT failures on this constraint indicate duplicate events.
+Deduplication table. The `UNIQUE (chain_id, nonce, authorizer)` constraint enforces that each ERC-3009 authorization nonce can only be processed once per chain and authorizer. INSERT failures on this constraint indicate duplicate events. The `reorged_at` column (migration 018) records when a nonce was invalidated by a chain reorg, enabling re-processing of re-broadcast transactions via `record_nonce_with_reorg()`.
+
+#### `nonces_archive`
+Background archival table (migration 019). Old nonce rows are periodically moved here by the archival job (`tripwire/db/archival.py`) to keep the hot `nonces` table small while preserving the deduplication history.
 
 #### `webhook_deliveries`
 Tracks the relationship between events and endpoint deliveries. Stores the Convoy message ID for cross-referencing delivery status with Convoy's delivery logs. Cascades on both endpoint and event deletion.
@@ -817,6 +847,10 @@ Immutable append-only log of system actions. Records the action type, affected e
 5. **Cascade deletes**: `subscriptions` and `webhook_deliveries` cascade on endpoint deletion, ensuring referential integrity without orphaned records.
 
 6. **Partial indexes**: The `active = TRUE` partial indexes on `endpoints` and `subscriptions` optimize the hot path (querying only active records) without indexing deactivated rows.
+
+7. **Precomputed `topic0` on triggers**: Migration 017 added a `topic0` column to `triggers` and `trigger_templates`, storing the keccak256 event-signature hash inline. This enables O(1) index lookups during event routing without recomputing the hash at query time.
+
+8. **Nonce archival**: Migration 019 introduced `nonces_archive` and a background archival job. Active nonces older than a configurable threshold are moved to the archive table, keeping the hot-path `nonces` table lean for the unique-constraint INSERT that performs deduplication.
 
 ---
 
@@ -858,9 +892,9 @@ This prevents:
 - **Replay attacks**: Re-submitting an already-processed event is rejected at the database level
 - **Race conditions**: The PostgreSQL unique constraint is atomic, handling concurrent inserts correctly
 
-### API Key Authentication
+### SIWE Wallet Authentication
 
-Endpoints store `api_key_hash` -- a hashed API key used to authenticate management requests (updating endpoint configuration, listing deliveries, etc.). The raw API key is never stored.
+Management requests (creating/updating endpoints, listing deliveries, etc.) are authenticated via Sign-In With Ethereum (SIWE). The caller signs a structured message with their wallet; TripWire verifies the signature via `eth_account`. API key columns were removed in migration 010 — no API keys are stored in the database.
 
 ### Contract Address Validation
 
@@ -885,6 +919,135 @@ TripWire uses the `supabase_service_role_key` (not the anon key) for database op
 | Webhook signing | HMAC-SHA256 via Convoy | Payload tampering, webhook spoofing |
 | Timestamp validation | Convoy signature includes timestamp | Replay attacks on webhook delivery |
 | Nonce deduplication | PostgreSQL unique constraint | Double-processing, replay of onchain events |
-| API key hashing | Stored hash, not plaintext | Credential theft from database breach |
+| SIWE wallet auth | EIP-4361 signature verification | Unauthorized management API access |
 | Contract validation | Address check against known USDC contracts | Spoofed events from malicious contracts |
 | Service role isolation | Supabase service_role key (backend only) | Unauthorized database access |
+| MCP 3-tier auth | SIWE wallet signature + x402 payment | Unauthorized tool access, impersonation |
+| Body-hash binding | SHA256(body) in SIWE statement | Request tampering after signature |
+| Redis nonce | Atomic delete on use | SIWE replay attacks |
+
+---
+
+## Event Bus (Redis Streams)
+
+An optional async processing layer between Goldsky ingestion and trigger evaluation, enabled via `EVENT_BUS_ENABLED=true`.
+
+### Architecture
+
+When enabled, ingest routes publish events to Redis Streams partitioned by `topic0` (event signature keccak256 hash). A pool of `TriggerWorker` tasks consume events via `XREADGROUP` consumer groups for at-least-once delivery.
+
+```mermaid
+graph LR
+    subgraph Ingest
+        GS["Goldsky POST"]
+        API["/api/v1/ingest"]
+    end
+    subgraph EventBus["Redis Streams"]
+        S1["tripwire:events:0xddf2..."]
+        S2["tripwire:events:0x98de..."]
+        SN["tripwire:events:..."]
+        DLQ["tripwire:dlq"]
+    end
+    subgraph Workers["Worker Pool"]
+        W1["Worker-0"]
+        W2["Worker-1"]
+        W3["Worker-2"]
+    end
+    subgraph Processing
+        EP["EventProcessor"]
+    end
+
+    GS --> API
+    API -->|"XADD"| S1
+    API -->|"XADD"| S2
+    API -->|"XADD"| SN
+    S1 -->|"XREADGROUP"| W1
+    S2 -->|"XREADGROUP"| W2
+    SN -->|"XREADGROUP"| W3
+    W1 --> EP
+    W2 --> EP
+    W3 --> EP
+    W1 -.->|"after 5 failures"| DLQ
+```
+
+### Key Properties
+
+| Property | Detail |
+|----------|--------|
+| Delivery semantics | At-least-once via XREADGROUP consumer groups |
+| Partitioning | By topic0 (event signature hash), round-robin across workers |
+| Stale message recovery | XAUTOCLAIM after 30s idle |
+| Dead letter queue | `tripwire:dlq` after 5 processing failures |
+| Stream cap | 500 max streams, 100 max per worker |
+| Graceful degradation | Falls back to sync processing when Redis publish fails |
+| Feature flag | `EVENT_BUS_ENABLED=false` (default) — zero impact |
+
+### Configuration
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `EVENT_BUS_ENABLED` | `false` | Enable Redis Streams async processing |
+| `EVENT_BUS_WORKERS` | `3` | Number of consumer tasks |
+
+---
+
+## Observability
+
+TripWire includes a full observability stack. All components are optional and degrade gracefully when not configured.
+
+### Prometheus Metrics (`/metrics`)
+
+| Type | Metric | Labels |
+|------|--------|--------|
+| Counter | `events_processed_total` | chain, event_type, status |
+| Counter | `webhooks_sent_total` | endpoint, event_type |
+| Counter | `errors_total` | component, error_type |
+| Counter | `auth_requests_total` | method, status |
+| Counter | `nonce_dedup_total` | chain, result |
+| Histogram | `pipeline_duration_seconds` | — |
+| Histogram | `request_duration_seconds` | — |
+| Histogram | `webhook_delivery_duration_seconds` | — |
+| Gauge | `dlq_backlog` | — |
+| Info | `tripwire_build_info` | version, env |
+
+Optional auth: set `METRICS_BEARER_TOKEN` to protect `/metrics` in production.
+
+### OpenTelemetry Tracing
+
+Set `OTEL_ENABLED=true` and `OTEL_ENDPOINT=<collector>` to enable distributed tracing. Uses batch span processor with OTLP exporter. Falls back to a no-op tracer when the OTel package is not installed.
+
+### Sentry Error Tracking
+
+Set `SENTRY_DSN=<dsn>` to enable error capture. A `before_send` hook strips `SecretStr` values from Sentry events. Configurable `SENTRY_TRACES_SAMPLE_RATE` (default 0.1).
+
+### Health Endpoints
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /health` | Basic liveness check |
+| `GET /health/detailed` | Deep probe: Supabase, Redis, webhook provider, identity resolver, background tasks, worker pool |
+| `GET /ready` | Readiness probe (200 only after lifespan startup completes) |
+
+---
+
+## Known Limitations
+
+Documented architectural limitations. Acceptable for a single-instance beta launch but must be addressed before horizontal scaling.
+
+### Pre-Scale Blockers
+
+1. **Finality poller has no distributed coordination.** In multi-instance deployments, every instance runs its own poller, causing duplicate `payment.confirmed` webhooks. *Fix:* Add Redis-based distributed lock or leader election before scaling horizontally.
+
+2. **Reorged nonce recovery is implemented but requires finality poller integration.** Migration 018 added `reorged_at` column and `record_nonce_with_reorg()` to mark nonces as reorged rather than permanently consumed. The finality poller must call `record_nonce_with_reorg()` on detected reorgs; until that integration is wired end-to-end, re-broadcast transactions with the same ERC-3009 nonce may still be rejected as duplicates.
+
+3. **Pre-confirmed events can get stranded.** The x402 facilitator fast path creates `payment.pre_confirmed` events with synthetic pseudo-tx-hashes. If the real tx never lands, these sit in `pending` forever. *Fix:* Add a TTL-based cleanup job that fires `payment.failed` after N minutes.
+
+### Horizontal Scaling
+
+4. **In-process caches are not shared across instances.** Trigger cache (30s TTL), identity cache (300s TTL), and trigger repository cache are per-process. Cache invalidation only flushes the local instance. *Fix:* Redis pub/sub for invalidation signals; move identity cache to Redis.
+
+5. **`event_endpoints` join table added in migration 014.** Events can now match multiple endpoints (M2M). The `search_events` MCP tool should query through `event_endpoints` rather than a single `endpoint_id` foreign key; older query paths that assumed one endpoint per event may need updating.
+
+6. **Webhook signing secrets are held exclusively by Convoy** (migration 016 dropped `webhook_secret` from the `endpoints` table). A Convoy compromise exposes signing secrets; TripWire's database alone does not. Envelope encryption with KMS remains a hardening option for the Convoy secret store.
+
+7. **Nonce archival is background-only.** Migration 019 added `nonces_archive` and the archival job (`tripwire/db/archival.py`), but the job must be kept running continuously to prevent the hot `nonces` table from accumulating unbounded rows. If the archival job crashes silently in production, the table will grow until manually remediated.
