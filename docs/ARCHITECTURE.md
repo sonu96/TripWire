@@ -10,6 +10,11 @@ evaluates policies, resolves agent identity, and delivers structured webhooks
 or real-time notifications. x402 payment webhooks are the primary use case,
 but the trigger registry supports arbitrary EVM events.
 
+The [TWSS-1 Skill Spec](SKILL-SPEC.md) defines the execution-aware output
+contract: lifecycle states (provisional/confirmed/finalized/reorged),
+three-layer gating (can_pay/can_trust/is_safe), and the two-phase execution
+model (prepare/commit). Machine-readable at `/.well-known/tripwire-skill-spec.json`.
+
 Last updated: 2026-03-17
 
 ---

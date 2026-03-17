@@ -40,8 +40,14 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - **x402**: HTTP 402 micropayment protocol using ERC-3009 transferWithAuthorization
 - **ERC-3009**: transferWithAuthorization standard for gasless USDC transfers
 - **ERC-8004**: Onchain AI agent identity registry (went mainnet Jan 29 2026)
+- **TWSS-1**: TripWire Skill Spec — execution-aware skill standard defining lifecycle states (provisional/confirmed/finalized/reorged), three-layer gating (can_pay/can_trust/is_safe), and two-phase execution (prepare/commit). See docs/SKILL-SPEC.md
 - **Trigger Registry**: Dynamic trigger system — create triggers for any EVM event via MCP or API, no deploy needed
-- **x402 Bazaar**: Agent service discovery via /.well-known/x402-manifest.json
+- **x402 Bazaar**: Agent service discovery via /.well-known/x402-manifest.json + /.well-known/tripwire-skill-spec.json
+
+## Decoder Phases (C1-C3)
+- **C1 (Implemented)**: Decoder protocol + DecodedEvent envelope + ERC3009Decoder + AbiGenericDecoder in `tripwire/ingestion/decoders/`
+- **C2 (Implemented)**: Unified processing loop — single code path for ERC-3009 and dynamic triggers via `_process_unified()`. Feature-flagged: `UNIFIED_PROCESSOR=true` (default false). Dynamic triggers gain finality, policy, execution state, notify mode, tracing, metrics.
+- **C3 (Implemented)**: Per-trigger payment gating — `require_payment`, `payment_token`, `min_payment_amount` on Trigger model. `payment_amount/token/from/to` on DecodedEvent. Migration 024.
 
 ## Webhook Delivery (Convoy + direct httpx fast path)
 - Dual-path architecture: direct httpx POST for low-latency fast path; Convoy for managed delivery with retries, HMAC signing, and DLQ

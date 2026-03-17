@@ -20,7 +20,7 @@ Base URL: https://<host>:3402/api/v1
 | `/api/v1/ingest` | Goldsky and facilitator ingestion |
 | `/api/v1/stats` | Processing statistics and agent metrics |
 | `/auth` | Nonce issuance (root-level, no `/api/v1`) |
-| `/.well-known` | x402 manifest (root-level) |
+| `/.well-known` | x402 manifest + TWSS-1 skill spec (root-level) |
 | `/health`, `/ready`, `/metrics` | Operational (root-level) |
 | `/mcp` | MCP server (root-level) |
 
@@ -815,9 +815,19 @@ x402 Bazaar service discovery manifest. Returns metadata about TripWire's MCP to
     { "chain_id": 8453, "name": "Base" },
     { "chain_id": 1, "name": "Ethereum" },
     { "chain_id": 42161, "name": "Arbitrum" }
-  ]
+  ],
+  "skill_spec": {
+    "version": "1.0.0-draft",
+    "url": "https://<host>:3402/.well-known/tripwire-skill-spec.json"
+  }
 }
 ```
+
+### GET /.well-known/tripwire-skill-spec.json
+
+[TWSS-1 Skill Spec](SKILL-SPEC.md) machine-readable schema. Returns the execution-aware skill output contract, three-layer gating model, two-phase execution model (prepare/commit), chain finality reference, and determinism guarantees.
+
+**Auth**: None required.
 
 ---
 

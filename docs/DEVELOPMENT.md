@@ -31,6 +31,8 @@ The dev server starts on port **3402** by default (`http://localhost:3402`). It 
 
 **Goldsky data plane note:** Full end-to-end event flow requires Goldsky Turbo pipelines deployed and streaming live chain data to TripWire's `/api/v1/ingest/goldsky` endpoint. For local development you do not need Goldsky running — use `POST /api/v1/ingest/event` to submit a single raw event dict directly. This bypasses Goldsky entirely and runs the event through `EventProcessor` (or publishes to the Redis event bus when `EVENT_BUS_ENABLED=true`), giving you the full processing pipeline without a live chain connection.
 
+**Unified processor:** Set `UNIFIED_PROCESSOR=true` to route both ERC-3009 and dynamic triggers through the single-path `_process_unified()` pipeline. This gives dynamic triggers finality checking, full policy evaluation, and execution state metadata. Default is `false` (legacy split paths). See [TWSS-1 Skill Spec](SKILL-SPEC.md) for the execution semantics.
+
 Minimum `.env` for local dev (Supabase required):
 
 ```

@@ -27,10 +27,15 @@ When the facilitator path is not used (Goldsky-only flow), the event starts at `
 Chain (Base / Ethereum / Arbitrum)
   -> Goldsky Turbo (index raw logs + SQL transform)
     -> POST /ingest (decoded payload arrives at TripWire)
-      -> Dedup / Finality / Identity / Policy
+      -> Decode -> Filter -> Payment Gate -> Dedup -> Finality || Identity -> Policy
         -> Convoy (Execute mode) or Supabase Realtime (Notify mode)
           -> Developer endpoint
 ```
+
+When `UNIFIED_PROCESSOR=true`, both ERC-3009 and dynamic triggers flow through
+a single code path (`_process_unified`) using `DecodedEvent` as the uniform
+data structure. See [SKILL-SPEC (TWSS-1)](SKILL-SPEC.md) for the formal
+execution semantics and three-layer gating model (`can_pay?` / `can_trust?` / `is_safe?`).
 
 The **facilitator fast path** (`payment.pre_confirmed`) bypasses Goldsky entirely. The x402 facilitator POSTs the ERC-3009 authorization directly to TripWire after verifying the signature, before the transaction is submitted onchain. This path skips Goldsky, decode, and finality stages entirely. When the real transaction later lands onchain, Goldsky delivers it and TripWire promotes the same event to `payment.confirmed` (and subsequently `payment.finalized`).
 
@@ -363,6 +368,20 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
 ### Dynamic Trigger Payload (`wire.triggered`)
 
 Dynamic trigger events use a slightly different payload structure. The `data` field contains the ABI-decoded event fields directly, and includes a `trigger_id`.
+
+When `UNIFIED_PROCESSOR=true`, dynamic trigger payloads gain execution state
+fields (`execution_state`, `safe_to_execute`, `trust_source`, `finality`) that
+were previously exclusive to ERC-3009 payloads. See the
+[TWSS-1 Skill Output Contract](SKILL-SPEC.md#6-skill-output-contract) for
+the canonical format.
+
+#### Three-Layer Gating
+
+Dynamic triggers pass through three gates before dispatch (see [TWSS-1](SKILL-SPEC.md#4-three-layer-gating)):
+
+1. **Payment gate** (`can_pay?`) — If `trigger.require_payment=true`, the decoded event must contain payment metadata meeting `min_payment_amount` and `payment_token` requirements (Phase C3).
+2. **Identity gate** (`can_trust?`) — Reputation threshold and agent class checks via ERC-8004.
+3. **Execution gate** (`is_safe?`) — Finality depth gating per endpoint policy.
 
 #### Reputation Gating
 

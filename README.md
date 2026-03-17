@@ -229,6 +229,7 @@ Every delivery follows the v1 payload schema. The `execution_state` and `safe_to
 | [Security](docs/SECURITY.md)               | Auth model, HMAC signing, threat model           |
 | [Operations](docs/OPERATIONS.md)           | Deployment, monitoring, DLQ handling             |
 | [Development](docs/DEVELOPMENT.md)         | Local setup, testing, contribution guidelines    |
+| [Skill Spec (TWSS-1)](docs/SKILL-SPEC.md)  | Execution-aware skill standard                   |
 | [Team Update](docs/TEAM-UPDATE.md)         | Latest sprint summary and known issues           |
 
 ---

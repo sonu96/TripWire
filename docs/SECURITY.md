@@ -418,7 +418,19 @@ Configuration:
 
 X402-tier MCP tools (`register_middleware`, `create_trigger`, `activate_template`) require an `X-PAYMENT` header. The payment is verified against the tool's declared price via the x402 facilitator, and settled only after successful tool execution.
 
-### 10.3 ERC-3009 Model
+### 10.3 Per-Trigger Payment Gating (Phase C3)
+
+Dynamic triggers can require that decoded events contain payment metadata before dispatch. This is distinct from x402 tool-level payment — it gates the *event delivery pipeline*, not the MCP call.
+
+| Field | Type | Description |
+|---|---|---|
+| `require_payment` | bool | Enable payment gating on this trigger |
+| `payment_token` | address/null | Required token contract (null = any) |
+| `min_payment_amount` | string/null | Minimum amount in smallest unit |
+
+Payment gating runs *before* deduplication in the unified processor pipeline, so rejected events do not consume nonces. See [TWSS-1 Three-Layer Gating](SKILL-SPEC.md#4-three-layer-gating) for the full `can_pay? -> can_trust? -> is_safe?` model.
+
+### 10.4 ERC-3009 Model
 
 x402 payments use **ERC-3009 `transferWithAuthorization`** -- gasless USDC transfers where the payer signs an authorization that is submitted onchain by the facilitator. The facilitator verifies the ERC-3009 signature before calling TripWire's `/ingest/facilitator` endpoint.
 

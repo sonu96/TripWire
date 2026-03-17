@@ -68,6 +68,12 @@ All configuration is loaded from environment variables (or a `.env` file) via py
 | `IDENTITY_CACHE_TTL` | int | `300` | No | Seconds to cache identity lookups. |
 | `FACILITATOR_WEBHOOK_SECRET` | SecretStr | `""` | No | Validates x402 facilitator callbacks. |
 
+### Unified Processor (Phase C2)
+
+| Variable | Type | Default | Required in prod | Description |
+|---|---|---|---|---|
+| `UNIFIED_PROCESSOR` | bool | `false` | No | Enable unified processing loop for ERC-3009 and dynamic triggers. When true, both event types flow through `_process_unified()` — dynamic triggers gain finality checking, full policy evaluation, execution state metadata, notify mode, tracing, and metrics. See [TWSS-1 Skill Spec](SKILL-SPEC.md). |
+
 ### Event Bus (Redis Streams)
 
 | Variable | Type | Default | Required in prod | Description |

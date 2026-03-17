@@ -17,6 +17,8 @@ The server exposes 8 tools for trigger management, template browsing, and event 
 
 MCP is the **control plane**: agents use it to configure what events to watch and where to deliver them. **Goldsky Turbo is the data plane**: it indexes the target chains in real time and delivers matching event logs to TripWire's `/ingest` endpoint via webhook. When an agent registers triggers through MCP, no additional blockchain infrastructure is required — events flow automatically from Goldsky's indexing pipeline into TripWire's event processor, which evaluates them against registered triggers and dispatches webhooks.
 
+MCP tools map to the [TWSS-1 Skill Spec](SKILL-SPEC.md) lifecycle: `register_middleware` and `create_trigger` create skill definitions, `activate_template` instantiates skills from the Bazaar, and `search_events` returns results with the TWSS-1 [execution output contract](SKILL-SPEC.md#6-skill-output-contract) (`execution.state`, `execution.safe_to_execute`, `execution.trust_source`).
+
 ### Server Info
 
 | Field             | Value           |
