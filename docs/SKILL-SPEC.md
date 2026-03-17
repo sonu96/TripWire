@@ -1,69 +1,60 @@
 # TWSS-1: TripWire Skill Spec
 
-**Version:** 1.0.0-draft
+**Version:** 1.0.0
 **Status:** Draft
 **Date:** 2026-03-17
-**Authors:** TripWire Team
 
 > Everyone defines skills as "what to do." This spec defines "when it's safe to do it."
 
----
-
-## 1. Overview
-
-TWSS-1 defines execution-aware skills for onchain AI agent systems. A TripWire
-Skill is a programmable onchain event trigger that carries execution semantics
--- lifecycle state, trust attribution, safety guarantees, payment gating, and
-identity verification.
-
-Skills are the atomic unit of the TripWire platform. They are discoverable,
-composable, and monetizable via the x402 Bazaar.
-
-### 1.1 Design Principles
-
-- **Simple over complete.** V1 covers the 80% case.
-- **Opinionated over flexible.** One way to express execution safety.
-- **Implementable over theoretical.** Every field maps to running code.
-
-### 1.2 What This Spec Covers
-
-| Section | Purpose |
-|---------|---------|
-| Execution Semantics | The core: lifecycle, trust, safety |
-| Two-Phase Execution | prepare (provisional) / commit (finalized) |
-| Three-Layer Gating | can_pay? can_trust? is_safe? |
-| Skill Definition | Schema for declaring a skill |
-| Skill Output Contract | Schema for skill results |
-| Skill Lifecycle | draft / active / deprecated / archived |
-| Determinism Guarantees | What agents can rely on |
-| Integration Points | MCP, x402, ERC-8004 |
+The key words MUST, MUST NOT, SHOULD, and MAY in this document are to be
+interpreted as described in RFC 2119.
 
 ---
 
-## 2. Execution Semantics (CORE)
+## 1. Scope
 
-This is the centerpiece. Every other section builds on this.
+TWSS-1 defines execution-aware skills for onchain AI agent systems.
 
-### 2.1 Execution State Lifecycle
+A **Skill** is a declarative trigger bound to an onchain event that produces
+execution-aware output. Skills carry lifecycle state, trust attribution,
+safety guarantees, payment gating, and identity verification.
 
-An onchain event progresses through states. A skill's output reflects
-which state the triggering event has reached.
+This spec defines:
+- What a Skill Definition MUST contain
+- What a Skill Output MUST contain
+- What MUST be true about execution state
+- What MUST be true about determinism
+
+This spec does NOT define:
+- How the runtime processes events internally
+- What infrastructure delivers webhooks
+- How identity is resolved
+
+---
+
+## 2. Execution Semantics
+
+This is the core of the spec. Everything else depends on this.
+
+### 2.1 States
+
+Every skill output carries exactly one of four execution states:
 
 ```
               [EVENT DETECTED]
                     |
                     v
              +--------------+
-             | PROVISIONAL  |  ~100ms    facilitator verified signature
-             | prepare()    |            tx NOT yet onchain
+             | PROVISIONAL  |  prepare()
+             | safe = false |
              +--------------+
                     |
           tx lands onchain
                     |
                     v
              +--------------+
-             | CONFIRMED    |  ~1-13s    1+ block confirmations
-             |              |            onchain but not yet final
+             | CONFIRMED    |  wait()
+             | safe = false |
              +--------------+
                     |
         +-----------+-----------+
@@ -78,43 +69,57 @@ which state the triggering event has reached.
  +--------------+        +--------------+
 ```
 
-### 2.2 State Definitions
+### 2.2 State Rules
 
-| State | Confirmations | Trust Source | safe_to_execute | Agent Action |
-|-------|---------------|-------------|-----------------|--------------|
-| `provisional` | 0 | `facilitator` | `false` | Show spinner. Preview only. |
-| `confirmed` | 1+ | `onchain` | `false` | Update balances. No irreversible ops. |
-| `finalized` | chain depth* | `onchain` | `true` | Transfer funds. Mint. Grant access. |
-| `reorged` | invalidated | `onchain` | `false` | Undo everything. Notify user. |
+| State | `safe_to_execute` | `trust_source` | `finality` |
+|-------|:-:|---|---|
+| `provisional` | `false` | `facilitator` | `null` |
+| `confirmed` | `false` | `onchain` | object |
+| `finalized` | `true` | `onchain` | object, `is_finalized: true` |
+| `reorged` | `false` | `onchain` | object, `is_finalized: false` |
 
-*Chain finality depths: Ethereum 12, Base 3, Arbitrum 1. Configurable per-endpoint.
+### 2.3 The Safety Rule
 
-### 2.3 Trust Sources
+> **`safe_to_execute` MUST be `true` ONLY when `state` is `finalized`.**
 
-| Source | Meaning | Confidence |
-|--------|---------|------------|
-| `facilitator` | Off-chain signature verification (x402) | ~0.99 |
-| `onchain` | Block confirmations verified via RPC | 1.0 |
+This is the foundational invariant of TWSS-1. No exceptions.
+
+Formally:
+
+```
+safe_to_execute == true
+  REQUIRES state == "finalized"
+  REQUIRES trust_source == "onchain"
+  REQUIRES finality.confirmations >= finality.required
+  REQUIRES finality.is_finalized == true
+```
+
+A conforming implementation MUST NOT set `safe_to_execute = true` under
+any other conditions.
+
+### 2.4 Trust Sources
+
+| Source | Meaning |
+|--------|---------|
+| `facilitator` | Off-chain cryptographic signature verification |
+| `onchain` | Block confirmations verified against chain state |
+
+A conforming implementation MUST set `trust_source = "facilitator"` only
+for `provisional` state and `trust_source = "onchain"` for all other states.
 
 ---
 
-## 3. Two-Phase Execution Model
+## 3. Two-Phase Execution
 
-This is the killer concept. Skills operate in two phases:
+Skills operate in two phases. Consuming agents MUST implement both.
 
-### 3.1 prepare() -- Provisional Phase
+### 3.1 Phase 1: prepare()
 
-Triggered when the facilitator verifies an ERC-3009 signature but the
-transaction is not yet onchain. Latency: ~100ms.
+Triggered when `state == "provisional"`.
 
-```
-Agent receives: execution.state = "provisional"
-Agent action:   prepare() -- optimistic UI, hold resources, do NOT commit
-```
-
-The agent CAN:
-- Show success UI to the user
-- Reserve inventory
+The agent MAY:
+- Show optimistic UI
+- Reserve resources
 - Start background processing
 
 The agent MUST NOT:
@@ -123,107 +128,103 @@ The agent MUST NOT:
 - Grant permanent access
 - Write irreversible state
 
-### 3.2 commit() -- Finalized Phase
+### 3.2 Phase 2: commit()
 
-Triggered when the transaction reaches chain-specific finality depth.
-Latency: 250ms (Arbitrum) to ~2.5min (Ethereum).
+Triggered when `state == "finalized"` AND `safe_to_execute == true`.
 
-```
-Agent receives: execution.state = "finalized", execution.safe_to_execute = true
-Agent action:   commit() -- execute irreversible business logic
-```
-
-The agent CAN:
+The agent MAY:
 - Transfer funds
 - Mint tokens
 - Grant permanent access
 - Finalize orders
 
-### 3.3 rollback() -- Reorg Phase
+### 3.3 rollback()
 
-Triggered when a block reorganization invalidates the transaction.
+Triggered when `state == "reorged"`.
 
-```
-Agent receives: execution.state = "reorged"
-Agent action:   rollback() -- undo prepare(), restore previous state
-```
+The agent MUST undo all effects of `prepare()`.
 
 ---
 
 ## 4. Three-Layer Gating
 
-Every skill invocation passes through three gates. All three must pass.
+Every skill invocation passes through three gates. All three MUST pass.
 
 ```
   Event arrives
        |
-       v
-  [1. CAN PAY?]     Payment gating
+  [1. CAN PAY?]     → Payment gate
        |
-       v
-  [2. CAN TRUST?]   Identity + reputation gating
+  [2. CAN TRUST?]   → Identity gate
        |
-       v
-  [3. IS SAFE?]      Execution state gating
+  [3. IS SAFE?]      → Execution gate
        |
-       v
-  Skill executes
+  Skill fires
 ```
 
-### 4.1 Layer 1: Payment Gate (`can_pay?`)
+### 4.1 Payment Gate
 
-Does this event carry sufficient payment?
+Does the event carry sufficient payment?
 
-**MCP tool level:**
+```json
+{
+  "payment": {
+    "required": true,
+    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+    "min_amount": "1000000"
+  }
+}
+```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `auth_tier` | enum | `PUBLIC` / `SIWX` / `X402` |
-| `price` | string | Per-invocation price (e.g. `"$0.003"`) |
-| `network` | string | CAIP-2 chain (e.g. `"eip155:8453"`) |
+| `required` | bool | Whether payment metadata MUST be present |
+| `token` | address / null | Required token contract. `null` = any. |
+| `min_amount` | string / null | Minimum in smallest unit |
 
-**Event trigger level:**
+If `required` is `true` and the decoded event does not contain payment
+metadata meeting all specified constraints, the skill MUST NOT fire.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `require_payment` | bool | Gate on payment metadata |
-| `payment_token` | address / null | Required token (null = any) |
-| `min_payment_amount` | string / null | Minimum in smallest unit |
-
-### 4.2 Layer 2: Identity Gate (`can_trust?`)
+### 4.2 Identity Gate
 
 Is the sender a known, reputable agent?
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `min_reputation` | float (0-100) | Minimum ERC-8004 reputation score |
-| `required_agent_class` | string / null | Required agent type (e.g. `"trading-bot"`) |
-
-Identity is resolved from ERC-8004 onchain registry. Reputation is
-aggregated from onchain feedback. Cache TTL: 300s.
-
-### 4.3 Layer 3: Execution Gate (`is_safe?`)
-
-Has the triggering event reached sufficient finality?
+```json
+{
+  "identity": {
+    "min_reputation": 10.0,
+    "required_agent_class": "trading-bot"
+  }
+}
+```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `execution.state` | enum | Current lifecycle state |
-| `execution.safe_to_execute` | bool | `true` only when finalized |
-| `execution.finality.confirmations` | int | Current block depth |
-| `execution.finality.required` | int | Required depth for this endpoint |
+| `min_reputation` | float (0-100) | Minimum reputation score |
+| `required_agent_class` | string / null | Required agent type |
 
-`safe_to_execute = true` requires ALL of:
-- `state == "finalized"`
-- `confirmations >= required`
-- No reorg detected
-- `trust_source == "onchain"`
+Identity MUST be resolved from an onchain registry (ERC-8004). If the
+sender has no registered identity and either gate is set, the skill
+MUST NOT fire.
+
+### 4.3 Execution Gate
+
+Has the event reached sufficient finality?
+
+| Condition | Result |
+|-----------|--------|
+| `finality.confirmations >= finality.required` | Gate passes |
+| `finality.confirmations < finality.required` | Skill deferred |
+| `state == "reorged"` | Gate fails |
+
+The required finality depth MAY be configured per-skill or per-endpoint.
+Chain defaults: Ethereum 12, Base 3, Arbitrum 1.
 
 ---
 
-## 5. Skill Definition Schema
+## 5. Skill Definition
 
-A skill definition declares what the skill watches for and how it behaves.
+A Skill Definition declares what event to watch and how to gate it.
 
 ```json
 {
@@ -236,7 +237,7 @@ A skill definition declares what the skill watches for and how it behaves.
 
   "event": {
     "signature": "Transfer(address,address,uint256)",
-    "abi": [{"type": "event", "name": "Transfer", "inputs": [...]}],
+    "abi": [{"type": "event", "name": "Transfer", "inputs": ["..."]}],
     "chains": [8453, 1, 42161],
     "contract": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
   },
@@ -256,16 +257,17 @@ A skill definition declares what the skill watches for and how it behaves.
 
   "gating": {
     "payment": {
-      "require_payment": false
+      "required": false
     },
     "identity": {
-      "min_reputation": 0.0,
+      "min_reputation": 0,
       "required_agent_class": null
     }
   },
 
   "delivery": {
-    "webhook_event_type": "transfer.whale",
+    "type": "trigger",
+    "event_type": "transfer.whale",
     "modes": ["execute", "notify"]
   }
 }
@@ -273,31 +275,68 @@ A skill definition declares what the skill watches for and how it behaves.
 
 ### 5.1 Required Fields
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | string | Human-readable name |
-| `slug` | string | URL-safe identifier (kebab-case) |
-| `version` | string | Semantic version |
-| `event.signature` | string | Solidity event signature |
-| `event.abi` | array | ABI fragment for decoding |
-| `delivery.webhook_event_type` | string | Event type in webhook payload |
+| Field | Type | Rule |
+|-------|------|------|
+| `name` | string | MUST be human-readable |
+| `slug` | string | MUST be kebab-case, unique |
+| `version` | string | MUST be semver |
+| `event.signature` | string | MUST be a valid Solidity event signature |
+| `event.abi` | array | MUST be a valid ABI fragment for decoding |
+| `delivery.event_type` | string | MUST identify the webhook event type |
 
 ### 5.2 Optional Fields
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `event.chains` | `[8453]` | Supported chain IDs |
-| `event.contract` | `null` | Specific contract (null = any) |
-| `parameters` | `[]` | User-configurable inputs |
-| `filters` | `[]` | JMESPath filter rules |
-| `gating.payment` | `{require_payment: false}` | Payment requirements |
-| `gating.identity` | `{min_reputation: 0}` | Identity requirements |
+| Field | Default | Rule |
+|-------|---------|------|
+| `event.chains` | `[8453]` | SHOULD list all supported chain IDs |
+| `event.contract` | `null` | MAY restrict to a specific contract |
+| `parameters` | `[]` | MAY define user-configurable inputs |
+| `filters` | `[]` | MAY define filter predicates on decoded fields |
+| `gating.payment` | `{required: false}` | MAY require payment metadata |
+| `gating.identity` | `{min_reputation: 0}` | MAY require agent identity |
 
 ---
 
-## 6. Skill Output Contract
+## 6. Skill Instance
 
-This is the canonical output format. Every TripWire skill produces this.
+A Skill Instance is a deployed, configured binding of a Skill Definition
+to a delivery endpoint.
+
+```json
+{
+  "instance_id": "inst_abc123",
+  "skill": "whale-usdc-transfer",
+  "version": "1.0.0",
+  "endpoint_id": "ep_xyz789",
+  "owner": "0xAgentAddress",
+
+  "config": {
+    "threshold": "5000000000"
+  },
+
+  "status": "active"
+}
+```
+
+| Field | Type | Rule |
+|-------|------|------|
+| `instance_id` | string | MUST be unique |
+| `skill` | string | MUST reference a valid skill slug |
+| `version` | string | MUST be pinned to a specific semver |
+| `endpoint_id` | string | MUST reference a valid delivery endpoint |
+| `owner` | address | MUST be the agent that created the instance |
+| `config` | object | MUST satisfy the skill's `parameters` schema |
+| `status` | enum | `active` / `paused` / `deleted` |
+
+An agent MUST own the endpoint to create an instance.
+One agent MAY create multiple instances of the same skill.
+
+---
+
+## 7. Skill Output Contract
+
+Every skill output MUST conform to this schema. This is the contract
+between the platform and the consuming agent.
 
 ```json
 {
@@ -318,16 +357,7 @@ This is the canonical output format. Every TripWire skill produces this.
     }
   },
 
-  "data": {
-    "chain_id": 8453,
-    "tx_hash": "0x9f86d081...",
-    "block_number": 28451023,
-    "from_address": "0x1234...5678",
-    "to_address": "0xabcd...efab",
-    "amount": "5000000000",
-    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
-    "decoded_fields": {}
-  },
+  "data": {},
 
   "identity": {
     "address": "0x1234...5678",
@@ -338,311 +368,152 @@ This is the canonical output format. Every TripWire skill produces this.
 }
 ```
 
-### 6.1 The `execution` Block (Required)
+### 7.1 Required Fields
 
-Every skill output MUST include this block. It is the contract between
-TripWire and the consuming agent.
+| Field | Type | Rule |
+|-------|------|------|
+| `id` | string | MUST be unique per event |
+| `idempotency_key` | string | MUST be deterministic (see 8.1) |
+| `type` | string | MUST match `delivery.event_type` from skill definition |
+| `version` | string | MUST be `"v1"` |
+| `timestamp` | integer | MUST be Unix epoch seconds |
+| `execution` | object | MUST conform to Section 2 |
+| `data` | object | MUST contain decoded event fields |
 
-```json
-{
-  "execution": {
-    "state": "provisional | confirmed | finalized | reorged",
-    "safe_to_execute": false,
-    "trust_source": "facilitator | onchain",
-    "finality": {
-      "confirmations": 0,
-      "required": 3,
-      "is_finalized": false
-    }
-  }
-}
-```
+### 7.2 The `execution` Block
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `state` | enum | yes | Current lifecycle state |
-| `safe_to_execute` | bool | yes | Gate for irreversible actions |
-| `trust_source` | enum | yes | Who vouches for this state |
-| `finality` | object/null | yes | Block confirmation data (null if provisional) |
+MUST be present on every output. MUST follow the safety rule (Section 2.3).
 
-### 6.2 The `identity` Block (Optional)
+| Field | Type | Rule |
+|-------|------|------|
+| `execution.state` | enum | MUST be one of: `provisional`, `confirmed`, `finalized`, `reorged` |
+| `execution.safe_to_execute` | bool | MUST be `true` ONLY when `state == "finalized"` |
+| `execution.trust_source` | enum | MUST be `"facilitator"` or `"onchain"` |
+| `execution.finality` | object / null | MUST be `null` when `state == "provisional"` |
 
-Present when the sender is a registered ERC-8004 agent.
+### 7.3 The `identity` Block
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `address` | string | Agent wallet |
-| `agent_class` | string | Registered type |
-| `reputation_score` | float | 0-100 aggregated score |
-| `capabilities` | string[] | Declared capabilities |
+SHOULD be present when the sender is a registered agent.
 
-### 6.3 The `idempotency_key` (Required)
+| Field | Type | Rule |
+|-------|------|------|
+| `identity.address` | string | MUST be a valid address |
+| `identity.agent_class` | string | MUST match onchain registration |
+| `identity.reputation_score` | float | MUST be 0-100 |
+| `identity.capabilities` | string[] | SHOULD list declared capabilities |
 
-Deterministic. Derived from `SHA256(chain_id : tx_hash : log_index : endpoint_id : event_type)`.
+### 7.4 The `idempotency_key`
 
-Consuming agents MUST deduplicate on this key. TripWire guarantees:
-same event + same endpoint + same type = same idempotency_key.
+MUST be deterministic. Given the same onchain event, the same endpoint,
+and the same event type, the key MUST be identical across retries.
+
+Consuming agents MUST deduplicate on this key.
 
 ---
 
-## 7. Determinism Guarantees
+## 8. Determinism Guarantees
 
-What agents can rely on:
+A conforming implementation MUST provide these guarantees:
 
-### 7.1 Idempotency
+### 8.1 Idempotency
 
-Given the same onchain event, TripWire produces the same `idempotency_key`.
-Replays (Convoy retries, DLQ reprocessing) are safe to deduplicate.
+Same onchain event + same endpoint + same type = same `idempotency_key`.
+Retries and replays produce identical keys.
 
-### 7.2 Ordering
+### 8.2 Ordering
 
-Events for the same `event_id` are delivered in lifecycle order:
-`provisional` -> `confirmed` -> `finalized`. A `reorged` event may
-arrive at any point after `provisional`.
+Outputs for the same `id` MUST be delivered in lifecycle order:
+`provisional` -> `confirmed` -> `finalized`.
 
-### 7.3 At-Least-Once Delivery
+A `reorged` output MAY arrive at any point after `provisional`.
 
-Every event is delivered at least once via Convoy (10 retries, exponential
-backoff, DLQ). Consuming agents MUST handle duplicates via `idempotency_key`.
+### 8.3 At-Least-Once Delivery
 
-### 7.4 Finality Monotonicity
+Every output MUST be delivered at least once. Consuming agents MUST
+handle duplicates via `idempotency_key`.
 
-Once `safe_to_execute = true` is delivered for an event, it will not be
-revoked unless a `reorged` event follows. Finality confirmations only
-increase (except on reorg).
+### 8.4 Finality Monotonicity
 
-### 7.5 Nonce Uniqueness
+Once `safe_to_execute = true` is delivered for an event, it MUST NOT be
+revoked unless a `reorged` output follows.
 
-Each ERC-3009 authorization nonce is processed exactly once. The
-`(chain_id, nonce, authorizer)` tuple is unique across the system.
-Reorged nonces are released for reuse.
+`finality.confirmations` MUST only increase for the same event (except
+on reorg, where it resets to 0).
+
+### 8.5 Nonce Uniqueness
+
+Each authorization nonce MUST be processed exactly once. The tuple
+`(chain_id, nonce, authorizer)` MUST be globally unique.
+
+Reorged nonces MUST be released for reuse.
 
 ---
 
-## 8. Skill Lifecycle
-
-Skills progress through four states:
+## 9. Skill Lifecycle
 
 ```
 DRAFT ──> ACTIVE ──> DEPRECATED ──> ARCHIVED
 ```
 
-| State | Discoverable | Activatable | Existing Instances | Editable |
+| State | Discoverable | Activatable | Instances Run | Editable |
 |-------|:---:|:---:|:---:|:---:|
 | `draft` | no | no | n/a | yes |
-| `active` | yes | yes | running | no |
-| `deprecated` | yes (marked) | no (new) | running | no |
-| `archived` | no | no | running | no |
+| `active` | yes | yes | yes | no |
+| `deprecated` | yes (marked) | no (new) | yes | no |
+| `archived` | no | no | yes | no |
 
-### 8.1 Versioning
-
-Skills use semantic versioning (`major.minor.patch`):
-
-- **Major**: Breaking changes (renamed params, removed fields)
-- **Minor**: New optional parameters, filter improvements
-- **Patch**: Bug fixes, security updates
-
-Active instances continue running on their installed version.
-New activations use the latest active version.
-
-### 8.2 Discovery
-
-Skills are discoverable via:
-
-1. **MCP**: `list_templates` tool returns active skill definitions
-2. **Bazaar**: `/.well-known/x402-manifest.json` advertises available skills
-3. **API**: `GET /marketplace/discover` with category/search filters
+- A Skill Definition MUST NOT be modified after entering `active` state.
+- A new version MUST be published as a new Skill Definition.
+- Existing instances MUST continue running on their pinned version.
+- Versions MUST use semver. Major = breaking, minor = additive, patch = fix.
 
 ---
 
-## 9. Integration Points
+## 10. Chain Finality
 
-### 9.1 MCP (Model Context Protocol)
+| Chain | CAIP-2 | Default Depth | Block Time |
+|-------|--------|:---:|---|
+| Ethereum | `eip155:1` | 12 | ~12s |
+| Base | `eip155:8453` | 3 | ~2s |
+| Arbitrum | `eip155:42161` | 1 | ~250ms |
 
-Skills are exposed as MCP tools at `/mcp`. The 8 tools map to skill
-lifecycle operations:
+Finality depth MAY be overridden per-endpoint (range: 1-64).
 
-| Operation | MCP Tool | Auth |
-|-----------|----------|------|
-| Create endpoint + skills | `register_middleware` | X402 |
-| Create custom skill | `create_trigger` | X402 |
-| Install from Bazaar | `activate_template` | X402 |
-| List my skills | `list_triggers` | SIWX |
-| Remove skill | `delete_trigger` | SIWX |
-| Browse Bazaar | `list_templates` | SIWX |
-| Check health | `get_trigger_status` | SIWX |
-| Query events | `search_events` | SIWX |
-
-### 9.2 x402 (Payment Protocol)
-
-- Skill invocation can require x402 micropayment (X402 auth tier)
-- Skill events can gate on payment metadata (C3 payment gating)
-- Settlement via ERC-3009 `transferWithAuthorization` (gasless USDC)
-- Bazaar manifest at `/.well-known/x402-manifest.json`
-
-### 9.3 ERC-8004 (Agent Identity)
-
-- Agent identity resolved from onchain registry (CREATE2, all chains)
-- Reputation score gates skill access (`min_reputation`)
-- Agent class gates event delivery (`required_agent_class`)
-- Every skill output includes `identity` block when available
-
-### 9.4 CAIP-2 (Chain Identification)
-
-- All chain references use CAIP-2 format: `eip155:{chain_id}`
-- Supported: `eip155:1` (Ethereum), `eip155:8453` (Base), `eip155:42161` (Arbitrum)
+All chain references MUST use CAIP-2 format: `eip155:{chain_id}`.
 
 ---
 
-## 10. Examples
+## 11. Conformance
 
-### 10.1 Skill: x402 Payment Monitor
+An implementation is TWSS-1 conformant if:
 
-```json
-{
-  "name": "x402-payment",
-  "slug": "x402-payment",
-  "version": "1.0.0",
-  "description": "Monitor x402 USDC payments to your endpoint",
-  "category": "payments",
+1. Every skill output includes the `execution` block per Section 7.2
+2. `safe_to_execute` is `true` ONLY when `state == "finalized"` (Section 2.3)
+3. `trust_source` follows the rules in Section 2.4
+4. Idempotency keys are deterministic (Section 8.1)
+5. Delivery order follows Section 8.2
+6. Finality monotonicity holds per Section 8.4
+7. Nonce uniqueness holds per Section 8.5
+8. Three-layer gating is enforced per Section 4
 
-  "event": {
-    "signature": "AuthorizationUsed(address,address,uint256,bytes32)",
-    "abi": [{"type": "event", "name": "AuthorizationUsed", "inputs": [...]}],
-    "chains": [8453, 1, 42161],
-    "contract": null
-  },
+---
 
-  "parameters": [
-    {"name": "min_amount", "type": "uint256", "required": false, "description": "Min USDC (6 decimals)"}
-  ],
+## Appendix A: Landscape
 
-  "filters": [
-    {"field": "value", "op": "gte", "value": "${min_amount}"}
-  ],
+| System | Execution State | Finality | Payment Gate | Identity Gate |
+|--------|:---:|:---:|:---:|:---:|
+| OpenAI Functions | - | - | - | - |
+| Anthropic MCP | - | - | - | - |
+| LangChain / CrewAI | - | - | - | - |
+| Coinbase AgentKit | - | - | - | partial |
+| ERC-7579 / 6900 | - | - | - | - |
+| ERC-8004 | - | - | - | yes |
+| x402 | - | - | yes | - |
+| **TWSS-1** | **yes** | **yes** | **yes** | **yes** |
 
-  "gating": {
-    "payment": {"require_payment": false},
-    "identity": {"min_reputation": 0}
-  },
+---
 
-  "delivery": {
-    "webhook_event_type": "payment.confirmed",
-    "modes": ["execute", "notify"]
-  }
-}
-```
-
-### 10.2 Skill Output: Provisional (prepare)
-
-```json
-{
-  "id": "evt_abc123",
-  "idempotency_key": "sha256:8453:0x...:0:ep_xyz:pre_confirmed",
-  "type": "payment.pre_confirmed",
-  "version": "v1",
-  "timestamp": 1710700800,
-
-  "execution": {
-    "state": "provisional",
-    "safe_to_execute": false,
-    "trust_source": "facilitator",
-    "finality": null
-  },
-
-  "data": {
-    "chain_id": 8453,
-    "tx_hash": "0x0000000000000000000000000000000000000000",
-    "block_number": 0,
-    "from_address": "0xAgent...",
-    "to_address": "0xYourAPI...",
-    "amount": "5000000",
-    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-  },
-
-  "identity": {
-    "address": "0xAgent...",
-    "agent_class": "trading-bot",
-    "reputation_score": 87.5,
-    "capabilities": ["swap"]
-  }
-}
-```
-
-### 10.3 Skill Output: Finalized (commit)
-
-```json
-{
-  "id": "evt_abc123",
-  "idempotency_key": "sha256:8453:0x9f86...:7:ep_xyz:finalized",
-  "type": "payment.finalized",
-  "version": "v1",
-  "timestamp": 1710700860,
-
-  "execution": {
-    "state": "finalized",
-    "safe_to_execute": true,
-    "trust_source": "onchain",
-    "finality": {
-      "confirmations": 3,
-      "required": 3,
-      "is_finalized": true
-    }
-  },
-
-  "data": {
-    "chain_id": 8453,
-    "tx_hash": "0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-    "block_number": 28451023,
-    "from_address": "0xAgent...",
-    "to_address": "0xYourAPI...",
-    "amount": "5000000",
-    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-  },
-
-  "identity": {
-    "address": "0xAgent...",
-    "agent_class": "trading-bot",
-    "reputation_score": 87.5,
-    "capabilities": ["swap"]
-  }
-}
-```
-
-### 10.4 Skill Output: Reorged (rollback)
-
-```json
-{
-  "id": "evt_abc123",
-  "idempotency_key": "sha256:8453:0x9f86...:7:ep_xyz:reorged",
-  "type": "payment.reorged",
-  "version": "v1",
-  "timestamp": 1710700900,
-
-  "execution": {
-    "state": "reorged",
-    "safe_to_execute": false,
-    "trust_source": "onchain",
-    "finality": {
-      "confirmations": 0,
-      "required": 3,
-      "is_finalized": false
-    }
-  },
-
-  "data": {
-    "chain_id": 8453,
-    "tx_hash": "0x9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-    "block_number": 28451023,
-    "from_address": "0xAgent...",
-    "to_address": "0xYourAPI...",
-    "amount": "5000000",
-    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-  }
-}
-```
-
-### 10.5 Consumer Pattern
+## Appendix B: Consumer Reference
 
 ```python
 @webhook("/tripwire")
@@ -651,111 +522,20 @@ async def handle(payload: dict):
 
     match execution["state"]:
         case "provisional":
-            # prepare() — optimistic UI, hold resources
-            await show_success_screen(payload["id"])
-            await reserve_inventory(payload["data"]["amount"])
+            await prepare(payload)       # optimistic, reversible only
 
         case "confirmed":
-            # waiting — update balance display, no irreversible ops
-            await update_balance(payload["data"])
+            await wait(payload)          # update display, no commits
 
         case "finalized":
             if execution["safe_to_execute"]:
-                # commit() — safe to execute irreversible logic
-                await transfer_funds(payload["data"])
-                await grant_access(payload["data"]["from_address"])
+                await commit(payload)    # irreversible operations
 
         case "reorged":
-            # rollback() — undo everything from prepare()
-            await rollback_reservation(payload["id"])
-            await notify_user("Payment was reorganized. Please retry.")
+            await rollback(payload)      # undo prepare()
 ```
 
 ---
 
-## 11. JSON Schema Reference
-
-Machine-readable schema for validation:
-
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://tripwire.dev/schemas/twss-1/v1",
-  "title": "TWSS-1 Skill Output",
-
-  "type": "object",
-  "required": ["id", "idempotency_key", "type", "version", "timestamp", "execution", "data"],
-
-  "properties": {
-    "id": {"type": "string"},
-    "idempotency_key": {"type": "string"},
-    "type": {"type": "string"},
-    "version": {"type": "string", "const": "v1"},
-    "timestamp": {"type": "integer"},
-
-    "execution": {
-      "type": "object",
-      "required": ["state", "safe_to_execute", "trust_source"],
-      "properties": {
-        "state": {"enum": ["provisional", "confirmed", "finalized", "reorged"]},
-        "safe_to_execute": {"type": "boolean"},
-        "trust_source": {"enum": ["facilitator", "onchain"]},
-        "finality": {
-          "oneOf": [
-            {"type": "null"},
-            {
-              "type": "object",
-              "required": ["confirmations", "required", "is_finalized"],
-              "properties": {
-                "confirmations": {"type": "integer", "minimum": 0},
-                "required": {"type": "integer", "minimum": 1, "maximum": 64},
-                "is_finalized": {"type": "boolean"}
-              }
-            }
-          ]
-        }
-      }
-    },
-
-    "data": {"type": "object"},
-    "identity": {
-      "type": "object",
-      "properties": {
-        "address": {"type": "string"},
-        "agent_class": {"type": "string"},
-        "reputation_score": {"type": "number", "minimum": 0, "maximum": 100},
-        "capabilities": {"type": "array", "items": {"type": "string"}}
-      }
-    }
-  }
-}
-```
-
----
-
-## Appendix A: Landscape Comparison
-
-| System | Execution State | Finality | Payment Gate | Identity Gate |
-|--------|:---:|:---:|:---:|:---:|
-| OpenAI Functions | - | - | - | - |
-| Anthropic MCP | - | - | - | - |
-| LangChain/CrewAI | - | - | - | - |
-| Coinbase AgentKit | - | - | - | partial |
-| ERC-7579/6900 | - | - | - | - |
-| ERC-8004 | - | - | - | yes |
-| x402 | - | - | yes | - |
-| **TWSS-1** | **yes** | **yes** | **yes** | **yes** |
-
----
-
-## Appendix B: Chain Finality Reference
-
-| Chain | CAIP-2 | Default Depth | Block Time | Time to Finalize |
-|-------|--------|---------------|------------|------------------|
-| Ethereum | eip155:1 | 12 | ~12s | ~2.5 min |
-| Base | eip155:8453 | 3 | ~2s | ~6s |
-| Arbitrum | eip155:42161 | 1 | ~250ms | ~5s |
-
----
-
-*TWSS-1 is an open specification. Feedback: github.com/tripwire/skill-spec*
+*TWSS-1 is an open specification.*
+*Machine-readable schema: `GET /.well-known/tripwire-skill-spec.json`*
