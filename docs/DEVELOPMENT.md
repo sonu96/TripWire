@@ -61,7 +61,10 @@ tripwire/
   db/              Supabase client, repositories, SQL migrations
     migrations/    Numbered SQL migration files (001..021)
     repositories/  Data access: endpoints, events, nonces, triggers, webhooks
-  identity/        ERC-8004 identity resolution (mock for MVP)
+  identity/        ERC-8004 identity resolution
+    resolver.py    ERC8004Resolver (prod, makes eth_call to onchain registry)
+                   and MockResolver (dev, returns hardcoded identities)
+    reputation.py  ReputationRegistry RPC client with 300s in-memory cache
   ingestion/       Goldsky pipeline processing, finality tracking,
                    event_bus.py (Redis Streams), trigger_worker.py,
                    dlq_consumer.py (Redis Streams DLQ consumer)
@@ -159,6 +162,16 @@ DEV_WALLET_ADDRESS=0xYourAddress python dev_server.py
 ```
 
 The dev server runs with `reload=True` so file changes restart the process automatically.
+
+**Identity resolution in dev mode:** When `APP_ENV=development`, the identity layer automatically uses `MockResolver` instead of `ERC8004Resolver`. The mock returns predictable identities for three hardcoded agent addresses without making any RPC calls:
+
+| Agent slug | Address |
+|---|---|
+| `trading-bot` | `0x70997970C51812dc3A010C7d01b50e0d17dc79C8` |
+| `data-oracle` | `0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC` |
+| `payment-agent` | `0x90F79bf6EB2c4f870365E785982E1f101E93b906` |
+
+Any address not in this list resolves to `None` (no registered identity). No RPC node is required for identity lookups during local development.
 
 **Important:** `dev_server.py` must never be deployed to production. It is the only file where the auth bypass exists.
 
@@ -318,6 +331,19 @@ pytest tests/ -m integration -v
 # Run with coverage
 pytest tests/ --cov=tripwire --cov-report=term-missing
 ```
+
+### Testing with Identity
+
+The `MockResolver` makes identity-dependent code testable without any external dependencies:
+
+- **Predictable outputs:** `MockResolver` returns a fixed `AgentIdentity` for the three known agent addresses (trading-bot, data-oracle, payment-agent) and `None` for all others, so assertions are deterministic.
+- **Dependency injection override:** Any route or service that receives the resolver via FastAPI `Depends()` can be overridden in tests by passing a `MockResolver` instance directly. For example:
+
+  ```python
+  app.dependency_overrides[get_identity_resolver] = lambda: MockResolver()
+  ```
+
+- **`sample_identity` fixture:** `conftest.py` provides a `sample_identity` fixture that returns a pre-built `AgentIdentity` model matching the `trading-bot` mock agent. Use it in tests that need a non-`None` identity without constructing one manually.
 
 ### Key Fixtures (from `tests/conftest.py` and `tests/_wallet_helpers.py`)
 

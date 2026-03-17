@@ -13,12 +13,13 @@ This document describes TripWire's authentication, authorization, and secret man
 3. [Request Signing Flow](#3-request-signing-flow)
 4. [Replay Prevention](#4-replay-prevention)
 5. [MCP Authentication](#5-mcp-authentication)
-6. [Secret Flows](#6-secret-flows)
-7. [Ownership Enforcement](#7-ownership-enforcement)
-8. [Row Level Security](#8-row-level-security)
-9. [x402 Payment Security](#9-x402-payment-security)
-10. [Webhook Delivery Security](#10-webhook-delivery-security)
-11. [Dev Mode](#11-dev-mode)
+6. [Identity-Based Access Control (ERC-8004)](#6-identity-based-access-control-erc-8004)
+7. [Secret Flows](#7-secret-flows)
+8. [Ownership Enforcement](#8-ownership-enforcement)
+9. [Row Level Security](#9-row-level-security)
+10. [x402 Payment Security](#10-x402-payment-security)
+11. [Webhook Delivery Security](#11-webhook-delivery-security)
+12. [Dev Mode](#12-dev-mode)
 
 ---
 
@@ -201,11 +202,50 @@ Each `ToolDef` has a `min_reputation` field (float). If greater than 0, the serv
 
 ---
 
-## 6. Secret Flows
+## 6. Identity-Based Access Control (ERC-8004)
+
+TripWire integrates with the ERC-8004 onchain AI agent identity registry to gate access based on agent class and reputation. Identity data is resolved from registry contracts on Base (chain 8453) via direct JSON-RPC calls — no self-reported claims are trusted.
+
+### 6.1 Reputation Gating in MCP
+
+After SIWE/X402 authentication succeeds, the MCP auth layer resolves the caller's ERC-8004 identity on Base (chain 8453) and populates `MCPAuthContext` with the agent's `agent_class` and `reputation_score`. Each `ToolDef` declares a `min_reputation` threshold. If `tool.min_reputation > 0` and the caller's `identity.reputation_score` falls below the threshold, the server returns JSON-RPC error `-32001` (`REPUTATION_TOO_LOW`) before the tool handler executes.
+
+**Current state**: All tools have `min_reputation=0.0`, so reputation gating is wired but not enforced. The mechanism is ready for activation on a per-tool basis without code changes.
+
+### 6.2 Identity Policies on Endpoints
+
+`EndpointPolicies` supports two identity-based policy fields evaluated during event processing, **before** webhook dispatch:
+
+- **`required_agent_class`**: The webhook fires only if the sender's ERC-8004 `agent_class` matches the policy value. Events from agents of a different class are silently filtered — no webhook is dispatched.
+- **`min_reputation_score`**: The webhook fires only if the sender's ERC-8004 `reputation_score` meets or exceeds the threshold. Events from agents below the threshold are silently filtered.
+
+These checks run in the event processor after deduplication and finality checks but before Convoy dispatch or direct httpx delivery. A filtered event is not retried or queued — it is dropped at evaluation time.
+
+### 6.3 Trust Properties
+
+ERC-8004 identity data has stronger trust guarantees than application-managed identity because:
+
+- **Onchain source of truth**: Identity records (agent class, reputation score) are read directly from registry contracts via `eth_call`, not from any TripWire-internal database or self-reported API field.
+- **External reputation**: Reputation scores are aggregated from onchain feedback submitted by other agents and protocols. TripWire does not compute or influence these scores.
+- **Deterministic deployment**: Registry contracts are CREATE2-deployed at the same address across all supported chains, eliminating address confusion across networks.
+
+### 6.4 Cache Staleness and Security Implications
+
+Identity resolution results are cached in-process with a **300-second (5-minute) TTL**. This means:
+
+- A reputation drop (e.g., from onchain slashing or negative feedback) takes up to 5 minutes to propagate to TripWire's access control decisions.
+- A compromised or misbehaving agent whose reputation is slashed onchain can continue to pass reputation gates and trigger webhook deliveries for up to 5 minutes after the slash transaction is finalized.
+- Agent class changes are similarly delayed — an agent reclassified onchain will retain its old class in TripWire's cache until the entry expires.
+
+This is a deliberate tradeoff: the cache reduces RPC call volume and latency for the common case (identity data changes infrequently), at the cost of a bounded window of stale authorization decisions. For high-sensitivity endpoints, operators should set reputation thresholds with margin to account for this propagation delay.
+
+---
+
+## 7. Secret Flows
 
 TripWire handles four distinct inbound/outbound secret flows, plus several configuration secrets.
 
-### 6.1 Goldsky -> TripWire (Inbound Webhook)
+### 7.1 Goldsky -> TripWire (Inbound Webhook)
 
 **Secret**: `GOLDSKY_WEBHOOK_SECRET` (stored as `SecretStr` in settings)
 
@@ -215,7 +255,7 @@ TripWire handles four distinct inbound/outbound secret flows, plus several confi
 
 **Dev bypass**: If the secret is empty and `APP_ENV=development`, the check is skipped. If the secret is empty and the environment is NOT development, the server returns HTTP 500.
 
-### 6.2 TripWire -> Goldsky Edge (Outbound RPC)
+### 7.2 TripWire -> Goldsky Edge (Outbound RPC)
 
 **Secret**: `GOLDSKY_EDGE_API_KEY` (stored as `SecretStr` in settings)
 
@@ -223,7 +263,7 @@ TripWire handles four distinct inbound/outbound secret flows, plus several confi
 
 **Optional**: If `GOLDSKY_EDGE_API_KEY` is empty, the `Authorization` header is omitted entirely. TripWire will still function against public RPC endpoints, but Goldsky Edge rate limits will apply.
 
-### 6.3 Facilitator -> TripWire (Inbound)
+### 7.3 Facilitator -> TripWire (Inbound)
 
 **Secret**: `FACILITATOR_WEBHOOK_SECRET` (stored as `SecretStr` in settings)
 
@@ -255,7 +295,7 @@ Webhook payloads now carry three trust-boundary fields derived from the event ty
 
 The facilitator fast path explicitly produces `execution_state=provisional`, `safe_to_execute=false`, `trust_source=facilitator`. Consumers MUST NOT execute irreversible actions on provisional payloads. Only `payment.finalized` events (or confirmed events where `finality.is_finalized=true`) set `safe_to_execute=true` with `trust_source=onchain`.
 
-### 6.4 TripWire -> Developer (Outbound Webhook Signing)
+### 7.4 TripWire -> Developer (Outbound Webhook Signing)
 
 This is the most nuanced flow, and it has a known bug in the MCP path.
 
@@ -279,11 +319,11 @@ But this secret is **never passed to Convoy**. The handler inserts the endpoint 
 
 **Impact**: Endpoints registered via MCP will not have Convoy project/endpoint IDs set. Webhook delivery via Convoy will be skipped entirely for these endpoints (the dispatcher checks for `convoy_project_id` and skips if missing).
 
-### 6.5 Vestigial: webhook_signing_secret
+### 7.5 Vestigial: webhook_signing_secret
 
 `settings.py` defines `webhook_signing_secret: SecretStr = SecretStr("")` with the comment "Default HMAC secret, can be overridden per endpoint". This field is **never referenced** anywhere in the codebase outside of `settings.py` itself. It appears to be a leftover from a previous design where TripWire performed HMAC signing directly (before Convoy was adopted). It can be safely removed.
 
-### 6.6 Secret Summary Table
+### 7.6 Secret Summary Table
 
 | Secret | Storage | Type | Used By |
 |---|---|---|---|
@@ -299,13 +339,13 @@ But this secret is **never passed to Convoy**. The handler inserts the endpoint 
 | SIWE nonces | Redis (5-min TTL) | `token_urlsafe(32)` | Replay prevention |
 | x402 payment dedup keys | Redis (24h TTL) | SHA-256 of payment header | Payment replay prevention |
 
-### 6.7 Future: Envelope Encryption for Direct httpx Path
+### 7.7 Future: Envelope Encryption for Direct httpx Path
 
-TripWire has a dual-path webhook delivery architecture: Convoy for managed delivery, and a direct httpx POST path for low-latency scenarios. The direct path currently does **not** perform HMAC signing. An envelope encryption scheme is planned but not yet implemented. See [Section 10.2](#102-direct-httpx-fast-path) for delivery security details.
+TripWire has a dual-path webhook delivery architecture: Convoy for managed delivery, and a direct httpx POST path for low-latency scenarios. The direct path currently does **not** perform HMAC signing. An envelope encryption scheme is planned but not yet implemented. See [Section 11.2](#112-direct-httpx-fast-path) for delivery security details.
 
 ---
 
-## 7. Ownership Enforcement
+## 8. Ownership Enforcement
 
 All endpoint and trigger management routes enforce **application-layer ownership checks**. The pattern is consistent:
 
@@ -330,7 +370,7 @@ MCP tools (`tripwire/mcp/tools.py`) use the same pattern, comparing `ctx.agent_a
 
 ---
 
-## 8. Row Level Security
+## 9. Row Level Security
 
 ### Current State: RLS Policies Exist but Are Inert
 
@@ -361,11 +401,11 @@ def get_supabase_scoped(request: Request, wallet: WalletAuthContext):
 
 ---
 
-## 9. x402 Payment Security
+## 10. x402 Payment Security
 
 x402 payment gating is applied in two places:
 
-### 9.1 REST API Endpoint Registration
+### 10.1 REST API Endpoint Registration
 
 The `POST /endpoints` route can be gated by x402 payment. Payment verification is handled by middleware that sets `request.state.payment_tx_hash` and `request.state.payment_chain_id` on the request. If present, the endpoint row is updated with the registration transaction hash and chain ID.
 
@@ -374,11 +414,11 @@ Configuration:
 - `x402_network`: Default `eip155:8453` (Base mainnet)
 - `tripwire_treasury_address`: USDC recipient address (required in production)
 
-### 9.2 MCP Tool Calls
+### 10.2 MCP Tool Calls
 
 X402-tier MCP tools (`register_middleware`, `create_trigger`, `activate_template`) require an `X-PAYMENT` header. The payment is verified against the tool's declared price via the x402 facilitator, and settled only after successful tool execution.
 
-### 9.3 ERC-3009 Model
+### 10.3 ERC-3009 Model
 
 x402 payments use **ERC-3009 `transferWithAuthorization`** -- gasless USDC transfers where the payer signs an authorization that is submitted onchain by the facilitator. The facilitator verifies the ERC-3009 signature before calling TripWire's `/ingest/facilitator` endpoint.
 
@@ -388,7 +428,7 @@ The facilitator endpoint validates:
 - `chain_id` must be a supported chain
 - `from_address` and `to_address` must be valid Ethereum addresses (regex-validated)
 
-### 9.4 Webhook Event Types
+### 10.4 Webhook Event Types
 
 The following event types are emitted through the webhook delivery pipeline:
 
@@ -405,9 +445,9 @@ Consumers should gate irreversible actions on `payment.finalized` (or check `saf
 
 ---
 
-## 10. Webhook Delivery Security
+## 11. Webhook Delivery Security
 
-### 10.1 Convoy Circuit Breaker
+### 11.1 Convoy Circuit Breaker
 
 The Convoy client (`tripwire/webhook/convoy_client.py`) implements a **circuit breaker** to protect against cascading failures when Convoy is unavailable.
 
@@ -423,13 +463,13 @@ When the circuit is open, all Convoy calls raise `ConvoyCircuitOpenError` immedi
 
 The circuit state is exposed via a Prometheus gauge (`tripwire_convoy_circuit_state`: 0=closed, 1=open, 2=half_open) and the `get_circuit_state()` diagnostic function.
 
-### 10.2 Direct httpx Fast Path
+### 11.2 Direct httpx Fast Path
 
 The direct httpx POST path bypasses Convoy entirely for low-latency scenarios. It currently does **not** perform HMAC signing. An envelope encryption scheme is planned but not yet implemented. The circuit breaker does not affect the direct path -- it continues to operate even when Convoy is down.
 
 ---
 
-## 11. Dev Mode
+## 12. Dev Mode
 
 `dev_server.py` provides a development-only auth bypass. It:
 

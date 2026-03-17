@@ -154,8 +154,8 @@ Register a new webhook endpoint. For `execute` mode, a Convoy application and en
 | `max_amount` | string or null | null | Maximum transfer amount. |
 | `allowed_senders` | EthAddress[] or null | null | Whitelist of sender addresses. |
 | `blocked_senders` | EthAddress[] or null | null | Blacklist of sender addresses. |
-| `required_agent_class` | string or null | null | ERC-8004 agent class filter. |
-| `min_reputation_score` | float (0-100) or null | null | Minimum reputation score. |
+| `required_agent_class` | string or null | null | ERC-8004 agent class filter. When set, TripWire resolves the sender's onchain ERC-8004 identity and rejects events where the sender's `agent_class` does not match this value. Senders with no onchain identity are also rejected. |
+| `min_reputation_score` | float (0-100) or null | null | Minimum ERC-8004 reputation score (0–100). Resolved from the onchain registry's 0–10000 basis-point value. Events from senders whose reputation falls below this threshold — or who have no onchain identity — are rejected. |
 | `finality_depth` | int (1-64) or null | null | Block confirmations required. When null, uses the chain default (Ethereum: 12, Base: 3, Arbitrum: 1). |
 
 **Response** (201 Created):
@@ -941,8 +941,22 @@ safe_to_execute   bool                Whether the event is safe to act on (true 
 trust_source      TrustSource         "facilitator" | "onchain" — origin of the trust assertion
 data.transfer     TransferData        chain_id, tx_hash, block_number, from/to_address, amount, nonce, token
 data.finality     FinalityData?       confirmations, required_confirmations, is_finalized
-data.identity     AgentIdentity?      ERC-8004 identity (address, agent_class, reputation_score, capabilities)
+data.identity     AgentIdentity | null   ERC-8004 identity of the sender. `null` when the sender has no registered onchain identity. See `AgentIdentity` model below.
 ```
+
+### AgentIdentity
+
+Resolved from the [ERC-8004](https://eips.ethereum.org/EIPS/eip-8004) onchain agent identity registry, which went mainnet on January 29, 2026. Present on every webhook payload where the event sender has a registered onchain identity; `null` otherwise.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `address` | string | Agent's wallet address |
+| `agent_class` | string | ERC-8004 classification (e.g., `"trading-bot"`, `"payment-bot"`) |
+| `deployer` | string | Contract deployer/owner address |
+| `capabilities` | string[] | Onchain-declared capability strings |
+| `reputation_score` | float | 0–100 (normalized from the registry's 0–10000 basis-point value) |
+| `registered_at` | int | Agent token ID — a proxy for registration order (lower = registered earlier) |
+| `metadata` | object | Raw fields: `agent_id` (registry token ID) and `tokenURI` (metadata URI) |
 
 ### Trigger
 

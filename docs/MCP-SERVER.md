@@ -53,6 +53,13 @@ Wallet signature via SIWE (EIP-4361). The caller must include the following head
 
 The signature covers a SIWE message that includes the HTTP method, path, and SHA-256 hash of the request body. Nonces are single-use and consumed atomically via Redis.
 
+After SIWE authentication succeeds, the server resolves the caller's ERC-8004 identity on Base (chain ID 8453). Two onchain registry contracts are queried — `IdentityRegistry` and `ReputationRegistry` — to populate the `MCPAuthContext` with:
+
+- `identity`: full `AgentIdentity` record (name, metadata, registration block)
+- `reputation_score`: integer 0–100
+
+If a tool's `min_reputation` threshold is set above 0 and the caller's score is below it, the request is rejected with `-32001 REPUTATION_TOO_LOW`. Currently all 8 tools have `min_reputation=0`, so the check always passes; operators can enable reputation gating by changing tool registrations.
+
 ### X402 (Per-Call Payment)
 
 Micropayment via the x402 protocol. The caller must include:
@@ -505,6 +512,8 @@ The manifest advertises available paid services, MCP tools, auth configuration, 
 }
 ```
 
+The `identity.protocol` field is set to `"ERC-8004"` to signal that TripWire uses the ERC-8004 onchain agent identity registry for caller identity discovery. Agents with an ERC-8004 registration on Base have their `AgentIdentity` and `reputation_score` resolved and attached to every authenticated MCP request.
+
 ### Discovery Flow
 
 1. Agent fetches `GET /.well-known/x402-manifest.json`
@@ -533,7 +542,7 @@ Every `tools/call` request follows this pipeline:
 
 4. **Agent address check** -- Non-PUBLIC tools require a resolved `agent_address`. If missing, returns `-32000`.
 
-5. **Reputation check** -- If the tool has `min_reputation > 0`, the agent's reputation score (from ERC-8004 identity) is compared. Below threshold returns `-32001`.
+5. **Reputation check** -- If the tool has `min_reputation > 0`, the agent's reputation score is compared against the threshold. The score is sourced from the ERC-8004 `ReputationRegistry` contract on Base (chain ID 8453) via a raw JSON-RPC call; results are cached for 300 seconds to avoid per-request onchain lookups. Below threshold returns `-32001`.
 
 6. **Rate limit** -- Per-address rate limiting: 60 calls/minute per wallet address, enforced via Redis INCR with 60-second TTL. Exceeding the limit returns `-32003`. If Redis is unavailable, rate limiting fails open.
 

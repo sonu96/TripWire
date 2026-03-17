@@ -222,17 +222,29 @@ Present when finality information is available. `null` for `payment.pre_confirme
 
 Present when the sender has an ERC-8004 onchain agent identity. `null` if no identity is registered.
 
+`identity` is `null` when the sender address has no ERC-8004 registration in the onchain agent registry. In that case, identity-based policies (`required_agent_class`, `min_reputation_score`) will cause the endpoint to be skipped.
+
 ```json
 {
-  "address": "0x1111111111111111111111111111111111111111",
-  "agent_class": "payment_agent",
-  "deployer": "0x3333333333333333333333333333333333333333",
-  "capabilities": ["transfer", "swap"],
-  "reputation_score": 85.5,
-  "registered_at": 1706547200,
-  "metadata": {}
+  "address": "0x1234...",
+  "agent_class": "trading-bot",
+  "deployer": "0xABCD...",
+  "capabilities": ["swap", "limit-order", "portfolio-rebalance"],
+  "reputation_score": 85.0,
+  "registered_at": 42,
+  "metadata": {"agent_id": 42, "agent_uri": "ipfs://..."}
 }
 ```
+
+| Field | Type | Description |
+|---|---|---|
+| `address` | string | The agent's wallet address (checksummed hex) |
+| `agent_class` | string | Classification from the ERC-8004 registry (e.g., `"trading-bot"`, `"data-oracle"`, `"payment_agent"`). Set by the deployer at registration time. |
+| `deployer` | string | The address that deployed or owns the agent contract — i.e., who registered the agent onchain. |
+| `capabilities` | list[string] | Self-declared capabilities stored onchain (e.g., `["swap", "limit-order", "portfolio-rebalance"]`). Set by the deployer; not verified by TripWire. |
+| `reputation_score` | float | 0–100 reputation score. Derived from the onchain 0–10000 basis-point value (divided by 100). |
+| `registered_at` | integer | The agent's token ID (sequential NFT ID from the ERC-8004 registry). Lower values indicate earlier registration. |
+| `metadata` | object | Raw metadata from the registry: `agent_id` (same as `registered_at`) and `agent_uri` (tokenURI, typically an IPFS link to off-chain agent metadata). |
 
 ### Example: `payment.pre_confirmed`
 
@@ -542,6 +554,15 @@ After matching, each endpoint's policies are evaluated. The transfer is only dis
 | `finality_depth` | Required confirmation depth before this endpoint receives webhooks (range: 1-64). See dispatch-time gate below. |
 
 Endpoints that fail policy evaluation are logged and skipped. The event is still recorded.
+
+#### Identity-Based Policy Evaluation
+
+`required_agent_class` and `min_reputation_score` operate on the `data.identity` object resolved during event processing:
+
+- **`required_agent_class`**: If set, the event is only delivered if `data.identity.agent_class` exactly matches the configured value. If `data.identity` is `null` (sender has no ERC-8004 registration), the check fails and the endpoint is skipped.
+- **`min_reputation_score`**: If set, the event is only delivered if `data.identity.reputation_score` is greater than or equal to the configured threshold (0–100 float). If `data.identity` is `null`, the check fails and the endpoint is skipped.
+
+Both policies can be combined. For example, an endpoint configured with `required_agent_class: "trading-bot"` and `min_reputation_score: 75.0` will only receive webhooks from registered trading-bot agents with a reputation score of at least 75.
 
 ### Finality Depth as a Dispatch-Time Gate
 

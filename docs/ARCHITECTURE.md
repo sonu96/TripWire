@@ -618,9 +618,61 @@ to be processed as a new event when it reappears in a different block.
 
 ---
 
-## 6. Delivery Layer
+## 6. Identity Resolution (ERC-8004)
 
-### 6.1 Execute Mode: Convoy (webhook POST)
+TripWire enriches every event with onchain agent identity from the ERC-8004
+registry. This enables reputation-gated webhook delivery and agent
+classification.
+
+### 6.1 Two Registry Contracts (CREATE2, same address all chains)
+
+| Contract | Address | Purpose |
+|----------|---------|---------|
+| IdentityRegistry | `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` | ERC-721 based. Stores agent_class, deployer, capabilities, tokenURI |
+| ReputationRegistry | `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63` | Aggregated reputation scores (0-10000 basis points -> 0-100 float) |
+
+### 6.2 Resolution Pipeline (7 RPC calls via Goldsky Edge)
+
+```
+address
+  -> balanceOf(address)              [sequential - checks if registered]
+  -> tokenOfOwnerByIndex(address, 0) [sequential - gets agent_id]
+  -> asyncio.gather(                 [5 parallel calls]
+      tokenURI(agent_id),
+      getMetadata(agent_id, "agentClass"),
+      getMetadata(agent_id, "capabilities"),
+      ownerOf(agent_id),
+      getSummary(agent_id, [])      [ReputationRegistry]
+    )
+  -> AgentIdentity {
+      address, agent_class, deployer, capabilities,
+      reputation_score, registered_at, metadata
+    }
+```
+
+### 6.3 Caching
+
+- Identity cache: in-process dict, 300s TTL for hits, 30s for misses
+- Reputation cache: in-process dict, 300s TTL
+- Cache key: `{chain_id}:{address}`
+
+### 6.4 Where Identity Is Used
+
+1. **Pipeline enrichment**: Every webhook payload includes `data.identity` (AgentIdentity or null)
+2. **Endpoint policies**: `required_agent_class` and `min_reputation_score` filter webhooks
+3. **MCP reputation gating**: Per-tool `min_reputation` threshold checked before execution
+4. **Audit context**: Agent identity logged with every event
+
+### 6.5 Mock vs Production
+
+- Production: `ERC8004Resolver` — real onchain RPC calls
+- Development: `MockResolver` — 3 hardcoded agents (trading-bot, data-oracle, payment-agent)
+
+---
+
+## 7. Delivery Layer
+
+### 7.1 Execute Mode: Convoy (webhook POST)
 
 All execute-mode delivery is routed through Convoy. There is NO direct
 httpx delivery path in the current codebase. Direct httpx fast-path
@@ -694,7 +746,7 @@ Retries up to `dlq_max_retries` (default 3) via `force_resend()`. After
 exhaustion, marks the delivery as `dead_lettered` in the local
 `webhook_deliveries` table and fires an alert to `dlq_alert_webhook_url`.
 
-### 6.2 Notify Mode: Supabase Realtime
+### 7.2 Notify Mode: Supabase Realtime
 
 ```
   EventProcessor
@@ -722,7 +774,7 @@ no subscriptions are defined, the endpoint receives all events
 
 ---
 
-## 7. Event Bus (Redis Streams)
+## 8. Event Bus (Redis Streams)
 
 The event bus is an optional async processing layer that provides backpressure between Goldsky ingestion and trigger evaluation. When enabled, events are buffered in Redis Streams partitioned by topic0, allowing horizontal scaling of event processing without overwhelming the database or downstream services. When disabled (default), events flow synchronously through the processor.
 
@@ -731,7 +783,7 @@ the `/ingest` endpoint publishes to Redis Streams instead of processing
 synchronously. When disabled, events are processed inline through
 `EventProcessor`.
 
-### 7.1 Architecture
+### 8.1 Architecture
 
 ```
   /ingest/goldsky
@@ -752,7 +804,7 @@ synchronously. When disabled, events are processed inline through
       NO ------> EventProcessor.process_batch() (synchronous)
 ```
 
-### 7.2 Stream Topology
+### 8.2 Stream Topology
 
 Streams are keyed by topic0 (the keccak256 hash of the event signature):
 
@@ -774,12 +826,12 @@ Streams are keyed by topic0 (the keccak256 hash of the event signature):
 | BLOCK_MS           | 2,000   | XREADGROUP block timeout                    |
 | CLAIM_IDLE_MS      | 30,000  | XAUTOCLAIM idle threshold                   |
 
-### 7.3 Topic0 Validation
+### 8.3 Topic0 Validation
 
 Topics are validated with strict regex: `^0x[0-9a-f]{64}$` (lowercase hex
 only). Invalid topics are routed to `tripwire:events:unknown`.
 
-### 7.4 Worker Pool
+### 8.4 Worker Pool
 
 ```
   WorkerPool
@@ -810,7 +862,7 @@ to prevent concurrent refreshes.
 exponential backoff (base 2s, max 120s). Restart counter resets after 300s
 of stability.
 
-### 7.5 Safety Mechanisms
+### 8.5 Safety Mechanisms
 
 | Mechanism                  | Implementation                                     |
 |----------------------------|----------------------------------------------------|
@@ -829,7 +881,7 @@ of stability.
 | Poison message handling    | Malformed messages are ACKed immediately             |
 | Startup degradation        | If worker pool fails to start, app continues without it |
 
-### 7.6 Consumer Group Semantics
+### 8.6 Consumer Group Semantics
 
 - **At-least-once delivery**: Messages are ACKed only after successful
   processing or DLQ write.
@@ -838,7 +890,7 @@ of stability.
 - **Consumer group**: `trigger-workers` -- shared across all workers in
   the pool. Created on-demand with MKSTREAM.
 
-### 7.7 DLQ Consumer
+### 8.7 DLQ Consumer
 
 `RedisDLQConsumer` (`tripwire/ingestion/dlq_consumer.py`) is a background
 task that reads permanently-failed events from the `tripwire:dlq` stream.
@@ -855,12 +907,12 @@ Started only when `EVENT_BUS_ENABLED=true`.
 
 ---
 
-## 8. Trigger Registry
+## 9. Trigger Registry
 
 The trigger registry allows AI agents to create triggers for any EVM event
 via MCP tools or the REST API, without deploying new infrastructure.
 
-### 8.1 Data Model
+### 9.1 Data Model
 
 Three tables, introduced in migration 013:
 
@@ -925,7 +977,7 @@ Unique partial index: one active instance per (template_id, owner_address).
 The `install_count` on `trigger_templates` is maintained by a balanced
 INSERT/UPDATE/DELETE trigger function (migration 015).
 
-### 8.2 Lookup Path
+### 9.2 Lookup Path
 
 ```
   topic0 from raw log
@@ -945,7 +997,7 @@ The TriggerIndex (used by event bus workers) maintains an in-memory dict
 rebuilt from the database every 10 seconds. Uses the precomputed `topic0`
 column (keccak256 hash), added in migration 017.
 
-### 8.3 Generic ABI Decoder
+### 9.3 Generic ABI Decoder
 
 `decode_event_with_abi()` in `tripwire/ingestion/generic_decoder.py`:
 
@@ -954,7 +1006,7 @@ column (keccak256 hash), added in migration 017.
 - Decodes non-indexed params from data via `eth_abi.decode()`
 - Returns flat dict of `field_name -> value` plus `_`-prefixed metadata
 
-### 8.4 JMESPath Filter Engine
+### 9.4 JMESPath Filter Engine
 
 `evaluate_filters()` in `tripwire/ingestion/filter_engine.py`:
 
@@ -978,13 +1030,13 @@ are auto-converted to Decimal for numeric comparisons.
 
 ---
 
-## 9. Database Schema
+## 10. Database Schema
 
 All tables live in Supabase-managed PostgreSQL. Row Level Security is
 enabled on `endpoints`, `subscriptions`, `events`, and `webhook_deliveries`
 (migration 011) using the session variable `app.current_wallet`.
 
-### 9.1 Core Tables
+### 10.1 Core Tables
 
 ```
   +------------------+       +------------------+       +------------------+
@@ -1017,7 +1069,7 @@ enabled on `endpoints`, `subscriptions`, `events`, and `webhook_deliveries`
                     +------------------+
 ```
 
-### 9.2 endpoints
+### 10.2 endpoints
 
 | Column              | Type        | Notes                                  |
 |---------------------|-------------|----------------------------------------|
@@ -1042,7 +1094,7 @@ Key indexes: `recipient`, `owner_address`, `(recipient) WHERE active`,
 Dropped columns: `api_key_hash` (migration 010), `webhook_secret`
 (migration 016).
 
-### 9.3 events
+### 10.3 events
 
 | Column              | Type        | Notes                                  |
 |---------------------|-------------|----------------------------------------|
@@ -1071,7 +1123,7 @@ Key indexes: `(chain_id, tx_hash)`, `to_address`, `from_address`,
 `authorizer`, `(chain_id, nonce, authorizer)`, `status`,
 `(chain_id, block_number)`, `type`, `(endpoint_id, created_at DESC)`.
 
-### 9.4 event_endpoints (M2M join table, migration 014)
+### 10.4 event_endpoints (M2M join table, migration 014)
 
 | Column      | Type        | Notes                                       |
 |-------------|-------------|---------------------------------------------|
@@ -1082,7 +1134,7 @@ Key indexes: `(chain_id, tx_hash)`, `to_address`, `from_address`,
 Resolves the issue where `events.endpoint_id` only recorded the first
 matched endpoint. Backfilled from existing data on creation.
 
-### 9.5 nonces (deduplication)
+### 10.5 nonces (deduplication)
 
 | Column      | Type        | Notes                                       |
 |-------------|-------------|---------------------------------------------|
@@ -1106,7 +1158,7 @@ Uses `SELECT FOR UPDATE` to lock the row, preventing TOCTOU races. This
 enables the Goldsky path to detect that the facilitator already claimed a
 nonce and promote the pre_confirmed event to confirmed.
 
-### 9.6 nonces_archive (migration 019)
+### 10.6 nonces_archive (migration 019)
 
 | Column      | Type        | Notes                                       |
 |-------------|-------------|---------------------------------------------|
@@ -1122,7 +1174,7 @@ The `archive_old_nonces()` PL/pgSQL function moves confirmed nonces older
 than 30 days (default) in batches of 5000, using `FOR UPDATE SKIP LOCKED`
 for concurrency safety. The `NonceArchiver` background task runs this daily.
 
-### 9.7 webhook_deliveries
+### 10.7 webhook_deliveries
 
 | Column              | Type        | Notes                                  |
 |---------------------|-------------|----------------------------------------|
@@ -1137,7 +1189,7 @@ for concurrency safety. The `NonceArchiver` background task runs this daily.
 Key indexes: `(endpoint_id, status, created_at DESC)`,
 `(event_id, created_at DESC)`, `provider_message_id WHERE NOT NULL`.
 
-### 9.8 subscriptions
+### 10.8 subscriptions
 
 | Column      | Type        | Notes                                       |
 |-------------|-------------|---------------------------------------------|
@@ -1147,7 +1199,7 @@ Key indexes: `(endpoint_id, status, created_at DESC)`,
 | active      | BOOLEAN     |                                             |
 | created_at  | TIMESTAMPTZ |                                             |
 
-### 9.9 audit_log (migration 012)
+### 10.9 audit_log (migration 012)
 
 | Column        | Type        | Notes                                     |
 |---------------|-------------|-------------------------------------------|
@@ -1160,7 +1212,7 @@ Key indexes: `(endpoint_id, status, created_at DESC)`,
 | ip_address    | TEXT        |                                           |
 | created_at    | TIMESTAMPTZ |                                           |
 
-### 9.10 realtime_events
+### 10.10 realtime_events
 
 Used by Supabase Realtime for notify-mode delivery. Rows are inserted by
 `RealtimeNotifier` and automatically pushed to WebSocket subscribers.
@@ -1175,19 +1227,19 @@ Used by Supabase Realtime for notify-mode delivery. Rows are inserted by
 | recipient   | TEXT        |                                             |
 | created_at  | TIMESTAMPTZ |                                             |
 
-### 9.11 Trigger Registry Tables
+### 10.11 Trigger Registry Tables
 
-See Section 8.1 for `trigger_templates`, `triggers`, and
+See Section 9.1 for `trigger_templates`, `triggers`, and
 `trigger_instances`.
 
 ---
 
-## 10. MCP Server
+## 11. MCP Server
 
 Mounted at `/mcp` as a FastAPI sub-application. Implements JSON-RPC 2.0
 per the Model Context Protocol specification (version `2024-11-05`).
 
-### 10.1 Authentication Tiers
+### 11.1 Authentication Tiers
 
 ```
   PUBLIC   No auth required (initialize, tools/list)
@@ -1201,7 +1253,7 @@ if Redis is unavailable.
 Reputation gating: Tools with `min_reputation > 0` require the caller's
 ERC-8004 reputation score to meet the threshold.
 
-### 10.2 Tool Registry
+### 11.2 Tool Registry
 
 | Tool               | Auth Tier | Price   | Description                           |
 |--------------------|-----------|---------|---------------------------------------|
@@ -1214,7 +1266,7 @@ ERC-8004 reputation score to meet the threshold.
 | get_trigger_status | SIWX      | free    | Check trigger health + event count    |
 | search_events      | SIWX      | free    | Query recent events                   |
 
-### 10.3 x402 Payment Flow
+### 11.3 x402 Payment Flow
 
 For X402-tier tools:
 
@@ -1226,20 +1278,20 @@ For X402-tier tools:
 5. If settlement fails, the dedup key is cleaned up so the payer can
    retry, and the tool result is withheld
 
-### 10.4 x402 Bazaar
+### 11.4 x402 Bazaar
 
 The `/.well-known/x402-manifest.json` endpoint exposes the service
 discovery manifest for agent marketplaces.
 
 ---
 
-## 11. Finality Poller
+## 12. Finality Poller
 
 Background task that promotes pending events to confirmed once they reach
 the required block depth. Spawns one asyncio task per chain. All RPC calls
 go through Goldsky Edge managed endpoints (see Section 3.4).
 
-### 11.1 Per-Chain Configuration
+### 12.1 Per-Chain Configuration
 
 | Chain    | Chain ID | Finality Depth | Poll Interval | Block Time |
 |----------|----------|----------------|---------------|------------|
@@ -1247,7 +1299,7 @@ go through Goldsky Edge managed endpoints (see Section 3.4).
 | Base     | 8453     | 3 confirmations| 10s           | ~2s        |
 | Ethereum | 1        | 12 confirmations| 30s          | ~12s       |
 
-### 11.2 Poll Cycle
+### 12.2 Poll Cycle
 
 The poller queries events with status IN (`pending`, `confirmed`) that have
 `block_number > 0`. This excludes `pre_confirmed` events (which have
@@ -1269,7 +1321,7 @@ For each event on a given chain:
      `payment.finalized` webhook
 5. Otherwise: update `finality_depth` column (for dashboard visibility)
 
-### 11.3 Reorg Handling
+### 12.3 Reorg Handling
 
 When a reorg is detected:
 
@@ -1281,11 +1333,11 @@ When a reorg is detected:
 
 ---
 
-## 12. Latency Map
+## 13. Latency Map
 
 Estimated end-to-end latencies from event emission to webhook delivery:
 
-### 12.1 x402 Facilitator Fast Path
+### 13.1 x402 Facilitator Fast Path
 
 | Stage              | Latency     | Notes                             |
 |--------------------|-------------|-----------------------------------|
@@ -1296,7 +1348,7 @@ Estimated end-to-end latencies from event emission to webhook delivery:
 | Convoy dispatch    | ~20-80ms    | Convoy API call                   |
 | **Total**          | **~40-125ms**|                                  |
 
-### 12.2 Goldsky Reliable Path (ERC-3009)
+### 13.2 Goldsky Reliable Path (ERC-3009)
 
 | Stage              | Latency     | Notes                             |
 |--------------------|-------------|-----------------------------------|
@@ -1309,7 +1361,7 @@ Estimated end-to-end latencies from event emission to webhook delivery:
 | Convoy dispatch    | ~20-80ms    | Convoy API call                   |
 | **Total**          | **~1.0-4.2s**| Dominated by Goldsky indexing    |
 
-### 12.3 Dynamic Trigger Path
+### 13.3 Dynamic Trigger Path
 
 | Stage              | Latency     | Notes                             |
 |--------------------|-------------|-----------------------------------|
@@ -1322,7 +1374,7 @@ Estimated end-to-end latencies from event emission to webhook delivery:
 | Convoy dispatch    | ~20-80ms    | Convoy API call                   |
 | **Total**          | **~1.0-4.2s**| Dominated by Goldsky indexing    |
 
-### 12.4 Per-Chain Finality Promotion
+### 13.4 Per-Chain Finality Promotion
 
 Additional time from first delivery (pending) to confirmed webhook:
 
@@ -1334,7 +1386,7 @@ Additional time from first delivery (pending) to confirmed webhook:
 
 ---
 
-## 13. Known Limitations
+## 14. Known Limitations
 
 ### PENDING Issues
 
@@ -1386,7 +1438,7 @@ RPC load.
 
 ---
 
-## 14. Configuration Reference
+## 15. Configuration Reference
 
 All settings are loaded via `pydantic-settings` from environment variables
 or `.env` file. See `tripwire/config/settings.py`.
@@ -1431,7 +1483,7 @@ or `.env` file. See `tripwire/config/settings.py`.
 
 ---
 
-## 15. Background Tasks
+## 16. Background Tasks
 
 The application lifespan starts and stops these background tasks:
 
@@ -1449,7 +1501,7 @@ NonceArchiver -> DLQHandler -> RPC client close -> OTel flush.
 
 ---
 
-## 16. Middleware Stack
+## 17. Middleware Stack
 
 FastAPI/Starlette middleware wraps last-added as outermost. The execution
 order for an inbound request is:
@@ -1466,7 +1518,7 @@ Sentry capture).
 
 ---
 
-## 17. API Routes
+## 18. API Routes
 
 | Method | Path                              | Auth      | Description                  |
 |--------|-----------------------------------|-----------|------------------------------|

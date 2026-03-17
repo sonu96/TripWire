@@ -63,8 +63,8 @@ All configuration is loaded from environment variables (or a `.env` file) via py
 | `AUTH_TIMESTAMP_TOLERANCE_SECONDS` | int | `300` | No | Max age (seconds) of a SIWE signature. |
 | `REDIS_URL` | str | `redis://localhost:6379` | No | Redis for SIWE nonce storage, rate limiting, and event bus. |
 | `SIWE_DOMAIN` | str | `tripwire.dev` | No | Domain for Sign-In with Ethereum messages. |
-| `ERC8004_IDENTITY_REGISTRY` | str | `0x8004...a432` | No | CREATE2-deployed identity registry address. |
-| `ERC8004_REPUTATION_REGISTRY` | str | `0x8004...9b63` | No | CREATE2-deployed reputation registry address. |
+| `ERC8004_IDENTITY_REGISTRY` | str | `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432` | No | CREATE2-deployed identity registry address. |
+| `ERC8004_REPUTATION_REGISTRY` | str | `0x8004BAa17C55a88189AE136b182e5fdA19dE9b63` | No | CREATE2-deployed reputation registry address. |
 | `IDENTITY_CACHE_TTL` | int | `300` | No | Seconds to cache identity lookups. |
 | `FACILITATOR_WEBHOOK_SECRET` | SecretStr | `""` | No | Validates x402 facilitator callbacks. |
 
@@ -504,6 +504,20 @@ Managed RPC endpoints with caching, load balancing, and cross-node consensus. Us
 - **Identity resolver** -- Reads ERC-8004 identity and reputation registries on-chain.
 
 Each RPC URL (`BASE_RPC_URL`, `ETHEREUM_RPC_URL`, `ARBITRUM_RPC_URL`) points to a Goldsky Edge endpoint. The `GOLDSKY_EDGE_API_KEY` is sent as a Bearer token on every JSON-RPC call.
+
+### Identity Resolution (ERC-8004)
+
+TripWire resolves onchain AI agent identities via the ERC-8004 registries deployed at the addresses configured by `ERC8004_IDENTITY_REGISTRY` and `ERC8004_REPUTATION_REGISTRY`. Resolution uses the Goldsky Edge RPC endpoints (same endpoints as the finality poller).
+
+**RPC call profile per resolution**: 2 sequential calls (registry lookup → profile fetch) followed by up to 5 parallel calls (reputation scores, delegate checks, etc.).
+
+**Caching**: Results are cached in-process using a two-tier TTL:
+- Cache hits: 300 seconds (controlled by `IDENTITY_CACHE_TTL`)
+- Cache misses: 30 seconds (to avoid hammering RPC for unknown addresses)
+
+**Development mode**: When `APP_ENV=development`, a mock resolver is used. No RPC calls are made. This means `BASE_RPC_URL` and `GOLDSKY_EDGE_API_KEY` are not required for local development.
+
+**Known limitation**: The identity cache is per-instance and is not shared across horizontally scaled deployments. Identity updates (e.g., a newly registered agent) will not be visible to other instances until their individual cache TTLs expire. With the default 300-second TTL, stale identity data can persist for up to 5 minutes per instance.
 
 ---
 
