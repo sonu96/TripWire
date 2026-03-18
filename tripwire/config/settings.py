@@ -14,13 +14,13 @@ class Settings(BaseSettings):
 
     # Supabase
     supabase_url: str = ""
-    supabase_anon_key: str = ""
+    supabase_anon_key: str = ""  # Unused — kept for .env compat; may be removed in future
     supabase_service_role_key: SecretStr = SecretStr("")
 
     # Convoy (Webhook Delivery)
     convoy_api_key: SecretStr = SecretStr("")
     convoy_url: str = "http://localhost:5005"
-    webhook_signing_secret: SecretStr = SecretStr("")  # Default HMAC secret, can be overridden per endpoint
+    webhook_signing_secret: SecretStr = SecretStr("")  # Unused — kept for .env compat; may be removed in future
 
     # Goldsky platform (CLI auth for deploying/managing Turbo pipelines)
     goldsky_api_key: SecretStr = SecretStr("")

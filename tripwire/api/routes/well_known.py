@@ -1,5 +1,7 @@
 """x402 service manifest and TWSS-1 skill spec for Bazaar discovery."""
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter
 
 from tripwire.config.settings import settings
@@ -179,4 +181,47 @@ async def x402_manifest():
             "version": TWSS_VERSION,
             "url": f"{settings.app_base_url}/.well-known/tripwire-skill-spec.json",
         },
+        "_deprecation": "Use GET /discovery/resources for x402 V2 Bazaar format",
     }
+
+
+@router.get("/discovery/resources")
+async def discovery_resources():
+    """x402 V2 Bazaar discovery — returns all MCP tools as resources."""
+    from tripwire.mcp.server import TOOLS
+
+    now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    resources = []
+    for tool_def in TOOLS.values():
+        # Build accepts: payment-gated tools get a PaymentOption, auth-only tools get empty list
+        if tool_def.auth_tier == AuthTier.X402 and tool_def.price:
+            accepts = [
+                {
+                    "scheme": "exact",
+                    "price": tool_def.price,
+                    "network": tool_def.network,
+                    "payTo": settings.tripwire_treasury_address,
+                    "asset": "USDC",
+                }
+            ]
+        else:
+            accepts = []
+
+        resources.append({
+            "resource": f"{settings.app_base_url}/mcp#{tool_def.name}",
+            "type": "mcp",
+            "x402Version": 2,
+            "accepts": accepts,
+            "extensions": ["sign-in-with-x"],
+            "metadata": {
+                "tool": tool_def.name,
+                "description": tool_def.description,
+                "inputSchema": tool_def.input_schema,
+                "transport": "json-rpc",
+                "minReputation": tool_def.min_reputation,
+            },
+            "lastUpdated": now,
+        })
+
+    return resources

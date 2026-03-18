@@ -161,9 +161,16 @@ Every delivery follows the v1 payload schema. The `execution_state` and `safe_to
   "mode": "execute",
   "timestamp": 1710700800,
   "version": "v1",
-  "execution_state": "finalized",
-  "safe_to_execute": true,
-  "trust_source": "onchain",
+  "execution": {
+    "state": "finalized",
+    "safe_to_execute": true,
+    "trust_source": "onchain",
+    "finality": {
+      "confirmations": 3,
+      "required_confirmations": 3,
+      "is_finalized": true
+    }
+  },
   "data": {
     "transfer": {
       "chain_id": 8453,
@@ -174,11 +181,6 @@ Every delivery follows the v1 payload schema. The `execution_state` and `safe_to
       "amount": "5000000",
       "nonce": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    },
-    "finality": {
-      "confirmations": 3,
-      "required_confirmations": 3,
-      "is_finalized": true
     },
     "identity": {
       "address": "0x1234567890abcdef1234567890abcdef12345678",
@@ -197,9 +199,9 @@ Every delivery follows the v1 payload schema. The `execution_state` and `safe_to
 
 | Field             | Values                                                | Meaning                                     |
 |-------------------|-------------------------------------------------------|----------------------------------------------|
-| `execution_state` | `provisional`, `confirmed`, `finalized`, `reorged`    | How far the event has progressed             |
-| `safe_to_execute` | `true` / `false`                                      | `true` only after onchain finality confirmed |
-| `trust_source`    | `facilitator` or `onchain`                            | Who vouches for this state                   |
+| `execution.state` | `provisional`, `confirmed`, `finalized`, `reorged`    | How far the event has progressed             |
+| `execution.safe_to_execute` | `true` / `false`                             | `true` only after onchain finality confirmed |
+| `execution.trust_source`    | `facilitator` or `onchain`                   | Who vouches for this state                   |
 | `idempotency_key` | Deterministic SHA-256                                 | Safe to deduplicate on your end              |
 
 **Event types:** `payment.pre_confirmed`, `payment.confirmed`, `payment.finalized`, `payment.failed`, `payment.reorged`

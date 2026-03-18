@@ -100,9 +100,16 @@ Both modes deliver the same enriched payload structure:
   "mode": "execute",
   "timestamp": 1709856000,
   "version": "v1",
-  "execution_state": "finalized",
-  "safe_to_execute": true,
-  "trust_source": "onchain",
+  "execution": {
+    "state": "finalized",
+    "safe_to_execute": true,
+    "trust_source": "onchain",
+    "finality": {
+      "confirmations": 3,
+      "required_confirmations": 3,
+      "is_finalized": true
+    }
+  },
   "data": {
     "transfer": {
       "chain_id": 8453,
@@ -112,11 +119,6 @@ Both modes deliver the same enriched payload structure:
       "amount": "5000000",
       "nonce": "0x...",
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    },
-    "finality": {
-      "confirmations": 3,
-      "required_confirmations": 3,
-      "is_finalized": true
     },
     "identity": {
       "address": "0xAgent...",
@@ -129,7 +131,7 @@ Both modes deliver the same enriched payload structure:
 }
 ```
 
-Every payload includes `execution_state` (`provisional`, `confirmed`, `finalized`, `reorged`), `safe_to_execute` (true only after finality), and `trust_source` (`facilitator` or `onchain`). Your application branches on these fields without making a single chain call.
+Every payload includes a nested `execution` block with `state` (`provisional`, `confirmed`, `finalized`, `reorged`), `safe_to_execute` (true only after finality), `trust_source` (`facilitator` or `onchain`), and `finality` data. Your application branches on `execution.safe_to_execute` without making a single chain call.
 
 ---
 

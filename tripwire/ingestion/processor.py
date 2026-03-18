@@ -34,7 +34,6 @@ from tripwire.ingestion.decoder import (
     AUTHORIZATION_USED_TOPIC,
     TRANSFER_TOPIC,
     _parse_topics,
-    decode_transfer_event,
 )
 from tripwire.ingestion.finality import check_finality, check_finality_generic
 from tripwire.notify.realtime import RealtimeNotifier

@@ -58,19 +58,6 @@ def test_wallet():
 
 
 @pytest.fixture
-def other_wallet():
-    """Secondary test wallet derived from Hardhat account #1."""
-    acct = Account.from_key(OTHER_PRIVATE_KEY)
-    return {"account": acct, "address": acct.address}
-
-
-@pytest.fixture
-def mock_redis():
-    """In-memory Redis mock for nonce management."""
-    return MockRedis()
-
-
-@pytest.fixture
 def auth_headers(test_wallet):
     """Auth headers for the primary test wallet, targeting GET /."""
     return make_auth_headers(test_wallet["account"], method="GET", path="/")
@@ -146,24 +133,3 @@ def sample_raw_log() -> dict:
     }
 
 
-@pytest.fixture
-def sample_raw_log_enriched() -> dict:
-    """Raw log with joined Transfer data (as produced by the updated pipeline)."""
-    return {
-        "transaction_hash": TX_HASH,
-        "block_number": 100,
-        "block_hash": BLOCK_HASH,
-        "log_index": 3,
-        "block_timestamp": 1700000000,
-        "address": USDC_BASE.lower(),
-        "chain_id": 8453,
-        "decoded": {
-            "authorizer": AUTHORIZER,
-            "nonce": NONCE_HEX,
-        },
-        "transfer": {
-            "from_address": SENDER,
-            "to_address": RECIPIENT,
-            "value": 5_000_000,
-        },
-    }

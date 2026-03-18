@@ -43,7 +43,15 @@ No authentication required. Used for protocol handshake and tool discovery.
 
 ### SIWX (Sign-In With X)
 
-Wallet signature via SIWE (EIP-4361). The caller must include the following headers:
+Wallet signature via SIWE (EIP-4361). The caller can authenticate using **either** of two methods:
+
+**Option A: x402 V2 `SIGN-IN-WITH-X` header** (preferred)
+
+| Header              | Description                                 |
+|---------------------|---------------------------------------------|
+| `SIGN-IN-WITH-X`   | SIWX-encoded wallet identity and signature  |
+
+**Option B: Custom SIWE headers** (V1, deprecated)
 
 | Header                     | Description                        |
 |----------------------------|------------------------------------|
@@ -52,6 +60,8 @@ Wallet signature via SIWE (EIP-4361). The caller must include the following head
 | `X-TripWire-Nonce`        | One-time nonce from `/auth/nonce`  |
 | `X-TripWire-Issued-At`    | ISO 8601 timestamp                 |
 | `X-TripWire-Expiration`   | ISO 8601 expiration time           |
+
+Both methods are currently accepted. The `SIGN-IN-WITH-X` header is the x402 V2 standard and is the recommended path forward. The custom `X-TripWire-*` headers are deprecated for MCP and will be removed in a future release.
 
 The signature covers a SIWE message that includes the HTTP method, path, and SHA-256 hash of the request body. Nonces are single-use and consumed atomically via Redis.
 
@@ -64,11 +74,11 @@ If a tool's `min_reputation` threshold is set above 0 and the caller's score is 
 
 ### X402 (Per-Call Payment)
 
-Micropayment via the x402 protocol. The caller must include:
+Micropayment via the x402 V2 protocol. The caller must include the `PAYMENT-SIGNATURE` header:
 
-| Header       | Description                                |
-|--------------|--------------------------------------------|
-| `X-PAYMENT`  | x402 payment proof (ERC-3009 authorization)|
+| Header               | Description                                    |
+|----------------------|------------------------------------------------|
+| `PAYMENT-SIGNATURE`  | x402 V2 payment proof (ERC-3009 authorization) |
 
 Payment is verified before tool execution but settled only after successful execution. If settlement fails, the tool result is withheld and the payment dedup key is cleaned up so the caller can retry. Replay protection uses a SHA-256 hash of the payment proof stored in Redis with a 24-hour TTL.
 
@@ -532,9 +542,13 @@ The manifest advertises available paid services, MCP tools, auth configuration, 
 
 The `identity.protocol` field is set to `"ERC-8004"` to signal that TripWire uses the ERC-8004 onchain agent identity registry for caller identity discovery. Agents with an ERC-8004 registration on Base have their `AgentIdentity` and `reputation_score` resolved and attached to every authenticated MCP request.
 
+### Bazaar V2 Endpoint
+
+x402 V2 introduces `GET /discovery/resources` as the standardized Bazaar discovery endpoint. This endpoint serves the same role as `GET /.well-known/x402-manifest.json` but follows the V2 resource discovery convention. Both endpoints are available; V2 clients should prefer `/discovery/resources`.
+
 ### Discovery Flow
 
-1. Agent fetches `GET /.well-known/x402-manifest.json`
+1. Agent fetches `GET /.well-known/x402-manifest.json` (V1) or `GET /discovery/resources` (V2)
 2. Reads `auth.siwe.nonce_endpoint` to get a SIWE nonce
 3. Reads `auth.x402` for payment facilitator config
 4. Reads `mcp.tools` to discover available tools and their auth tiers
@@ -556,7 +570,7 @@ Every `tools/call` request follows this pipeline:
 3. **Authenticate** -- `build_auth_context()` runs the appropriate auth flow based on the tool's `AuthTier`:
    - PUBLIC: no-op
    - SIWX: verify SIWE headers, recover wallet address, consume nonce
-   - X402: verify `X-PAYMENT` header, check replay protection, verify payment proof via facilitator
+   - X402: verify `PAYMENT-SIGNATURE` header, check replay protection, verify payment proof via facilitator
 
 4. **Agent address check** -- Non-PUBLIC tools require a resolved `agent_address`. If missing, returns `-32000`.
 

@@ -162,11 +162,13 @@ The `initialize` and `tools/list` JSON-RPC methods require no authentication. Th
 
 Uses the same SIWE flow as the REST API. The MCP auth module (`tripwire/mcp/auth.py`) re-implements the verification logic in `_verify_siwe()` rather than calling the FastAPI dependency directly. The flow is identical: verify expiration, check issued-at tolerance (`auth_timestamp_tolerance_seconds`, default 300s), compute body hash, reconstruct the SIWE message, recover the signer, compare addresses, and atomically consume the nonce from Redis.
 
+x402 V2 introduces **SIWX (Sign-In With X)** as the standardized replacement for custom SIWE header flows. SIWX is transmitted via the `SIGN-IN-WITH-X` header and provides a unified cross-chain identity primitive. TripWire accepts both the legacy custom SIWE headers (`X-TripWire-*`) and the V2 `SIGN-IN-WITH-X` header for backward compatibility.
+
 After successful SIWE verification, the server performs an ERC-8004 identity resolution on the recovered address (defaulting to Base chain 8453) to populate the `MCPAuthContext` with identity and reputation data.
 
 ### 5.4 X402 Tier (Payment Required)
 
-For paid tools, the caller must include an `X-PAYMENT` header containing an x402 payment proof.
+For paid tools, the caller must include an x402 payment header containing a payment proof. x402 V2 uses the `PAYMENT-SIGNATURE` header; the legacy V1 `X-PAYMENT` header is still accepted but deprecated.
 
 Verification flow:
 
@@ -416,7 +418,7 @@ Configuration:
 
 ### 10.2 MCP Tool Calls
 
-X402-tier MCP tools (`register_middleware`, `create_trigger`, `activate_template`) require an `X-PAYMENT` header. The payment is verified against the tool's declared price via the x402 facilitator, and settled only after successful tool execution.
+X402-tier MCP tools (`register_middleware`, `create_trigger`, `activate_template`) require an x402 payment header. x402 V2 callers should use the `PAYMENT-SIGNATURE` header; the legacy V1 `X-PAYMENT` header is still accepted but deprecated. The payment is verified against the tool's declared price via the x402 facilitator, and settled only after successful tool execution.
 
 ### 10.3 Per-Trigger Payment Gating (Phase C3)
 
@@ -497,6 +499,29 @@ Additionally, both the Goldsky and facilitator webhook authentication dependenci
 
 ---
 
+## 13. x402 V1 to V2 Migration
+
+x402 V2 introduces updated header conventions and authentication primitives. TripWire is migrating to support both V1 and V2 during the transition period.
+
+### Header Changes
+
+| Purpose | V1 (Deprecated) | V2 | Status |
+|---|---|---|---|
+| Payment proof | `X-PAYMENT` | `PAYMENT-SIGNATURE` | Both accepted; V1 deprecated |
+| Wallet identity (SIWX) | Custom `X-TripWire-*` headers | `SIGN-IN-WITH-X` | Both accepted; custom headers deprecated for MCP |
+
+### Authentication Changes
+
+- **SIWX replaces custom SIWE**: x402 V2 standardizes wallet authentication under the SIWX (Sign-In With X) primitive, transmitted via the `SIGN-IN-WITH-X` header. This replaces TripWire's custom `X-TripWire-*` SIWE header scheme for the MCP path. The REST API continues to use `X-TripWire-*` headers.
+- **Bazaar V2 endpoint**: `GET /discovery/resources` serves as the V2 Bazaar discovery endpoint, complementing the existing `GET /.well-known/x402-manifest.json` (V1).
+
+### Migration Timeline
+
+- **Current**: Both V1 and V2 headers are accepted. V1 headers are deprecated but functional.
+- **Future**: V1 headers will be removed in a future release. Callers should migrate to `PAYMENT-SIGNATURE` and `SIGN-IN-WITH-X` headers.
+
+---
+
 ## Known Issues Summary
 
 | Issue | Location | Severity | Status | Description |
@@ -504,7 +529,7 @@ Additionally, both the Goldsky and facilitator webhook authentication dependenci
 | Chain ID mismatch | `tripwire/api/auth.py:33` vs `sdk/tripwire_sdk/signer.py:40` | High | Open | Server uses 8453, SDK hardcodes 1. SDK-signed requests will fail verification. |
 | MCP register_middleware webhook secret | `tripwire/mcp/tools.py:76` | High | Open | Generates a secret but never passes it to Convoy. Returned secret is useless. No Convoy project/endpoint created. |
 | RLS policies inert | `tripwire/api/__init__.py:13` | Medium | Open | `get_supabase_scoped` exists but is never called. All routes use the service role, bypassing RLS. |
-| Vestigial webhook_signing_secret | `tripwire/config/settings.py:23` | Low | Open | Defined but never referenced in any code path. Dead configuration. |
+| ~~Vestigial webhook_signing_secret~~ | ~~`tripwire/config/settings.py`~~ | ~~Low~~ | **Resolved** | Removed from settings.py. Was dead configuration never referenced in any code path. |
 
 ### Resolved Issues
 

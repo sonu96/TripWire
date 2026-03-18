@@ -28,7 +28,7 @@ Base URL: https://<host>:3402/api/v1
 
 ## 2. Authentication
 
-TripWire uses **SIWE (Sign-In with Ethereum, EIP-4361)** wallet authentication. There are no API keys. Every authenticated request requires five headers.
+TripWire uses **SIWE (Sign-In with Ethereum, EIP-4361)** wallet authentication. There are no API keys. Every authenticated REST API request requires five headers. For MCP requests, x402 V2 clients can alternatively use the `SIGN-IN-WITH-X` (SIWX) header -- see [MCP-SERVER.md](./MCP-SERVER.md) for details.
 
 ### Required Headers
 
@@ -822,6 +822,16 @@ x402 Bazaar service discovery manifest. Returns metadata about TripWire's MCP to
   }
 }
 ```
+
+### GET /discovery/resources
+
+x402 V2 Bazaar discovery endpoint. Returns the same service discovery information as `GET /.well-known/x402-manifest.json` but follows the x402 V2 resource discovery convention. V2 clients should prefer this endpoint.
+
+**Auth**: None required.
+
+> Note: This endpoint is mounted at the root, not under `/api/v1`.
+
+**Response** (200): Same structure as `GET /.well-known/x402-manifest.json` (see above).
 
 ### GET /.well-known/tripwire-skill-spec.json
 

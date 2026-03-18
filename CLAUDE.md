@@ -37,12 +37,12 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - `tests/` — Unit and integration tests
 
 ## Key Protocols
-- **x402**: HTTP 402 micropayment protocol using ERC-3009 transferWithAuthorization
+- **x402**: HTTP 402 micropayment protocol using ERC-3009 transferWithAuthorization. V2 migration in progress: `PAYMENT-SIGNATURE` replaces `X-PAYMENT` (V1 deprecated but still accepted), SIWX (`SIGN-IN-WITH-X` header) replaces custom SIWE for MCP auth, `GET /discovery/resources` is the V2 Bazaar endpoint
 - **ERC-3009**: transferWithAuthorization standard for gasless USDC transfers
 - **ERC-8004**: Onchain AI agent identity registry (went mainnet Jan 29 2026)
 - **TWSS-1**: TripWire Skill Spec — execution-aware skill standard defining lifecycle states (provisional/confirmed/finalized/reorged), three-layer gating (can_pay/can_trust/is_safe), and two-phase execution (prepare/commit). See docs/SKILL-SPEC.md
 - **Trigger Registry**: Dynamic trigger system — create triggers for any EVM event via MCP or API, no deploy needed
-- **x402 Bazaar**: Agent service discovery via /.well-known/x402-manifest.json + /.well-known/tripwire-skill-spec.json
+- **x402 Bazaar**: Agent service discovery via /.well-known/x402-manifest.json (V1) + /discovery/resources (V2) + /.well-known/tripwire-skill-spec.json
 
 ## Decoder Phases (C1-C3)
 - **C1 (Implemented)**: Decoder protocol + DecodedEvent envelope + ERC3009Decoder + AbiGenericDecoder in `tripwire/ingestion/decoders/`. AbiGenericDecoder performs best-effort payment field extraction (`_extract_payment_fields`) so C3 payment gating works for dynamic triggers too.

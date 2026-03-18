@@ -162,17 +162,17 @@ async def _verify_x402_payment(
     request: Request,
     tool_def: ToolDef,
 ) -> str:
-    """Verify the X-PAYMENT header for an x402-gated tool.
+    """Verify the x402 V2 ``PAYMENT-SIGNATURE`` header for a paid tool.
 
     Returns the payer address extracted from the payment proof.
     The payment is verified but NOT settled -- the caller must invoke
     ``settle_payment`` after successful tool execution.
     """
-    payment_header = request.headers.get("X-PAYMENT")
+    payment_header = request.headers.get("PAYMENT-SIGNATURE")
     if not payment_header:
         raise HTTPException(
             status_code=402,
-            detail="Payment required. Include an X-PAYMENT header.",
+            detail="Payment required. Include a PAYMENT-SIGNATURE header.",
         )
 
     # --- Replay protection: atomic claim of payment proof --------------------
@@ -309,7 +309,7 @@ async def settle_payment(request: Request) -> None:
     if not _X402_AVAILABLE:
         return
 
-    payment_header = request.headers.get("X-PAYMENT")
+    payment_header = request.headers.get("PAYMENT-SIGNATURE")
     if not payment_header:
         return
 

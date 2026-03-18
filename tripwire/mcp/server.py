@@ -537,7 +537,7 @@ def create_mcp_app() -> FastAPI:
                     try:
                         import hashlib as _hl
                         from tripwire.api.redis import get_redis as _get_redis
-                        _payment = request.headers.get("X-PAYMENT", "")
+                        _payment = request.headers.get("PAYMENT-SIGNATURE", "")
                         _ph = _hl.sha256(_payment.encode()).hexdigest()
                         await _get_redis().delete(f"x402:payment:{_ph}:{tool_name}")
                     except Exception:

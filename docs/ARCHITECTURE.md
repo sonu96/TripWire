@@ -1440,7 +1440,7 @@ ERC-8004 reputation score to meet the threshold.
 
 For X402-tier tools:
 
-1. Client includes `X-PAYMENT` header with x402 payment proof
+1. Client includes `PAYMENT-SIGNATURE` header with x402 payment proof
 2. `build_auth_context()` validates the payment proof and deduplicates
    via Redis key `x402:payment:{hash}:{tool_name}`
 3. Tool executes

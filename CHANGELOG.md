@@ -2,6 +2,19 @@
 
 All notable changes to TripWire are documented in this file.
 
+## [2026-03-18] — x402 V2 Migration
+
+### Changed
+- **x402 V2 payment header** — X402-tier MCP tools now accept `PAYMENT-SIGNATURE` (V2) in addition to `X-PAYMENT` (V1, deprecated). V2 callers should use `PAYMENT-SIGNATURE`.
+- **SIWX authentication** — SIWX-tier MCP tools now accept the x402 V2 `SIGN-IN-WITH-X` header alongside the existing custom `X-TripWire-*` SIWE headers. The custom headers are deprecated for MCP.
+
+### Added
+- **`GET /discovery/resources`** — x402 V2 Bazaar discovery endpoint. Serves the same service discovery manifest as `GET /.well-known/x402-manifest.json` using V2 conventions.
+
+### Documentation
+- Updated SECURITY.md, MCP-SERVER.md, API-REFERENCE.md, and CLAUDE.md to reflect x402 V2 header changes, SIWX support, and the new Bazaar V2 endpoint.
+- Added V1-to-V2 migration guide in SECURITY.md.
+
 ## [2026-03-17] — Gap Fixes
 
 ### Changed
