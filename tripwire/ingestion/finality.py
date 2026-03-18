@@ -60,29 +60,39 @@ async def get_block_hash(
         return None
 
 
-async def check_finality(
-    transfer: ERC3009Transfer,
+async def check_finality_generic(
+    chain_id: int | ChainId,
+    block_number: int,
+    tx_hash: str,
     current_block: int | None = None,
     client: httpx.AsyncClient | None = None,
     required_depth: int | None = None,
 ) -> FinalityStatus:
-    """Check whether a transfer has reached finality.
+    """Check finality using raw values — no typed model required.
 
+    Works for any EVM event, not just ERC-3009 transfers.
     If *current_block* is not provided, it will be fetched via RPC.
     If *required_depth* is provided it overrides the chain-default
     depth from ``FINALITY_DEPTHS``.
     """
-    if current_block is None:
-        current_block = await get_block_number(transfer.chain_id, client=client)
+    # Normalise chain_id to ChainId enum for RPC + depth lookup
+    chain_enum = chain_id if isinstance(chain_id, ChainId) else ChainId(chain_id)
 
-    required = required_depth if required_depth is not None else FINALITY_DEPTHS[transfer.chain_id]
-    confirmations = max(0, current_block - transfer.block_number)
+    if current_block is None:
+        current_block = await get_block_number(chain_enum, client=client)
+
+    required = (
+        required_depth
+        if required_depth is not None
+        else FINALITY_DEPTHS.get(chain_enum, 3)
+    )
+    confirmations = max(0, current_block - block_number)
     is_finalized = confirmations >= required
 
     status = FinalityStatus(
-        tx_hash=transfer.tx_hash,
-        chain_id=transfer.chain_id,
-        block_number=transfer.block_number,
+        tx_hash=tx_hash,
+        chain_id=chain_enum,
+        block_number=block_number,
         confirmations=confirmations,
         required_confirmations=required,
         is_finalized=is_finalized,
@@ -91,9 +101,29 @@ async def check_finality(
 
     logger.debug(
         "finality_check",
-        tx_hash=transfer.tx_hash,
+        tx_hash=tx_hash,
         confirmations=confirmations,
         required=required,
         finalized=is_finalized,
     )
     return status
+
+
+async def check_finality(
+    transfer: ERC3009Transfer,
+    current_block: int | None = None,
+    client: httpx.AsyncClient | None = None,
+    required_depth: int | None = None,
+) -> FinalityStatus:
+    """Check whether a transfer has reached finality.
+
+    Delegates to :func:`check_finality_generic` for backward compatibility.
+    """
+    return await check_finality_generic(
+        chain_id=transfer.chain_id,
+        block_number=transfer.block_number,
+        tx_hash=transfer.tx_hash,
+        current_block=current_block,
+        client=client,
+        required_depth=required_depth,
+    )

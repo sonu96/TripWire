@@ -2,7 +2,19 @@
 
 All notable changes to TripWire are documented in this file.
 
-## [2026-03-17]
+## [2026-03-17] — Gap Fixes
+
+### Changed
+- **Nested `ExecutionBlock` on WebhookPayload** — `WebhookPayload` now uses a nested `execution` block (`ExecutionBlock` model) instead of flat `execution_state`, `safe_to_execute`, `trust_source` fields at the root. Finality data moved from `data.finality` into `execution.finality`. `derive_execution_metadata()` now returns an `ExecutionBlock` (not a tuple).
+- **`check_finality_generic()` in finality.py** — New function that accepts raw values (chain_id, block_number, tx_hash) without requiring an `ERC3009Transfer` model. The original `check_finality()` now delegates to it. Enables finality checking for any event type in the unified processor.
+- **AbiGenericDecoder extracts payment fields** — Best-effort payment field extraction (`_extract_payment_fields`) scans decoded event fields for amount-like, from-like, and to-like keys. C3 payment gating now works for dynamic triggers, not just ERC-3009 events.
+
+### Added
+- **`required_agent_class` on Trigger model** — ERC-8004 agent class gate at the trigger level (not just endpoint policy level).
+- **`version` field on Trigger and TriggerTemplate** — Trigger definition versioning (default: "1.0.0").
+- **Migration 025 (`025_skill_spec_alignment.sql`)** — Adds `version`, `status`/lifecycle, `required_agent_class` columns to triggers; `version` to trigger_templates.
+
+## [2026-03-17] — Sprint Delivery
 
 ### Added
 - **Unified processing loop (C2)** — New `_process_unified()` in `processor.py` merges separate ERC-3009 and dynamic trigger code paths into a single pipeline using `DecodedEvent`. Feature-flagged via `UNIFIED_PROCESSOR=true`. Dynamic triggers now gain: finality checking, full policy evaluation, finality depth gating, execution state metadata, notify mode, tracing spans, and Prometheus metrics.

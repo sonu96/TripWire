@@ -73,10 +73,10 @@ async def skill_spec():
                                 {"type": "null"},
                                 {
                                     "type": "object",
-                                    "required": ["confirmations", "required", "is_finalized"],
+                                    "required": ["confirmations", "required_confirmations", "is_finalized"],
                                     "properties": {
                                         "confirmations": {"type": "integer", "minimum": 0},
-                                        "required": {"type": "integer", "minimum": 1, "maximum": 64},
+                                        "required_confirmations": {"type": "integer", "minimum": 1, "maximum": 64},
                                         "is_finalized": {"type": "boolean"},
                                     },
                                 },

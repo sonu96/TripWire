@@ -90,7 +90,7 @@ Formally:
 safe_to_execute == true
   REQUIRES state == "finalized"
   REQUIRES trust_source == "onchain"
-  REQUIRES finality.confirmations >= finality.required
+  REQUIRES finality.confirmations >= finality.required_confirmations
   REQUIRES finality.is_finalized == true
 ```
 
@@ -213,7 +213,7 @@ Has the event reached sufficient finality?
 
 | Condition | Result |
 |-----------|--------|
-| `finality.confirmations >= finality.required` | Gate passes |
+| `finality.confirmations >= finality.required_confirmations` | Gate passes |
 | `finality.confirmations < finality.required` | Skill deferred |
 | `state == "reorged"` | Gate fails |
 
@@ -352,7 +352,7 @@ between the platform and the consuming agent.
     "trust_source": "onchain",
     "finality": {
       "confirmations": 3,
-      "required": 3,
+      "required_confirmations": 3,
       "is_finalized": true
     }
   },

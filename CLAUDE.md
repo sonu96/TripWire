@@ -45,9 +45,17 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - **x402 Bazaar**: Agent service discovery via /.well-known/x402-manifest.json + /.well-known/tripwire-skill-spec.json
 
 ## Decoder Phases (C1-C3)
-- **C1 (Implemented)**: Decoder protocol + DecodedEvent envelope + ERC3009Decoder + AbiGenericDecoder in `tripwire/ingestion/decoders/`
-- **C2 (Implemented)**: Unified processing loop — single code path for ERC-3009 and dynamic triggers via `_process_unified()`. Feature-flagged: `UNIFIED_PROCESSOR=true` (default false). Dynamic triggers gain finality, policy, execution state, notify mode, tracing, metrics.
+- **C1 (Implemented)**: Decoder protocol + DecodedEvent envelope + ERC3009Decoder + AbiGenericDecoder in `tripwire/ingestion/decoders/`. AbiGenericDecoder performs best-effort payment field extraction (`_extract_payment_fields`) so C3 payment gating works for dynamic triggers too.
+- **C2 (Implemented)**: Unified processing loop — single code path for ERC-3009 and dynamic triggers via `_process_unified()`. Feature-flagged: `UNIFIED_PROCESSOR=true` (default false). Dynamic triggers gain finality (via `check_finality_generic()`), policy, execution state (nested `ExecutionBlock`), notify mode, tracing, metrics.
 - **C3 (Implemented)**: Per-trigger payment gating — `require_payment`, `payment_token`, `min_payment_amount` on Trigger model. `payment_amount/token/from/to` on DecodedEvent. Migration 024.
+
+## Key Models
+- **`ExecutionBlock`** (`tripwire/types/models.py`): Nested execution metadata — `state` (ExecutionState), `safe_to_execute` (bool), `trust_source` (TrustSource), `finality` (FinalityData | None). Used as the `execution` field on `WebhookPayload`.
+- **`derive_execution_metadata()`** returns `ExecutionBlock` (not a tuple). Derives execution state from event type and finality data.
+- **`check_finality_generic()`** (`tripwire/ingestion/finality.py`): Finality check using raw values (chain_id, block_number, tx_hash) — no `ERC3009Transfer` required. `check_finality()` delegates to it.
+- **Trigger** has `required_agent_class` (str | None) and `version` (str, default "1.0.0"). Migration 025.
+- **TriggerTemplate** has `version` (str, default "1.0.0"). Migration 025.
+- **Finality field**: `required_confirmations` (not `required`) on `FinalityData`.
 
 ## Webhook Delivery (Convoy + direct httpx fast path)
 - Dual-path architecture: direct httpx POST for low-latency fast path; Convoy for managed delivery with retries, HMAC signing, and DLQ

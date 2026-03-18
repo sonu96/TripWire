@@ -78,9 +78,7 @@ def _build_payload(
         event_type=event_type.value,
     )
     finality_data = build_finality_data(finality, required_depth=required_depth)
-    execution_state, safe_to_execute, trust_source = derive_execution_metadata(
-        event_type, finality_data
-    )
+    execution = derive_execution_metadata(event_type, finality_data)
     return WebhookPayload(
         id=str(uuid.uuid4()),
         idempotency_key=idempotency_key,
@@ -88,9 +86,7 @@ def _build_payload(
         mode=mode,
         timestamp=int(time.time()),
         version="v1",
-        execution_state=execution_state,
-        safe_to_execute=safe_to_execute,
-        trust_source=trust_source,
+        execution=execution,
         data=WebhookData(
             transfer=build_transfer_data(transfer),
             finality=finality_data,

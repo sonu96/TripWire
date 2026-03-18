@@ -105,6 +105,44 @@ All three phases of the decoder unification are now implemented.
 
 ---
 
+## Gap Fixes (Post-Sprint Alignment)
+
+### 1. WebhookPayload uses nested `ExecutionBlock`
+
+`WebhookPayload` no longer has flat `execution_state`, `safe_to_execute`, `trust_source` fields at the root. These are now nested inside an `execution` block (`ExecutionBlock` model in `tripwire/types/models.py`). Finality data has also moved from `data.finality` into `execution.finality`.
+
+**Before:** `payload.execution_state`, `payload.safe_to_execute`, `payload.trust_source`
+**After:** `payload.execution.state`, `payload.execution.safe_to_execute`, `payload.execution.trust_source`, `payload.execution.finality`
+
+`derive_execution_metadata()` now returns an `ExecutionBlock` (not a tuple).
+
+### 2. AbiGenericDecoder extracts payment fields
+
+`AbiGenericDecoder` now performs best-effort payment field extraction via `_extract_payment_fields()`. It scans decoded event fields for amount-like, from-like, and to-like keys and populates `payment_amount`, `payment_token`, `payment_from`, `payment_to` on the `DecodedEvent`. This means C3 payment gating works for dynamic triggers, not just ERC-3009 events.
+
+### 3. `check_finality_generic()` in finality.py
+
+New function that works with raw values (chain_id, block_number, tx_hash) without requiring an `ERC3009Transfer` model. The original `check_finality()` now delegates to `check_finality_generic()`. This enables the unified processor to check finality for any event type.
+
+### 4. Trigger model additions
+
+- `required_agent_class` (str | None): ERC-8004 agent class gate at the trigger level (not just endpoint policy level)
+- `version` (str, default "1.0.0"): Trigger definition versioning
+
+### 5. TriggerTemplate model additions
+
+- `version` (str, default "1.0.0"): Template versioning
+
+### 6. Migration 025 (`025_skill_spec_alignment.sql`)
+
+Adds `version`, `status`/lifecycle, and `required_agent_class` columns to triggers table. Adds `version` column to trigger_templates table.
+
+### 7. Finality field naming
+
+The finality model uses `required_confirmations` (not `required`) as the field name for the chain-specific finality depth threshold.
+
+---
+
 ## System Capabilities Summary
 
 ### Ingestion Paths
@@ -146,7 +184,7 @@ Redis Streams partitioned by topic0. Feature-flagged via `EVENT_BUS_ENABLED`.
 
 ---
 
-## Database Migrations (24 total)
+## Database Migrations (25 total)
 
 Key recent migrations:
 - **020** — Unified event lifecycle (facilitator-Goldsky correlation via `record_nonce_or_correlate`)
@@ -154,6 +192,7 @@ Key recent migrations:
 - **022** — Audit log execution latency
 - **023** — Agent metrics materialized view
 - **024** — Trigger payment gating columns (`require_payment`, `payment_token`, `min_payment_amount`)
+- **025** — Skill spec alignment: `version`, `status`/lifecycle, `required_agent_class` on triggers; `version` on trigger_templates
 
 ---
 

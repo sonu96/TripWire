@@ -52,17 +52,13 @@ class RealtimeNotifier:
         transfer_data: TransferData = build_transfer_data(transfer)
         finality_data = build_finality_data(finality)
 
-        execution_state, safe_to_execute, trust_source = derive_execution_metadata(
-            event_type, finality_data
-        )
+        execution = derive_execution_metadata(event_type, finality_data)
 
         data: dict = {
             "transfer": transfer_data.model_dump(),
             "timestamp": int(time.time()),
             "version": "v1",
-            "execution_state": execution_state.value,
-            "safe_to_execute": safe_to_execute,
-            "trust_source": trust_source.value,
+            "execution": execution.model_dump(),
         }
         if finality_data is not None:
             data["finality"] = finality_data.model_dump()
@@ -117,17 +113,13 @@ class RealtimeNotifier:
         transfer_data: TransferData = build_transfer_data(transfer)
         finality_data = build_finality_data(finality)
 
-        execution_state, safe_to_execute, trust_source = derive_execution_metadata(
-            event_type, finality_data
-        )
+        execution = derive_execution_metadata(event_type, finality_data)
 
         data: dict = {
             "transfer": transfer_data.model_dump(),
             "timestamp": int(time.time()),
             "version": "v1",
-            "execution_state": execution_state.value,
-            "safe_to_execute": safe_to_execute,
-            "trust_source": trust_source.value,
+            "execution": execution.model_dump(),
         }
         if finality_data is not None:
             data["finality"] = finality_data.model_dump()

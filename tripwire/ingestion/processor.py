@@ -36,7 +36,7 @@ from tripwire.ingestion.decoder import (
     _parse_topics,
     decode_transfer_event,
 )
-from tripwire.ingestion.finality import check_finality
+from tripwire.ingestion.finality import check_finality, check_finality_generic
 from tripwire.notify.realtime import RealtimeNotifier
 from tripwire.types.models import (
     FINALITY_DEPTHS,
@@ -536,9 +536,12 @@ class EventProcessor:
                 "mode": endpoint.mode.value,
                 "timestamp": int(time.time()),
                 "version": "v1",
-                "execution_state": "confirmed",
-                "safe_to_execute": False,
-                "trust_source": "onchain",
+                "execution": {
+                    "state": "confirmed",
+                    "safe_to_execute": False,
+                    "trust_source": "onchain",
+                    "finality": None,
+                },
                 "trigger_id": trigger_id,
                 "data": decoded,
             }
@@ -807,34 +810,18 @@ class EventProcessor:
         t0 = time.perf_counter()
 
         async def _do_finality():
-            if is_erc3009 and primary_decoded.typed_model is not None:
-                try:
-                    return await check_finality(primary_decoded.typed_model)
-                except Exception:
-                    logger.exception("unified_finality_failed", tx_hash=tx_hash)
-                    return None
-            elif primary_decoded.block_number and primary_decoded.chain_id:
-                # Dynamic triggers: build a lightweight finality check
-                # using block_number and chain_id directly
-                from tripwire.types.models import ChainId, FinalityStatus
-                try:
-                    chain_enum = ChainId(primary_decoded.chain_id)
-                    required = FINALITY_DEPTHS.get(chain_enum, 3)
-                    from tripwire.ingestion.finality import get_block_number
-                    current = await get_block_number(chain_enum)
-                    confirmations = max(0, current - primary_decoded.block_number)
-                    return FinalityStatus(
-                        tx_hash=primary_decoded.tx_hash,
-                        chain_id=chain_enum,
-                        block_number=primary_decoded.block_number,
-                        confirmations=confirmations,
-                        required_confirmations=required,
-                        is_finalized=confirmations >= required,
-                    )
-                except Exception:
-                    logger.warning("unified_finality_failed_dynamic", tx_hash=tx_hash)
-                    return None
-            return None
+            # Unified finality: check_finality_generic works for all event types
+            if not primary_decoded.block_number or not primary_decoded.chain_id:
+                return None
+            try:
+                return await check_finality_generic(
+                    chain_id=primary_decoded.chain_id,
+                    block_number=primary_decoded.block_number,
+                    tx_hash=primary_decoded.tx_hash,
+                )
+            except Exception:
+                logger.exception("unified_finality_failed", tx_hash=tx_hash)
+                return None
 
         identity_address = primary_decoded.identity_address
 
@@ -985,9 +972,23 @@ class EventProcessor:
                 safe = False
                 trust = TrustSource.ONCHAIN
 
-            # Build payload
+            # Build TWSS-1 compliant payload with nested execution block
             event_id = str(uuid.uuid4())
             event_type_str = trigger.webhook_event_type
+            execution_block = {
+                "state": exec_state.value,
+                "safe_to_execute": safe,
+                "trust_source": trust.value,
+                "finality": (
+                    {
+                        "confirmations": finality_data.confirmations,
+                        "required_confirmations": finality_data.required_confirmations,
+                        "is_finalized": finality_data.is_finalized,
+                    }
+                    if finality_data
+                    else None
+                ),
+            }
             payload = {
                 "id": event_id,
                 "idempotency_key": f"dyn_{tx_hash}_{decoded.log_index}_{trigger_id}",
@@ -995,19 +996,10 @@ class EventProcessor:
                 "mode": endpoint.mode.value,
                 "timestamp": int(time.time()),
                 "version": "v1",
-                "execution_state": exec_state.value,
-                "safe_to_execute": safe,
-                "trust_source": trust.value,
+                "execution": execution_block,
                 "trigger_id": trigger_id,
                 "data": decoded.fields,
             }
-
-            if finality_data:
-                payload["finality"] = {
-                    "confirmations": finality_data.confirmations,
-                    "required_confirmations": finality_data.required_confirmations,
-                    "is_finalized": finality_data.is_finalized,
-                }
 
             if identity:
                 payload["identity"] = identity.model_dump()

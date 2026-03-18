@@ -1018,18 +1018,19 @@ created_at       string (ISO-8601)
 The payload delivered to your webhook endpoint:
 
 ```
-id                string              Unique event ID
-idempotency_key   string              For deduplication on your side
-type              WebhookEventType
-mode              "notify" | "execute"
-timestamp         int                 Unix timestamp
-version           string              Payload schema version (currently "v1")
-execution_state   ExecutionState?     "provisional" | "confirmed" | "finalized" | "reorged" (derived from event type and finality)
-safe_to_execute   bool                Whether the event is safe to act on (true only when finalized)
-trust_source      TrustSource         "facilitator" | "onchain" — origin of the trust assertion
-data.transfer     TransferData        chain_id, tx_hash, block_number, from/to_address, amount, nonce, token
-data.finality     FinalityData?       confirmations, required_confirmations, is_finalized
-data.identity     AgentIdentity | null   ERC-8004 identity of the sender. `null` when the sender has no registered onchain identity. See `AgentIdentity` model below.
+id                         string              Unique event ID
+idempotency_key            string              For deduplication on your side
+type                       WebhookEventType
+mode                       "notify" | "execute"
+timestamp                  int                 Unix timestamp
+version                    string              Payload schema version (currently "v1")
+execution                  ExecutionBlock      Nested execution metadata (see below)
+execution.state            ExecutionState      "provisional" | "confirmed" | "finalized" | "reorged"
+execution.safe_to_execute  bool                Whether the event is safe to act on (true only when finalized)
+execution.trust_source     TrustSource         "facilitator" | "onchain" — origin of the trust assertion
+execution.finality         FinalityData?       confirmations, required_confirmations, is_finalized. null for pre_confirmed events.
+data.transfer              TransferData        chain_id, tx_hash, block_number, from/to_address, amount, nonce, token
+data.identity              AgentIdentity | null   ERC-8004 identity of the sender. `null` when the sender has no registered onchain identity. See `AgentIdentity` model below.
 ```
 
 ### AgentIdentity
@@ -1061,6 +1062,8 @@ chain_ids             int[]         Chain IDs to monitor
 filter_rules          TriggerFilter[]   Field-level filters (field, op, value)
 webhook_event_type    string        Event type string for matched events
 reputation_threshold  float         Minimum sender reputation (0.0-100.0)
+required_agent_class  string?       Required ERC-8004 agent class for sender (null = any)
+version               string        Trigger definition version (default: "1.0.0")
 batch_id              string?       Batch installation tracking
 active                bool
 created_at            datetime?
@@ -1075,6 +1078,7 @@ updated_at            datetime?
 id                    string
 name                  string
 slug                  string        URL-safe identifier
+version               string        Template version (default: "1.0.0")
 description           string?
 category              string        Template category (default: "general")
 event_signature       string

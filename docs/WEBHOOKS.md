@@ -10,13 +10,13 @@ The facilitator fast path and Goldsky confirmation path produce a **single event
 
 ```
 Facilitator fires
-  -> payment.pre_confirmed  (event_id=X, execution_state=provisional, safe_to_execute=false)
+  -> payment.pre_confirmed  (event_id=X, execution.state=provisional, execution.safe_to_execute=false)
 
 Goldsky confirms the onchain tx
-  -> payment.confirmed      (same event_id=X, execution_state=confirmed, real tx_hash)
+  -> payment.confirmed      (same event_id=X, execution.state=confirmed, real tx_hash)
 
 Finality depth threshold reached
-  -> payment.finalized      (same event_id=X, execution_state=finalized, safe_to_execute=true)
+  -> payment.finalized      (same event_id=X, execution.state=finalized, execution.safe_to_execute=true)
 ```
 
 When the facilitator path is not used (Goldsky-only flow), the event starts at `payment.pending` and is promoted to `payment.confirmed` and then `payment.finalized` by the finality poller.
@@ -143,12 +143,18 @@ All webhook payloads follow a consistent envelope structure.
   "mode": "execute",
   "timestamp": 1710547200,
   "version": "v1",
-  "execution_state": "confirmed",
-  "safe_to_execute": false,
-  "trust_source": "onchain",
+  "execution": {
+    "state": "confirmed",
+    "safe_to_execute": false,
+    "trust_source": "onchain",
+    "finality": {
+      "confirmations": 3,
+      "required_confirmations": 3,
+      "is_finalized": false
+    }
+  },
   "data": {
     "transfer": { ... },
-    "finality": { ... },
     "identity": { ... }
   }
 }
@@ -164,14 +170,16 @@ All webhook payloads follow a consistent envelope structure.
 | `mode` | string | `"execute"` or `"notify"` |
 | `timestamp` | integer | Unix timestamp of payload creation |
 | `version` | string | Payload schema version. Always `"v1"`. |
-| `execution_state` | string | Current lifecycle state: `"provisional"`, `"confirmed"`, `"finalized"`, or `"reorged"` |
-| `safe_to_execute` | boolean | `true` only when `execution_state` is `"finalized"`. Consumers should gate irreversible side-effects on this flag. |
-| `trust_source` | string | `"facilitator"` for pre-confirmed events (off-chain signature verification), `"onchain"` for all others (Goldsky-confirmed). |
-| `data` | object | Contains `transfer`, `finality`, and `identity` sub-objects |
+| `execution` | object | Nested `ExecutionBlock` containing `state`, `safe_to_execute`, `trust_source`, and `finality`. See below. |
+| `execution.state` | string | Current lifecycle state: `"provisional"`, `"confirmed"`, `"finalized"`, or `"reorged"` |
+| `execution.safe_to_execute` | boolean | `true` only when `state` is `"finalized"`. Consumers should gate irreversible side-effects on this flag. |
+| `execution.trust_source` | string | `"facilitator"` for pre-confirmed events (off-chain signature verification), `"onchain"` for all others (Goldsky-confirmed). |
+| `execution.finality` | object or null | Contains `confirmations`, `required_confirmations`, `is_finalized`. `null` for `payment.pre_confirmed` events (tx not yet onchain). |
+| `data` | object | Contains `transfer` and `identity` sub-objects |
 
 #### Execution State Mapping
 
-| Event Type | `execution_state` | `safe_to_execute` | `trust_source` |
+| Event Type | `execution.state` | `execution.safe_to_execute` | `execution.trust_source` |
 |---|---|---|---|
 | `payment.pre_confirmed` | `provisional` | `false` | `facilitator` |
 | `payment.confirmed` | `confirmed` | `false` | `onchain` |
@@ -205,9 +213,9 @@ All webhook payloads follow a consistent envelope structure.
 | `nonce` | string | ERC-3009 authorization nonce (bytes32 hex) |
 | `token` | string | Token contract address (USDC) |
 
-### Finality Data (`data.finality`)
+### Finality Data (`execution.finality`)
 
-Present when finality information is available. `null` for `payment.pre_confirmed` events (tx not yet onchain).
+Nested inside the `execution` block. Present when finality information is available. `null` for `payment.pre_confirmed` events (tx not yet onchain).
 
 ```json
 {
@@ -261,9 +269,12 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
   "mode": "execute",
   "timestamp": 1710547180,
   "version": "v1",
-  "execution_state": "provisional",
-  "safe_to_execute": false,
-  "trust_source": "facilitator",
+  "execution": {
+    "state": "provisional",
+    "safe_to_execute": false,
+    "trust_source": "facilitator",
+    "finality": null
+  },
   "data": {
     "transfer": {
       "chain_id": 8453,
@@ -275,7 +286,6 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
       "nonce": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
     },
-    "finality": null,
     "identity": null
   }
 }
@@ -291,9 +301,16 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
   "mode": "execute",
   "timestamp": 1710547200,
   "version": "v1",
-  "execution_state": "confirmed",
-  "safe_to_execute": false,
-  "trust_source": "onchain",
+  "execution": {
+    "state": "confirmed",
+    "safe_to_execute": false,
+    "trust_source": "onchain",
+    "finality": {
+      "confirmations": 3,
+      "required_confirmations": 3,
+      "is_finalized": false
+    }
+  },
   "data": {
     "transfer": {
       "chain_id": 8453,
@@ -304,11 +321,6 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
       "amount": "5000000",
       "nonce": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    },
-    "finality": {
-      "confirmations": 3,
-      "required_confirmations": 3,
-      "is_finalized": false
     },
     "identity": {
       "address": "0x1111111111111111111111111111111111111111",
@@ -333,9 +345,16 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
   "mode": "execute",
   "timestamp": 1710547260,
   "version": "v1",
-  "execution_state": "finalized",
-  "safe_to_execute": true,
-  "trust_source": "onchain",
+  "execution": {
+    "state": "finalized",
+    "safe_to_execute": true,
+    "trust_source": "onchain",
+    "finality": {
+      "confirmations": 12,
+      "required_confirmations": 12,
+      "is_finalized": true
+    }
+  },
   "data": {
     "transfer": {
       "chain_id": 8453,
@@ -346,11 +365,6 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
       "amount": "5000000",
       "nonce": "0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
       "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
-    },
-    "finality": {
-      "confirmations": 12,
-      "required_confirmations": 12,
-      "is_finalized": true
     },
     "identity": {
       "address": "0x1111111111111111111111111111111111111111",
@@ -369,9 +383,9 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
 
 Dynamic trigger events use a slightly different payload structure. The `data` field contains the ABI-decoded event fields directly, and includes a `trigger_id`.
 
-When `UNIFIED_PROCESSOR=true`, dynamic trigger payloads gain execution state
-fields (`execution_state`, `safe_to_execute`, `trust_source`, `finality`) that
-were previously exclusive to ERC-3009 payloads. See the
+When `UNIFIED_PROCESSOR=true`, dynamic trigger payloads gain a nested `execution`
+block (`execution.state`, `execution.safe_to_execute`, `execution.trust_source`,
+`execution.finality`) that was previously exclusive to ERC-3009 payloads. See the
 [TWSS-1 Skill Output Contract](SKILL-SPEC.md#6-skill-output-contract) for
 the canonical format.
 

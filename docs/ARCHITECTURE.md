@@ -483,15 +483,17 @@ REORGED (confidence 0.0)
 
 These trust levels are encoded in the `WebhookEventType` enum
 (`tripwire/types/models.py`) and surfaced explicitly in every webhook
-payload via three new fields:
+payload via a nested `ExecutionBlock` (the `execution` field):
 
-- **`execution_state`**: `ExecutionState` enum -- `provisional`, `confirmed`,
+- **`execution.state`**: `ExecutionState` enum -- `provisional`, `confirmed`,
   `finalized`, or `reorged`. Derived from event type and finality data by
-  `derive_execution_metadata()`.
-- **`safe_to_execute`**: `bool` -- `true` only when `execution_state` is
+  `derive_execution_metadata()`, which returns an `ExecutionBlock`.
+- **`execution.safe_to_execute`**: `bool` -- `true` only when `state` is
   `finalized`. Tells the consumer whether irreversible actions are safe.
-- **`trust_source`**: `TrustSource` enum -- `facilitator` (pre_confirmed
+- **`execution.trust_source`**: `TrustSource` enum -- `facilitator` (pre_confirmed
   events) or `onchain` (all others).
+- **`execution.finality`**: `FinalityData | null` -- confirmation count,
+  required confirmations, and finalization flag. `null` for pre_confirmed events.
 
 The `WebhookEventType` enum now includes six event types:
 `payment.pre_confirmed`, `payment.pending`, `payment.confirmed`,
@@ -503,8 +505,11 @@ All payloads also carry `version: "v1"` for forward compatibility.
 
 The function `execution_state_from_status()` in `tripwire/types/models.py`
 maps the database `events.status` column to the execution metadata triple
-`(ExecutionState, safe_to_execute, TrustSource)` at query time. This is a
-pure derivation -- no schema migration is needed.
+`(ExecutionState, safe_to_execute, TrustSource)` at query time. The related
+`derive_execution_metadata()` function returns an `ExecutionBlock` model
+(containing `state`, `safe_to_execute`, `trust_source`, and `finality`)
+used to populate the nested `execution` field on `WebhookPayload`. Both are
+pure derivations -- no schema migration is needed.
 
 ```
   events.status         -> ExecutionState    safe_to_execute  TrustSource
@@ -957,6 +962,7 @@ Three tables, introduced in migration 013:
 | id                  | UUID PK     | Auto-generated                        |
 | name                | TEXT        | Human-readable name                   |
 | slug                | TEXT UNIQUE | URL-safe identifier                   |
+| version             | TEXT        | Template version (default: "1.0.0") (migration 025) |
 | description         | TEXT        | Template description                  |
 | category            | TEXT        | e.g. 'defi', 'payments', 'nft'       |
 | event_signature     | TEXT        | Solidity signature (e.g. `Transfer(address,address,uint256)`) |
@@ -990,6 +996,8 @@ Seeded templates: `whale-transfer`, `dex-swap`, `nft-mint`,
 | filter_rules        | JSONB       | JMESPath filter predicates            |
 | webhook_event_type  | TEXT        | Event type string for webhooks        |
 | reputation_threshold| FLOAT       | Min reputation score                  |
+| required_agent_class| TEXT        | Required ERC-8004 agent class (null = any) (migration 025) |
+| version             | TEXT        | Trigger definition version (default: "1.0.0") (migration 025) |
 | batch_id            | UUID        | Groups triggers created together      |
 | active              | BOOLEAN     | Soft-delete flag                      |
 
@@ -1076,7 +1084,7 @@ tripwire/ingestion/decoders/
 **Concrete decoders:**
 
 - **`ERC3009Decoder`** (`erc3009.py`): Wraps existing `decode_transfer_event()`. Sets `typed_model` to `ERC3009Transfer`, `identity_address` to the authorizer.
-- **`AbiGenericDecoder(abi_fragment)`** (`abi_generic.py`): Wraps existing `decode_event_with_abi()`. Stores the full decoded dict in `fields`. Accepts any ABI event fragment; decodes indexed params from topics[1:] and non-indexed params from data via `eth_abi.decode()`.
+- **`AbiGenericDecoder(abi_fragment)`** (`abi_generic.py`): Wraps existing `decode_event_with_abi()`. Stores the full decoded dict in `fields`. Accepts any ABI event fragment; decodes indexed params from topics[1:] and non-indexed params from data via `eth_abi.decode()`. Now performs best-effort payment field extraction (`_extract_payment_fields`): scans decoded fields for amount-like, from-like, and to-like keys and populates `payment_amount`, `payment_token`, `payment_from`, `payment_to` on the `DecodedEvent`. This enables C3 payment gating to work for dynamic triggers, not just ERC-3009 events.
 
 **Integration**: `processor.py` now calls `ERC3009Decoder().decode()` and
 `AbiGenericDecoder(trigger.abi).decode()` instead of invoking the raw
@@ -1101,7 +1109,7 @@ and `_process_dynamic_event` methods with a single code path. Feature-flagged vi
 - Finality checking (block confirmations via RPC)
 - Full policy evaluation (endpoint policies, not just reputation threshold)
 - Finality depth gating per endpoint
-- Execution state metadata (`execution_state`, `safe_to_execute`, `trust_source`)
+- Execution state metadata via nested `ExecutionBlock` (`execution.state`, `execution.safe_to_execute`, `execution.trust_source`, `execution.finality`)
 - Notify mode support (Supabase Realtime push)
 - OpenTelemetry tracing spans
 - Prometheus pipeline metrics
@@ -1113,7 +1121,7 @@ and `_process_dynamic_event` methods with a single code path. Feature-flagged vi
   2. FILTER         evaluate_filters(decoded.fields, trigger.filter_rules)
   3. PAYMENT GATE   _check_payment_gate(decoded, trigger)           [C3]
   4. DEDUP          nonce_repo (correlation-aware for ERC-3009, simple for dynamic)
-  5. FINALITY       check_finality() or get_block_number() in parallel with...
+  5. FINALITY       check_finality_generic() (works with raw values, no ERC3009Transfer required) in parallel with...
      IDENTITY       resolver.resolve(decoded.identity_address)
   6. REPUTATION     trigger.reputation_threshold gating
   7. ENDPOINT       recipient matching (ERC-3009) or trigger.endpoint_id (dynamic)
@@ -1137,12 +1145,16 @@ minimum threshold before dispatch proceeds. Controlled by three fields on the
 
 **DecodedEvent payment fields** (populated by decoders):
 
-| Field          | Populated by     | Source                    |
-|----------------|------------------|---------------------------|
-| payment_amount | ERC3009Decoder   | `transfer.value`          |
-| payment_token  | ERC3009Decoder   | `transfer.token`          |
-| payment_from   | ERC3009Decoder   | `transfer.from_address`   |
-| payment_to     | ERC3009Decoder   | `transfer.to_address`     |
+| Field          | Populated by                  | Source                                         |
+|----------------|-------------------------------|------------------------------------------------|
+| payment_amount | ERC3009Decoder                | `transfer.value`                               |
+| payment_amount | AbiGenericDecoder (best-effort) | Heuristic scan for amount-like decoded fields |
+| payment_token  | ERC3009Decoder                | `transfer.token`                               |
+| payment_token  | AbiGenericDecoder (best-effort) | Emitting contract address                     |
+| payment_from   | ERC3009Decoder                | `transfer.from_address`                        |
+| payment_from   | AbiGenericDecoder (best-effort) | Heuristic scan for from-like decoded fields   |
+| payment_to     | ERC3009Decoder                | `transfer.to_address`                          |
+| payment_to     | AbiGenericDecoder (best-effort) | Heuristic scan for to-like decoded fields     |
 
 `_check_payment_gate(decoded, trigger)` validates: (1) payment data exists,
 (2) token matches if specified, (3) amount >= minimum. Returns `(bool, reason)`.

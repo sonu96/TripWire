@@ -183,6 +183,14 @@ class FinalityData(BaseModel):
     is_finalized: bool
 
 
+class ExecutionBlock(BaseModel):
+    """Nested execution metadata per TWSS-1 spec (Section 7.2)."""
+    state: ExecutionState
+    safe_to_execute: bool = False
+    trust_source: TrustSource = TrustSource.ONCHAIN
+    finality: FinalityData | None = None
+
+
 def build_finality_data(
     finality: "FinalityStatus | None",
     required_depth: int | None = None,
@@ -208,8 +216,10 @@ def build_finality_data(
 def derive_execution_metadata(
     event_type: WebhookEventType,
     finality: FinalityData | None,
-) -> tuple[ExecutionState, bool, TrustSource]:
-    """Derive execution state, safe_to_execute flag, and trust source.
+) -> ExecutionBlock:
+    """Derive an ExecutionBlock from event type and finality data.
+
+    Returns a nested ExecutionBlock per TWSS-1 Section 7.2.
 
     Mapping:
     - PRE_CONFIRMED → provisional, false, facilitator
@@ -218,18 +228,22 @@ def derive_execution_metadata(
     - else → confirmed, false, onchain
     """
     if event_type == WebhookEventType.PAYMENT_PRE_CONFIRMED:
-        return ExecutionState.PROVISIONAL, False, TrustSource.FACILITATOR
+        state, safe, trust = ExecutionState.PROVISIONAL, False, TrustSource.FACILITATOR
+    elif event_type in (WebhookEventType.PAYMENT_REORGED, WebhookEventType.PAYMENT_FAILED):
+        state, safe, trust = ExecutionState.REORGED, False, TrustSource.ONCHAIN
+    elif event_type == WebhookEventType.PAYMENT_FINALIZED:
+        state, safe, trust = ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
+    elif finality is not None and finality.is_finalized:
+        state, safe, trust = ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
+    else:
+        state, safe, trust = ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN
 
-    if event_type in (WebhookEventType.PAYMENT_REORGED, WebhookEventType.PAYMENT_FAILED):
-        return ExecutionState.REORGED, False, TrustSource.ONCHAIN
-
-    if event_type == WebhookEventType.PAYMENT_FINALIZED:
-        return ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
-
-    if finality is not None and finality.is_finalized:
-        return ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
-
-    return ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN
+    return ExecutionBlock(
+        state=state,
+        safe_to_execute=safe,
+        trust_source=trust,
+        finality=finality,
+    )
 
 
 def execution_state_from_status(
@@ -267,9 +281,7 @@ class WebhookPayload(BaseModel):
     mode: EndpointMode
     timestamp: int
     version: str = "v1"
-    execution_state: ExecutionState | None = None
-    safe_to_execute: bool = False
-    trust_source: TrustSource = TrustSource.ONCHAIN
+    execution: ExecutionBlock
     data: WebhookData
 
 
@@ -320,6 +332,8 @@ class Trigger(BaseModel):
     filter_rules: list[TriggerFilter] = Field(default_factory=list)
     webhook_event_type: str
     reputation_threshold: float = 0.0
+    required_agent_class: str | None = None
+    version: str = "1.0.0"
     batch_id: str | None = None
     # C3: Payment gating — require decoded event to contain payment meeting threshold
     require_payment: bool = False
@@ -336,6 +350,7 @@ class TriggerTemplate(BaseModel):
     id: str
     name: str
     slug: str
+    version: str = "1.0.0"
     description: str | None = None
     category: str = "general"
     event_signature: str

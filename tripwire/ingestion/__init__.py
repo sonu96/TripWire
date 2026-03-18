@@ -6,7 +6,7 @@ from tripwire.ingestion.decoder import (
     decode_transfer_event,
     decode_transfer_log,
 )
-from tripwire.ingestion.finality import check_finality, get_block_number
+from tripwire.ingestion.finality import check_finality, check_finality_generic, get_block_number
 from tripwire.ingestion.pipeline import (
     build_all_pipeline_configs,
     build_pipeline_config,
@@ -22,6 +22,7 @@ __all__ = [
     "build_pipeline_config",
     "build_pipeline_yaml",
     "check_finality",
+    "check_finality_generic",
     "decode_authorization_used",
     "decode_erc3009_from_logs",
     "decode_transfer_event",

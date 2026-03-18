@@ -61,7 +61,7 @@ tripwire/
   api/             FastAPI routes, auth middleware, rate limiting
   config/          Settings via pydantic-settings (.env loading)
   db/              Supabase client, repositories, SQL migrations
-    migrations/    Numbered SQL migration files (001..023)
+    migrations/    Numbered SQL migration files (001..025)
     repositories/  Data access: endpoints, events, nonces, triggers, webhooks
   identity/        ERC-8004 identity resolution
     resolver.py    ERC8004Resolver (prod, makes eth_call to onchain registry)
@@ -254,7 +254,7 @@ Key types exported from `tripwire_sdk.types`:
 | `TrustSource` | Enum: trust provenance (goldsky, facilitator, rpc) |
 | `PaginatedResponse` | Cursor-paginated event list |
 
-The `derive_execution_metadata()` helper function (in `tripwire/types/models.py`) computes execution state and trust metadata from an event's nonce source and finality status, used by the processor to enrich webhook payloads.
+The `derive_execution_metadata()` helper function (in `tripwire/types/models.py`) returns an `ExecutionBlock` containing execution state, trust metadata, and finality data, derived from an event's type and finality status. The processor uses this to populate the nested `execution` field on `WebhookPayload`.
 
 All SDK models inherit from `TripWireBaseModel` which is configured with `extra="ignore"` (silently drops unknown fields from the server) and `frozen=True` (immutable instances).
 
@@ -316,6 +316,8 @@ There is no automated migration runner. Run them in order against your Supabase 
 | 021 | `021_dlq_retry_count.sql` | Persistent `dlq_retry_count` column on webhook_deliveries (replaces in-memory retry counter in DLQHandler) |
 | 022 | `022_audit_latency.sql` | Add `execution_latency_ms` column to `audit_log` for tracking MCP tool execution latency |
 | 023 | `023_agent_metrics_view.sql` | Create `agent_metrics` materialized view for per-agent metrics; powers `GET /stats/agent-metrics` endpoint |
+| 024 | `024_trigger_payment_gating.sql` | Add `require_payment`, `payment_token`, `min_payment_amount` columns to triggers for per-trigger payment gating (C3) |
+| 025 | `025_skill_spec_alignment.sql` | Add `version`, `status`/lifecycle, `required_agent_class` columns to triggers and `version` to trigger_templates |
 
 ---
 
