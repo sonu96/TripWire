@@ -4,6 +4,34 @@ All notable changes to TripWire are documented in this file.
 
 ## [Unreleased] - 2026-03-18
 
+### Added (fb5fb45 — Dual-Product Platform)
+- **`OnchainEvent`/`PaymentEvent`/`TriggerEvent` model hierarchy** — Base onchain event model with product-specific subclasses in `tripwire/types/models.py`.
+- **`EventHandler` protocol** — `can_handle()` + `handle()` dispatch interface in `tripwire/ingestion/handlers/base.py`.
+- **`PaymentHandler` (Keeper) + `TriggerHandler` (Pulse)** — Product-specific event handlers implementing `EventHandler` protocol.
+- **Migration 026** — Schema support for dual-product event types and product metadata.
+- **`dispatch_generic_event()` + `notify_generic()`** — Generic event dispatch and notification for Pulse triggers.
+- **`TRIGGER_MATCHED`/`TRIGGER_CONFIRMED`/`TRIGGER_FINALIZED` event types** — Lifecycle event types for Pulse trigger processing.
+- **MCP product tagging** — Tools tagged with `product` ("pulse", "keeper", or "both") and filtered at `tools/list` time.
+- **`product_mode` setting** — `PRODUCT_MODE` env var ("pulse", "keeper", or "both"; default "both") with `is_pulse`/`is_keeper` property helpers.
+- **Product metadata in discovery** — `/discovery/resources` includes product mode information.
+
+### Added (c1fe811 — Keeper Sessions)
+- **`tripwire/session/` package** — Session management with `SessionManager` (manager.py) for Redis-backed session lifecycle.
+- **Lua atomic budget decrement** — `atomic_decrement.lua` script ensures budget checks and decrements are atomic; prevents overspend under concurrency.
+- **`POST/GET/DELETE /auth/session` routes** — Session REST API in `tripwire/api/routes/session.py` for opening, querying, and closing sessions.
+- **`SESSION` auth tier** — New authentication tier distinct from X402 and SIWX.
+- **`_handle_session_tool_call()`** — MCP server handler that validates and decrements session budget before executing tool calls.
+- **SDK session methods** — `open_session()`, `get_session()`, `close_session()` convenience methods on `TripwireClient`.
+- **`session_enabled` setting** — `SESSION_ENABLED` env var (bool, default false) gates the session system.
+
+### Changed (fb5fb45 — Dual-Product Platform)
+- **processor.py split** — Refactored from 1753 to 923 lines; product-specific logic delegated to `PaymentHandler`/`TriggerHandler` via `can_handle()` dispatch.
+- **`WebhookData.event` generic field** — Event payload field is now generic, accepting both `PaymentEvent` and `TriggerEvent`.
+- **Discovery includes product metadata** — `/discovery/resources` response enriched with active product mode and per-tool product tags.
+
+### Changed (c1fe811 — Keeper Sessions)
+- **MCP auth precedence** — Server checks `X-TripWire-Session` header before falling back to X402/SIWX authentication.
+
 ### Changed
 - **MCP auth refactored to hooks pattern**: `TripWirePaymentHooks` + `x402_tool_executor()` replace manual verify/settle flow. Identity resolution, reputation gating, rate limiting, and audit logging are now encapsulated as lifecycle hooks.
 - **Multi-chain x402 support**: `x402_networks: list[str]` replaces `x402_network: str`. Supports Base, Ethereum, Arbitrum, Polygon via CAIP-2 identifiers. Discovery endpoints generate per-network payment options.

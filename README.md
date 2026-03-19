@@ -6,6 +6,13 @@
 
 Turn onchain events into safe execution signals -- instantly or after finality. TripWire is the infrastructure layer between onchain events and application execution: it indexes, verifies, enriches, and delivers so your application never has to poll a chain or parse a log.
 
+TripWire runs as a **dual-product platform**:
+
+- **Pulse** -- generic onchain event triggers. Monitor any EVM event (ERC-20 transfers, DeFi swaps, NFT mints) across Base, Ethereum, and Arbitrum. Events progress through `trigger.matched` -> `trigger.confirmed` -> `trigger.finalized`.
+- **Keeper** -- x402 payment webhooks. Purpose-built for ERC-3009 `transferWithAuthorization` micropayments with a ~100ms facilitator fast path. Supports **sessions** -- pre-authorized spending limits so agents can make multiple MCP tool calls without per-call x402 payment negotiation.
+
+Deploy as Pulse-only, Keeper-only, or both (default) via the `PRODUCT_MODE` environment variable.
+
 ---
 
 ## What TripWire Does
@@ -13,6 +20,7 @@ Turn onchain events into safe execution signals -- instantly or after finality. 
 - **Indexes onchain events via Goldsky Turbo** across Base, Ethereum, and Arbitrum. Any EVM event -- ERC-3009 payments, ERC-20 transfers, DeFi swaps, NFT mints -- can be a trigger.
 - **Unified processing pipeline.** A single code path decodes, deduplicates, checks finality, resolves ERC-8004 identity, evaluates policies, and gates on payment metadata -- for both built-in ERC-3009 events and dynamic triggers created via MCP or API.
 - **Per-trigger payment gating.** Triggers can require that the decoded event contains a payment meeting a minimum threshold before dispatch proceeds. Gate on token contract, minimum amount, or both.
+- **Keeper sessions.** Pre-authorized spending limits stored in Redis with atomic Lua-script budget decrements. Agents open a session once, then make multiple MCP tool calls using the `X-TripWire-Session` header instead of per-call x402 payments. Feature-flagged via `SESSION_ENABLED`.
 - **Delivers signed webhooks via Convoy** with at-least-once guarantees. HMAC-signed payloads, exponential backoff retries (10 attempts), and a dead-letter queue ensure nothing is silently dropped.
 
 ---

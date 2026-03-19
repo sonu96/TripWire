@@ -30,6 +30,15 @@ This spec does NOT define:
 - What infrastructure delivers webhooks
 - How identity is resolved
 
+### Product Context
+
+TripWire operates as a dual-product platform:
+
+- **Pulse** (generic onchain triggers) -- fires `trigger.matched` / `trigger.confirmed` / `trigger.finalized` event types. Pulse events follow the same TWSS-1 execution semantics and three-layer gating model defined in this spec.
+- **Keeper** (x402 payment webhooks) -- fires `payment.pre_confirmed` / `payment.confirmed` / `payment.finalized` event types. Keeper supports sessions for pre-authorized MCP tool budgets.
+
+Both products produce skill outputs that conform to the TWSS-1 Skill Output Contract (Section 7). The `execution` block, safety rule, and determinism guarantees apply identically to Pulse and Keeper events.
+
 ---
 
 ## 2. Execution Semantics

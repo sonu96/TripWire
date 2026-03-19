@@ -19,6 +19,7 @@ Base URL: https://<host>:3402/api/v1
 | `/api/v1/deliveries` | Delivery tracking |
 | `/api/v1/ingest` | Goldsky and facilitator ingestion |
 | `/api/v1/stats` | Processing statistics and agent metrics |
+| `/api/v1/auth/session` | Keeper session management (open, query, close) |
 | `/auth` | Nonce issuance (root-level, no `/api/v1`) |
 | `/.well-known` | x402 manifest + TWSS-1 skill spec (root-level) |
 | `/health`, `/ready`, `/metrics` | Operational (root-level) |
@@ -666,6 +667,107 @@ Receive a pre-settlement ERC-3009 authorization from the x402 facilitator. This 
 
 ## 9. Auth API
 
+### Session Endpoints (Keeper Only)
+
+Session endpoints provide a pre-authorized spending limit for MCP tool calls, eliminating per-call x402 payment negotiation. Sessions are Keeper-only and require `SESSION_ENABLED=true`.
+
+All session endpoints require SIWE authentication and are mounted at `/api/v1/auth/session` (under the `/api/v1` prefix).
+
+#### POST /api/v1/auth/session
+
+Open a new Keeper session with a server-side spending limit.
+
+**Auth**: SIWE (wallet authentication)
+
+**Rate limit**: 30/min
+
+**Request body**:
+
+```json
+{
+  "budget": 10000000,
+  "ttl_seconds": 900,
+  "chain_id": 8453
+}
+```
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `budget` | int or null | No | Server default (10 USDC) | Budget in smallest USDC units (6 decimals). Clamped to server max (100 USDC). |
+| `ttl_seconds` | int or null | No | Server default (900s) | Session lifetime in seconds. Clamped to server max (1800s). |
+| `chain_id` | int or null | No | 8453 | Chain ID context for identity resolution. |
+
+**Response** (200):
+
+```json
+{
+  "session_id": "aB3dEf7GhIjK9LmNoPqRsTuVw",
+  "wallet_address": "0xYourWalletAddress",
+  "budget_total": 10000000,
+  "budget_remaining": 10000000,
+  "expires_at": "2026-03-18T12:15:00+00:00",
+  "ttl_seconds": 900,
+  "chain_id": 8453,
+  "status": "active"
+}
+```
+
+**Error**: 501 if `SESSION_ENABLED=false` or session system not initialized.
+
+#### GET /api/v1/auth/session/{session_id}
+
+Retrieve the current state of a session. Only the wallet that created the session can query it.
+
+**Auth**: SIWE (wallet authentication)
+
+**Rate limit**: 30/min
+
+**Response** (200):
+
+```json
+{
+  "session_id": "aB3dEf7GhIjK9LmNoPqRsTuVw",
+  "wallet_address": "0xYourWalletAddress",
+  "budget_total": 10000000,
+  "budget_remaining": 7000000,
+  "expires_at": "2026-03-18T12:15:00+00:00",
+  "ttl_seconds": 900,
+  "chain_id": 8453,
+  "status": "active"
+}
+```
+
+The `status` field is `"active"` or `"expired"` depending on whether `expires_at` has passed.
+
+**Errors**: 403 if not the session owner. 404 if session not found.
+
+#### DELETE /api/v1/auth/session/{session_id}
+
+Close a session and return its final state. Only the wallet that created the session can close it.
+
+**Auth**: SIWE (wallet authentication)
+
+**Rate limit**: 30/min
+
+**Response** (200):
+
+```json
+{
+  "session_id": "aB3dEf7GhIjK9LmNoPqRsTuVw",
+  "wallet_address": "0xYourWalletAddress",
+  "budget_total": 10000000,
+  "budget_remaining": 7000000,
+  "expires_at": "2026-03-18T12:15:00+00:00",
+  "ttl_seconds": 900,
+  "chain_id": 8453,
+  "status": "closed"
+}
+```
+
+**Errors**: 403 if not the session owner. 404 if session not found or already closed.
+
+---
+
 ### GET /auth/nonce
 
 Generate a cryptographically random nonce for SIWE authentication. The nonce is stored in Redis with a 5-minute TTL and can only be used once.
@@ -832,6 +934,8 @@ x402 V2 Bazaar discovery endpoint. Returns the same service discovery informatio
 > Note: This endpoint is mounted at the root, not under `/api/v1`.
 
 **Response** (200): Same structure as `GET /.well-known/x402-manifest.json` (see above).
+
+**Product mode filtering**: When `PRODUCT_MODE` is set to `pulse` or `keeper` (instead of the default `both`), the discovery endpoints filter their responses to only advertise capabilities relevant to the active product. For example, a `pulse`-only deployment omits Keeper payment-specific services and vice versa.
 
 ### GET /.well-known/tripwire-skill-spec.json
 

@@ -49,7 +49,10 @@ The **facilitator fast path** (`payment.pre_confirmed`) bypasses Goldsky entirel
 | `payment.pending` | Transfer detected but not yet confirmed |
 | `payment.failed` | Transfer processing failed |
 | `payment.reorged` | Transfer was reorganized out of the canonical chain |
-| `wire.triggered` | Custom event type from the dynamic trigger registry |
+| `wire.triggered` | Custom event type from the dynamic trigger registry (legacy) |
+| `trigger.matched` | Pulse: dynamic trigger matched an onchain event (initial detection) |
+| `trigger.confirmed` | Pulse: trigger event confirmed onchain (block depth met) |
+| `trigger.finalized` | Pulse: trigger event finalized (safe to execute) |
 
 ---
 
@@ -186,6 +189,9 @@ All webhook payloads follow a consistent envelope structure.
 | `payment.finalized` | `finalized` | `true` | `onchain` |
 | `payment.reorged` | `reorged` | `false` | `onchain` |
 | `payment.failed` | `reorged` | `false` | `onchain` |
+| `trigger.matched` | `confirmed` | `false` | `onchain` |
+| `trigger.confirmed` | `confirmed` | `false` | `onchain` |
+| `trigger.finalized` | `finalized` | `true` | `onchain` |
 
 ### Transfer Data (`data.transfer`)
 
@@ -379,9 +385,13 @@ Present when the sender has an ERC-8004 onchain agent identity. `null` if no ide
 }
 ```
 
-### Dynamic Trigger Payload (`wire.triggered`)
+### Dynamic Trigger Payload (`trigger.matched` / `wire.triggered`)
 
-Dynamic trigger events use a slightly different payload structure. The `data` field contains the ABI-decoded event fields directly, and includes a `trigger_id`.
+Dynamic trigger events (Pulse product) use a different payload structure from Keeper payment events. The `data.event` field contains the ABI-decoded event fields directly, and the payload includes a `trigger_id`.
+
+**Generic dispatch**: Pulse events are dispatched via `build_generic_payload()` in `tripwire/webhook/payload.py`. This builder uses a `data.event` field (containing the decoded event dict) instead of the `data.transfer` field used by Keeper payment payloads. The `data.event` field is a flat dict of ABI-decoded field names and values, plus metadata fields prefixed with `_` (e.g., `_chain_id`, `_tx_hash`, `_block_number`, `_log_index`).
+
+**Event type lifecycle**: Pulse events progress through `trigger.matched` -> `trigger.confirmed` -> `trigger.finalized`, mirroring the Keeper `payment.*` lifecycle. The `execution` block tracks the same states (`confirmed` -> `finalized`). Unknown event type strings fall back to `trigger.matched` during dispatch.
 
 When `UNIFIED_PROCESSOR=true`, dynamic trigger payloads gain a nested `execution`
 block (`execution.state`, `execution.safe_to_execute`, `execution.trust_source`,

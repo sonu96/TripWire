@@ -19,7 +19,8 @@ This document describes TripWire's authentication, authorization, and secret man
 9. [Row Level Security](#9-row-level-security)
 10. [x402 Payment Security](#10-x402-payment-security)
 11. [Webhook Delivery Security](#11-webhook-delivery-security)
-12. [Dev Mode](#12-dev-mode)
+12. [Session Security (Keeper Only)](#12-session-security-keeper-only)
+13. [Dev Mode](#13-dev-mode)
 
 ---
 
@@ -462,7 +463,51 @@ The direct httpx POST path bypasses Convoy entirely for low-latency scenarios. I
 
 ---
 
-## 12. Dev Mode
+## 12. Session Security (Keeper Only)
+
+The session system provides pre-authorized spending limits for MCP tool calls, replacing per-call x402 payment negotiation. It is feature-flagged via `SESSION_ENABLED` and only available in Keeper mode.
+
+### 12.1 Token Generation
+
+Session IDs are generated using `secrets.token_urlsafe(24)`, producing 192 bits (24 bytes) of cryptographic entropy. This is sufficient to prevent brute-force guessing of active session IDs.
+
+### 12.2 Ownership Enforcement
+
+All session endpoints (`GET`, `DELETE`) enforce ownership by comparing the authenticated wallet address (from SIWE) against the session's `wallet_address` field (case-insensitive). A caller cannot query or close another wallet's session. The `POST` endpoint implicitly binds the session to the authenticated wallet.
+
+### 12.3 Atomic Budget Decrement (Lua Script)
+
+Budget decrements use a server-side Lua script executed atomically in Redis. The script performs three checks in a single atomic operation:
+
+1. **Existence check** -- returns `-1` if the session key does not exist.
+2. **Expiry check** -- compares `expires_at` against the current time; returns `-2` if expired.
+3. **Budget check** -- compares `budget_remaining` against the requested cost; returns `-3` if insufficient.
+4. **Decrement** -- if all checks pass, decrements `budget_remaining` and returns the new value.
+
+This prevents TOCTOU race conditions where concurrent MCP tool calls could overdraw the budget.
+
+### 12.4 Redis TTL Safety Net
+
+Each session hash has a Redis-level TTL set to `ttl_seconds + 60` (one minute beyond the session's logical expiry). This ensures that abandoned sessions are automatically cleaned up by Redis even if the application does not explicitly close them. The Lua script also checks the application-level `expires_at` field, providing defense-in-depth against clock skew between the application and Redis TTL.
+
+### 12.5 Budget Validation Limits
+
+Budget values requested by clients are clamped to server-configured maximums:
+
+| Parameter | Default | Maximum | Description |
+|---|---|---|---|
+| `budget` | 10,000,000 (10 USDC) | 100,000,000 (100 USDC) | Spending limit in smallest USDC units |
+| `ttl_seconds` | 900 (15 min) | 1,800 (30 min) | Session lifetime |
+
+Clients cannot request budgets or TTLs exceeding these server-side limits regardless of the values they pass in the request body.
+
+### 12.6 Feature Flag
+
+Sessions are gated behind `SESSION_ENABLED=false` (default). When disabled, all session endpoints return HTTP 501. The session manager is not initialized in app state, providing an additional safety layer. This feature is Keeper-only; Pulse deployments (`PRODUCT_MODE=pulse`) do not initialize the session system.
+
+---
+
+## 13. Dev Mode
 
 `dev_server.py` provides a development-only auth bypass. It:
 
@@ -478,7 +523,7 @@ Additionally, both the Goldsky and facilitator webhook authentication dependenci
 
 ---
 
-## 13. x402 V1 to V2 Migration
+## 14. x402 V1 to V2 Migration
 
 x402 V2 introduces updated header conventions and authentication primitives. TripWire is migrating to support both V1 and V2 during the transition period.
 

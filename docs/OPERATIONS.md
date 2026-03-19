@@ -68,6 +68,22 @@ All configuration is loaded from environment variables (or a `.env` file) via py
 | `IDENTITY_CACHE_TTL` | int | `300` | No | Seconds to cache identity lookups. |
 | `FACILITATOR_WEBHOOK_SECRET` | SecretStr | `""` | No | Validates x402 facilitator callbacks. |
 
+### Product Mode
+
+| Variable | Type | Default | Required in prod | Description |
+|---|---|---|---|---|
+| `PRODUCT_MODE` | str | `both` | No | `pulse` (generic triggers), `keeper` (x402 payments), or `both`. Controls which event handlers and features are active. |
+
+### Session System (Keeper Only)
+
+| Variable | Type | Default | Required in prod | Description |
+|---|---|---|---|---|
+| `SESSION_ENABLED` | bool | `false` | No | Enable the Keeper session system. When true, `POST/GET/DELETE /api/v1/auth/session` endpoints become available. Requires Redis. |
+| `SESSION_DEFAULT_TTL_SECONDS` | int | `900` | No | Default session lifetime (15 minutes). |
+| `SESSION_MAX_TTL_SECONDS` | int | `1800` | No | Maximum session lifetime (30 minutes). |
+| `SESSION_DEFAULT_BUDGET_USDC` | int | `10000000` | No | Default budget in smallest USDC units (10 USDC). |
+| `SESSION_MAX_BUDGET_USDC` | int | `100000000` | No | Maximum budget (100 USDC). |
+
 ### Unified Processor (Phase C2)
 
 | Variable | Type | Default | Required in prod | Description |
@@ -369,6 +385,11 @@ All migrations live in `tripwire/db/migrations/` and are numbered sequentially. 
 | `019_nonce_archival.sql` | Creates `nonces_archive` table and `archive_old_nonces` DB function for nonce cleanup. |
 | `020_unified_event_lifecycle.sql` | Adds `source` column to `nonces` (facilitator vs goldsky) and `record_nonce_or_correlate` function to correlate duplicate nonces instead of silently dropping them. Fixes facilitator-then-Goldsky race condition. |
 | `021_dlq_retry_count.sql` | Adds `dlq_retry_count` column to `webhook_deliveries` so DLQ retry counts survive restarts. |
+| `022_audit_latency.sql` | Adds `execution_latency_ms` column to `audit_log` for MCP tool execution latency tracking. |
+| `023_agent_metrics_view.sql` | Creates `agent_metrics` materialized view for per-agent metrics. |
+| `024_trigger_payment_gating.sql` | Adds `require_payment`, `payment_token`, `min_payment_amount` to triggers for per-trigger payment gating. |
+| `025_skill_spec_alignment.sql` | Adds `version`, `status`/lifecycle, `required_agent_class` to triggers and templates. |
+| `026_event_neutral_schema.sql` | Makes events table event-neutral for Pulse/Keeper split: adds `event_type`, `decoded_fields`, `source`, `trigger_id`, `product_source` columns. |
 
 ### How to Run
 
@@ -491,10 +512,11 @@ Deployed via docker-compose. A direct httpx fast path for low-latency delivery i
 
 ### Redis
 
-Used for three purposes:
+Used for four purposes:
 1. SIWE nonce storage (always required when auth is used)
 2. Rate limiting via SlowAPI
 3. Event bus streams (only when `EVENT_BUS_ENABLED=true`)
+4. Session storage (only when `SESSION_ENABLED=true`) -- each session is a Redis hash at `session:{session_id}` with fields for wallet address, budget, TTL, identity data. Budget decrements use an atomic Lua script (`EVALSHA`). Sessions have a Redis-level TTL of `ttl_seconds + 60` for automatic cleanup.
 
 Configured via `REDIS_URL` (default `redis://localhost:6379`). This is a separate Redis instance from Convoy's internal Redis (port 6380).
 

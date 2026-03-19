@@ -33,6 +33,10 @@ The dev server starts on port **3402** by default (`http://localhost:3402`). It 
 
 **Unified processor:** Set `UNIFIED_PROCESSOR=true` to route both ERC-3009 and dynamic triggers through the single-path `_process_unified()` pipeline. This gives dynamic triggers finality checking, full policy evaluation, and execution state metadata. Default is `false` (legacy split paths). See [TWSS-1 Skill Spec](SKILL-SPEC.md) for the execution semantics.
 
+**Dual-product mode:** Set `PRODUCT_MODE` to `pulse` (generic onchain triggers), `keeper` (x402 payment webhooks), or `both` (default). This controls which event handlers are active and which features are advertised in discovery endpoints. See the `is_pulse` and `is_keeper` properties on `Settings`.
+
+**Session system:** Set `SESSION_ENABLED=true` to enable the Keeper session system. Sessions provide a pre-authorized spending limit for MCP tool calls, eliminating per-call x402 payment negotiation. Sessions are Keeper-only. Related env vars: `SESSION_DEFAULT_TTL_SECONDS` (default 900), `SESSION_MAX_TTL_SECONDS` (default 1800), `SESSION_DEFAULT_BUDGET_USDC` (default 10000000), `SESSION_MAX_BUDGET_USDC` (default 100000000).
+
 Minimum `.env` for local dev (Supabase required):
 
 ```
@@ -61,7 +65,7 @@ tripwire/
   api/             FastAPI routes, auth middleware, rate limiting
   config/          Settings via pydantic-settings (.env loading)
   db/              Supabase client, repositories, SQL migrations
-    migrations/    Numbered SQL migration files (001..025)
+    migrations/    Numbered SQL migration files (001..026)
     repositories/  Data access: endpoints, events, nonces, triggers, webhooks
   identity/        ERC-8004 identity resolution
     resolver.py    ERC8004Resolver (prod, makes eth_call to onchain registry)
@@ -70,11 +74,19 @@ tripwire/
   ingestion/       Goldsky pipeline processing, finality tracking,
                    event_bus.py (Redis Streams), trigger_worker.py,
                    dlq_consumer.py (Redis Streams DLQ consumer)
+    handlers/      Product-specific event handlers (base protocol, payment, trigger)
+      base.py      EventHandler protocol — can_handle() / handle()
+      payment.py   Keeper (ERC-3009 payment) handler
+      trigger.py   Pulse (dynamic trigger) handler + unified processing loop + C3 payment gating
     pipeline.py    Goldsky Turbo pipeline config builder and CLI management
                    (deploy_pipeline, start_pipeline, stop_pipeline, get_pipeline_status)
   mcp/             MCP server, tool handlers, 3-tier auth (PUBLIC/SIWX/X402)
   notify/          Supabase Realtime notifier (notify-mode delivery)
   observability/   Tracing (OTel), metrics (Prometheus), audit logging, Sentry
+  session/         Keeper session system (Redis-backed, feature-flagged)
+    manager.py     SessionManager: create, get, validate_and_decrement, refund, close
+                   Atomic budget decrement via Lua script; SessionData dataclass;
+                   SessionError/SessionNotFound/SessionExpired/InsufficientBudget exceptions
   rpc.py           Goldsky Edge RPC client: eth_call, eth_blockNumber, lazy singleton
                    httpx.AsyncClient; used by finality poller and identity resolver
   types/           Shared Pydantic v2 models
@@ -310,6 +322,7 @@ There is no automated migration runner. Run them in order against your Supabase 
 | 023 | `023_agent_metrics_view.sql` | Create `agent_metrics` materialized view for per-agent metrics; powers `GET /stats/agent-metrics` endpoint |
 | 024 | `024_trigger_payment_gating.sql` | Add `require_payment`, `payment_token`, `min_payment_amount` columns to triggers for per-trigger payment gating (C3) |
 | 025 | `025_skill_spec_alignment.sql` | Add `version`, `status`/lifecycle, `required_agent_class` columns to triggers and `version` to trigger_templates |
+| 026 | `026_event_neutral_schema.sql` | Make events table event-neutral for Pulse/Keeper product split: adds `event_type`, `decoded_fields`, `source`, `trigger_id`, `product_source` columns |
 
 ---
 
@@ -516,6 +529,16 @@ If `price` is set (e.g., `"$0.10"`), the MCP server collects an x402 payment bef
 **Resolved in:** Migration 020 (`020_unified_event_lifecycle.sql`)
 
 Previously, concurrent facilitator and Goldsky events could race on nonce insertion, causing one to silently drop. Migration 020 introduces a `record_nonce_or_correlate` PostgreSQL function that uses `SELECT FOR UPDATE` to atomically claim or correlate nonces, eliminating the TOCTOU window. Facilitator events now pre-claim nonces with `source = 'facilitator'`; when Goldsky delivers the same nonce, it correlates and promotes the event to `payment.confirmed` rather than rejecting as a duplicate.
+
+### Note: Processor Split Into Product-Specific Handlers
+
+The monolithic `EventProcessor` has been refactored. Product-specific event handling now lives in `tripwire/ingestion/handlers/`:
+
+- `base.py` defines the `EventHandler` protocol (`can_handle()` / `handle()`).
+- `payment.py` handles Keeper (ERC-3009 payment) events.
+- `trigger.py` handles Pulse (dynamic trigger) events, including the unified processing loop (`_process_unified`) and C3 payment gating.
+
+The `EventProcessor` iterates over registered handlers and delegates to the first one whose `can_handle()` returns True. Contributors adding new event types should implement the `EventHandler` protocol rather than modifying the processor directly.
 
 ### Note: Redis Streams DLQ Is Now Consumed
 

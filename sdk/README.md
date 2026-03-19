@@ -231,6 +231,61 @@ await client.get_nonce() -> str
 
 Fetch a fresh one-time nonce from the server. Called automatically before each authenticated request; you rarely need to call this directly.
 
+### Sessions (Keeper)
+
+#### `open_session`
+
+```python
+await client.open_session(
+    budget: int | None = None,
+    ttl_seconds: int | None = None,
+    chain_id: int = 8453,
+) -> Session
+```
+
+Open a pre-funded Keeper session. After opening, all subsequent API and MCP calls automatically include the `X-TripWire-Session` header, replacing per-call x402 payments. Budget is in smallest USDC units (6 decimals). Both `budget` and `ttl_seconds` are clamped to server-configured maximums.
+
+#### `get_session`
+
+```python
+await client.get_session(session_id: str | None = None) -> Session
+```
+
+Get the current state of a session. If `session_id` is not provided, uses the currently active session. Raises `SessionError` if no session is active.
+
+#### `close_session`
+
+```python
+await client.close_session(session_id: str | None = None) -> Session
+```
+
+Close a session early and return its final budget state. If `session_id` is not provided, closes the currently active session. Clears the internal session token so subsequent calls revert to per-call auth.
+
+#### Session Usage Example
+
+```python
+from tripwire_sdk import TripwireClient
+
+async with TripwireClient(private_key="0x...") as client:
+    # Open a session with 5 USDC budget, 10-minute TTL
+    session = await client.open_session(budget=5_000_000, ttl_seconds=600)
+    print(f"Session {session.session_id}: {session.budget_remaining} remaining")
+
+    # Subsequent calls automatically use the session token
+    endpoints = await client.list_endpoints()
+    events = await client.list_events(limit=10)
+
+    # Check remaining budget
+    status = await client.get_session()
+    print(f"Budget remaining: {status.budget_remaining}")
+
+    # Close when done (returns unspent budget info)
+    final = await client.close_session()
+    print(f"Closed. Unspent: {final.budget_remaining}")
+```
+
+---
+
 ## Types
 
 All models inherit from `TripWireBaseModel` (a Pydantic `BaseModel` with `extra="ignore"`, `frozen=True`, and `str_strip_whitespace=True`).
@@ -349,6 +404,22 @@ The full payload delivered to your webhook endpoint.
 | `cursor` | `str \| None` | Cursor for the next page (`None` if no more pages) |
 | `has_more` | `bool` | Whether more results are available |
 
+### `Session`
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | `str` | Unique session identifier |
+| `wallet_address` | `str` | Wallet that owns the session |
+| `budget_total` | `int` | Total budget in smallest USDC units |
+| `budget_remaining` | `int` | Remaining budget |
+| `budget_currency` | `str` | Currency identifier (default `"USDC"`) |
+| `expires_at` | `str` | ISO-8601 expiration timestamp |
+| `ttl_seconds` | `int` | Session lifetime in seconds |
+| `chain_id` | `int` | Chain ID context (default 8453) |
+| `status` | `str` | `"active"`, `"expired"`, or `"closed"` |
+| `reputation_score` | `float` | Cached reputation score from identity resolution |
+| `agent_class` | `str` | Cached agent class from identity resolution |
+
 ## Errors
 
 All SDK exceptions inherit from `TripWireError`, which carries `status_code` and `detail` attributes.
@@ -360,6 +431,9 @@ TripWireError                  # Base exception (any HTTP error)
   TripWireRateLimitError       # 429 -- rate limit exceeded (has retry_after: float | None)
   TripWireServerError          # 5xx -- server-side error
   TripWireValidationError      # Response parsing failure (status_code=0)
+  SessionError                 # Session operation failed (has session_id: str | None)
+    SessionExpiredError        # Session has expired
+    BudgetExhaustedError       # Session budget is exhausted
 ```
 
 Additionally, `WebhookVerificationError` (not part of the `TripWireError` hierarchy) is raised by the webhook verification functions. It has a `reason` attribute with values like `"missing_signature_header"`, `"timestamp_too_old"`, or `"signature_mismatch"`.

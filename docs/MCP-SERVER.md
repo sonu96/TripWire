@@ -13,7 +13,7 @@ POST /mcp
 Content-Type: application/json
 ```
 
-The server exposes 8 tools for trigger management, template browsing, and event querying. Two built-in methods (`initialize` and `tools/list`) require no authentication. Tool invocations go through a 3-tier authentication system that combines wallet signatures (SIWE) and per-call micropayments (x402).
+The server exposes 8 tools for trigger management, template browsing, and event querying. Two built-in methods (`initialize` and `tools/list`) require no authentication. Tool invocations go through a 4-tier authentication system that combines wallet signatures (SIWE), pre-funded sessions, and per-call micropayments (x402).
 
 MCP is the **control plane**: agents use it to configure what events to watch and where to deliver them. **Goldsky Turbo is the data plane**: it indexes the target chains in real time and delivers matching event logs to TripWire's `/ingest` endpoint via webhook. When an agent registers triggers through MCP, no additional blockchain infrastructure is required — events flow automatically from Goldsky's indexing pipeline into TripWire's event processor, which evaluates them against registered triggers and dispatches webhooks.
 
@@ -33,7 +33,7 @@ MCP tools map to the [TWSS-1 Skill Spec](SKILL-SPEC.md) lifecycle: `register_mid
 
 ## Authentication Tiers
 
-Every tool is assigned one of three authentication tiers. The tier determines what headers the caller must include.
+Every tool is assigned one of four authentication tiers. The tier determines what headers the caller must include. The tiers are ordered by increasing trust and cost.
 
 ### PUBLIC
 
@@ -72,6 +72,38 @@ After SIWE authentication succeeds, the server resolves the caller's ERC-8004 id
 
 If a tool's `min_reputation` threshold is set above 0 and the caller's score is below it, the request is rejected with `-32001 REPUTATION_TOO_LOW`. X402-tier tools (`register_middleware`, `create_trigger`, `activate_template`) require `min_reputation >= 10.0`. SIWX-tier tools remain at `min_reputation=0`. Agents with a reputation score below 10 calling a paid tool will receive JSON-RPC error code `-32001` ("Reputation too low").
 
+### SESSION (Pre-Funded Session)
+
+Session-based authentication allows agents to make multiple paid tool calls without per-call x402 payment negotiation. The agent opens a session via `POST /auth/session` (SIWE-authenticated) which creates a server-side spending budget in Redis. Subsequent tool calls include the session token:
+
+| Header                | Description                                         |
+|-----------------------|-----------------------------------------------------|
+| `X-TripWire-Session`  | Session ID returned by `POST /auth/session`        |
+
+**How it works:**
+
+1. Agent authenticates via SIWE and calls `POST /auth/session` with an optional budget and TTL
+2. Server creates a Redis-backed session with a spending limit (clamped to server max)
+3. Agent includes `X-TripWire-Session: <session_id>` on subsequent `POST /mcp` calls
+4. Server atomically validates the session and decrements the budget via a Lua script
+5. If the tool call fails, the budget is refunded
+
+The session check runs BEFORE x402 payment verification in the `tools/call` handler. If an `X-TripWire-Session` header is present and `SESSION_ENABLED=true`, the request is routed to `_handle_session_tool_call()` and never reaches the x402 payment flow.
+
+**Session auth context:** The `MCPAuthContext` is populated with `auth_tier=SESSION`, the wallet address from the session, and the reputation score and agent class that were cached at session creation time.
+
+**Budget tracking:** Budget is stored in smallest USDC units (6 decimals). The atomic Lua decrement script checks existence, expiry, and sufficient budget in a single Redis round-trip, preventing race conditions on concurrent calls.
+
+**Session endpoints:**
+
+| Method | Path                     | Auth | Description                                    |
+|--------|--------------------------|------|------------------------------------------------|
+| POST   | `/auth/session`          | SIWE | Open session (budget, TTL, chain_id)           |
+| GET    | `/auth/session/{id}`     | SIWE | Get session status and remaining budget        |
+| DELETE | `/auth/session/{id}`     | SIWE | Close session, return final state              |
+
+Sessions require `SESSION_ENABLED=true` in the configuration. When disabled, session endpoints return 501.
+
 ### X402 (Per-Call Payment)
 
 Micropayment via the x402 V2 protocol. The caller must include the `PAYMENT-SIGNATURE` header:
@@ -82,20 +114,26 @@ Micropayment via the x402 V2 protocol. The caller must include the `PAYMENT-SIGN
 
 Payment is verified before tool execution but settled only after successful execution. If settlement fails, the tool result is withheld and the payment dedup key is cleaned up so the caller can retry. Replay protection uses a SHA-256 hash of the payment proof stored in Redis with a 24-hour TTL.
 
+**Session alternative:** Agents who prefer to avoid per-call payment negotiation can open a session (see SESSION tier above) and make multiple tool calls against a pre-funded budget.
+
 ### Pricing Table
 
-| Tool                | Auth Tier | Price   | Networks                              | Min Reputation |
-|---------------------|-----------|---------|---------------------------------------|----------------|
-| `register_middleware` | X402    | $0.003  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
-| `create_trigger`      | X402    | $0.003  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
-| `activate_template`   | X402    | $0.001  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
-| `list_triggers`       | SIWX    | free    | --                                    | 0              |
-| `delete_trigger`      | SIWX    | free    | --                                    | 0              |
-| `list_templates`      | SIWX    | free    | --                                    | 0              |
-| `get_trigger_status`  | SIWX    | free    | --                                    | 0              |
-| `search_events`       | SIWX    | free    | --                                    | 0              |
+| Tool                | Auth Tier | Price   | Product | Networks                              | Min Reputation |
+|---------------------|-----------|---------|---------|---------------------------------------|----------------|
+| `register_middleware` | X402    | $0.003  | keeper  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
+| `create_trigger`      | X402    | $0.003  | pulse   | eip155:8453, eip155:1, eip155:42161  | 10.0           |
+| `activate_template`   | X402    | $0.001  | pulse   | eip155:8453, eip155:1, eip155:42161  | 10.0           |
+| `list_triggers`       | SIWX    | free    | pulse   | --                                    | 0              |
+| `delete_trigger`      | SIWX    | free    | pulse   | --                                    | 0              |
+| `list_templates`      | SIWX    | free    | pulse   | --                                    | 0              |
+| `get_trigger_status`  | SIWX    | free    | pulse   | --                                    | 0              |
+| `search_events`       | SIWX    | free    | both    | --                                    | 0              |
 
 x402 payments are supported on multiple chains (Base, Ethereum, Arbitrum) via `x402_networks` configuration, and paid to the treasury address configured in `TRIPWIRE_TREASURY_ADDRESS`.
+
+**Product tags:** Each tool carries a `product` tag (`"pulse"`, `"keeper"`, or `"both"`) on its `ToolDef`. When `PRODUCT_MODE` is set to `"pulse"`, keeper-only tools are hidden from `tools/list`; when `"keeper"`, pulse-only tools are hidden. Tools tagged `"both"` are always visible.
+
+**Session alternative:** All X402-tier tools can also be called via an active session (`X-TripWire-Session` header), which deducts the tool's price from the session's pre-funded budget instead of requiring a per-call x402 payment. SIWX-tier tools (free) do not consume session budget.
 
 ---
 
@@ -563,26 +601,37 @@ Every `tools/call` request follows this pipeline:
 
 2. **Resolve tool** -- The tool name is looked up in the registry. Unknown tools return `-32601 Method not found`.
 
-3. **Authenticate & Route** -- The `tools/call` handler routes based on the tool's `AuthTier`:
+3. **Authenticate & Route** -- The `tools/call` handler routes based on headers and the tool's `AuthTier`. **Session is checked BEFORE x402**:
    - PUBLIC: no-op
    - SIWX: `build_auth_context()` verifies SIWE headers, recovers wallet address, consumes nonce
-   - X402: delegated to `_handle_x402_tool_call()` (see step 3a below)
+   - **SESSION**: if `X-TripWire-Session` header is present AND `SESSION_ENABLED=true`, the request is routed to `_handle_session_tool_call()` (see step 3b below). This intercepts the request BEFORE the X402 path.
+   - X402: if no session header, delegated to `_handle_x402_tool_call()` (see step 3a below)
 
    For SIWX and PUBLIC tools, `_handle_siwx_public_tool_call()` handles execution directly.
 
-   **3a. X402 payment lifecycle** -- For X402 tools, the `x402_tool_executor()` orchestrates the full payment lifecycle: verify → `before_execution` hooks (identity, reputation, rate limit) → tool execution → `after_execution` hooks (audit) → settlement. Settlement is handled by the x402 SDK's `x402ResourceServer.settle()`, with `TripWirePaymentHooks.on_settlement_success/failure` managing dedup cleanup and result withholding. The x402 SDK handles protocol-level verify/settle and `PAYMENT-REQUIRED`/`PAYMENT-RESPONSE` headers automatically.
+   **3a. X402 payment lifecycle** -- For X402 tools without a session, the `x402_tool_executor()` orchestrates the full payment lifecycle: verify → `before_execution` hooks (identity, reputation, rate limit) → tool execution → `after_execution` hooks (audit) → settlement. Settlement is handled by the x402 SDK's `x402ResourceServer.settle()`, with `TripWirePaymentHooks.on_settlement_success/failure` managing dedup cleanup and result withholding. The x402 SDK handles protocol-level verify/settle and `PAYMENT-REQUIRED`/`PAYMENT-RESPONSE` headers automatically.
+
+   **3b. SESSION lifecycle** -- For requests with `X-TripWire-Session`:
+   1. `_verify_session()` extracts the session ID from the header
+   2. `SessionManager.validate_and_decrement()` atomically checks session existence, expiry, and budget via a Lua script, then decrements
+   3. An `MCPAuthContext` is built with `auth_tier=SESSION`, wallet address, and cached reputation/agent_class from the session
+   4. Reputation check runs using the cached score from session creation
+   5. Rate limit check runs using the session's wallet address
+   6. Tool handler executes
+   7. On failure (reputation gate or execution error): `SessionManager.refund()` restores the budget
+   8. Audit log records `auth_tier=session`
 
 4. **Agent address check** -- Non-PUBLIC tools require a resolved `agent_address`. If missing, returns `-32000`.
 
-5. **Reputation check** -- If the tool has `min_reputation > 0`, the agent's reputation score is compared against the threshold. The score is sourced from the ERC-8004 `ReputationRegistry` contract on Base (chain ID 8453) via a raw JSON-RPC call; results are cached for 300 seconds to avoid per-request onchain lookups. Below threshold returns `-32001`. For X402 tools, this check is performed inside `TripWirePaymentHooks.before_execution`.
+5. **Reputation check** -- If the tool has `min_reputation > 0`, the agent's reputation score is compared against the threshold. The score is sourced from the ERC-8004 `ReputationRegistry` contract on Base (chain ID 8453) via a raw JSON-RPC call; results are cached for 300 seconds to avoid per-request onchain lookups. Below threshold returns `-32001`. For X402 tools, this check is performed inside `TripWirePaymentHooks.before_execution`. For SESSION tools, the cached reputation score from session creation is used.
 
-6. **Rate limit** -- Per-address rate limiting: 60 calls/minute per wallet address, enforced via Redis INCR with 60-second TTL. Exceeding the limit returns `-32003`. If Redis is unavailable, rate limiting fails open. For X402 tools, this check is performed inside `TripWirePaymentHooks.before_execution`.
+6. **Rate limit** -- Per-address rate limiting: 60 calls/minute per wallet address, enforced via Redis INCR with 60-second TTL. Exceeding the limit returns `-32003`. If Redis is unavailable, rate limiting fails open. For X402 tools, this check is performed inside `TripWirePaymentHooks.before_execution`. For SESSION tools, the check uses the session's wallet address.
 
 7. **Execute** -- The tool handler is called with `(params, auth_context, repos)`. Unhandled exceptions return `-32603 Internal error`.
 
-8. **Settlement (X402 only)** -- After successful tool execution, the x402 SDK settles the payment via `x402ResourceServer.settle()`. On success, `TripWirePaymentHooks.on_settlement_success` fires. If settlement fails, `TripWirePaymentHooks.on_settlement_failure` withholds the tool result and cleans up the dedup key so the caller can retry.
+8. **Settlement (X402 only) / Budget deduction (SESSION only)** -- For X402: the x402 SDK settles the payment via `x402ResourceServer.settle()`. On success, `TripWirePaymentHooks.on_settlement_success` fires. If settlement fails, `TripWirePaymentHooks.on_settlement_failure` withholds the tool result and cleans up the dedup key. For SESSION: budget was already decremented atomically in step 3b; on execution failure the budget is refunded.
 
-9. **Audit log** -- Every tool call is logged to the `audit_log` table. For SIWX/PUBLIC tools this is a fire-and-forget write. For X402 tools, audit logging is performed by `TripWirePaymentHooks.after_execution`. Records: action, actor address, auth tier, payment status, arguments, and success/failure.
+9. **Audit log** -- Every tool call is logged to the `audit_log` table. For SIWX/PUBLIC tools this is a fire-and-forget write. For X402 tools, audit logging is performed by `TripWirePaymentHooks.after_execution`. For SESSION tools, the audit log records `auth_tier=session` and the session_id. Records: action, actor address, auth tier, payment status, arguments, and success/failure.
 
 10. **Return** -- The result is wrapped in MCP `content` format: `{ "content": [{ "type": "text", "text": "<JSON>" }], "isError": bool }`.
 
@@ -606,7 +655,7 @@ Every `tools/call` request follows this pipeline:
 |----------|-------------------|------------------------------------------------------------|
 | `-32000` | Auth required     | Missing or invalid SIWE headers; no agent address resolved |
 | `-32001` | Reputation too low| Agent reputation below tool's `min_reputation` threshold   |
-| `-32002` | Payment required  | Missing, invalid, replayed, or failed x402 payment         |
+| `-32002` | Payment required  | Missing, invalid, replayed, or failed x402 payment; or session expired/insufficient budget |
 | `-32003` | Rate limited      | Exceeded 60 tool calls per minute for this address         |
 
 All errors are returned with HTTP status 200 (per JSON-RPC convention). The error object includes `code` and `message`; some include a `data` field with additional context.
@@ -651,3 +700,7 @@ Every `tools/call` invocation is logged to the `audit_log` table, regardless of 
 4. **Reputation gating is active for paid tools only.** X402-tier tools (`register_middleware`, `create_trigger`, `activate_template`) require `min_reputation >= 10.0`. SIWX-tier tools remain at `min_reputation=0`. Changing thresholds still requires a code change.
 
 5. **Tool pricing is hardcoded.** Prices are set at module import time in `server.py` via `_register()` calls. Changing a tool's price requires redeploying the application. There is no admin API or database-driven pricing.
+
+6. **Session budget refund is best-effort.** When a tool call fails and the session budget is refunded via `SessionManager.refund()`, if the Redis `HINCRBY` call itself fails, the budget loss is logged but not retried. This could lead to budget leakage in the event of Redis instability during a tool failure.
+
+7. **Session reputation is cached at creation time.** The reputation score stored in the session is resolved once at `POST /auth/session` and not refreshed. If an agent's onchain reputation changes during a long session, the stale cached score is used for reputation gating.

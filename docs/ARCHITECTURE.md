@@ -15,7 +15,7 @@ contract: lifecycle states (provisional/confirmed/finalized/reorged),
 three-layer gating (can_pay/can_trust/is_safe), and the two-phase execution
 model (prepare/commit). Machine-readable at `/.well-known/tripwire-skill-spec.json`.
 
-Last updated: 2026-03-17
+Last updated: 2026-03-18
 
 ---
 
@@ -25,7 +25,7 @@ TripWire is organized into six architecture layers spanning two planes:
 
 ```
 ─── CONTROL PLANE (MCP + API) ────────────────────────────────────────────
-L5  MCP            AI agent interface (8 tools, 3-tier auth, x402 Bazaar)
+L5  MCP            AI agent interface (8 tools, 4-tier auth, x402 Bazaar)
 L4  Application    Developer's API (receives structured webhook, executes logic)
 L3  Delivery       Convoy (execute mode) + Supabase Realtime (notify mode)
 L2  Middleware      TripWire FastAPI (decode, dedup, finality, identity, policy)
@@ -64,8 +64,95 @@ serve different architectural roles and use different authentication.
 | Metrics              | Prometheus (prometheus_client)                     |
 | Tracing              | OpenTelemetry (optional)                           |
 | Error tracking       | Sentry (optional)                                  |
-| Auth                 | SIWE wallet signatures (no API keys)               |
+| Auth                 | SIWE wallet signatures + session tokens (no API keys) |
 | Payment gating       | x402 protocol (ERC-3009 micropayments)             |
+
+### 1.1 Dual-Product Architecture: Pulse and Keeper
+
+TripWire operates as a dual-product platform controlled by a single
+`PRODUCT_MODE` setting (`tripwire/config/settings.py`). The two products
+share the ingestion pipeline, delivery layer, and identity system, but
+differ in what events they care about and how they process them.
+
+| Product | Purpose | Event Types | Processing |
+|---------|---------|-------------|------------|
+| **Pulse** | Generic onchain event triggers | Any EVM log (Transfer, Swap, Liquidation, etc.) | Dynamic triggers with ABI decode + JMESPath filters |
+| **Keeper** | Managed x402 payment infrastructure | ERC-3009 TransferWithAuthorization | Payment-specific decode, nonce dedup, facilitator correlation |
+
+**ProductMode enum** (`tripwire/types/models.py`):
+
+```
+ProductMode.PULSE   — only Pulse handlers active
+ProductMode.KEEPER  — only Keeper handlers active
+ProductMode.BOTH    — both active (default)
+```
+
+The `settings.is_pulse` and `settings.is_keeper` convenience properties
+determine which handlers are registered with the `EventProcessor` at
+startup. MCP tools carry a `product` tag (`"pulse"`, `"keeper"`, or
+`"both"`) that controls visibility based on the active product mode.
+
+**Event-neutral model** (`tripwire/types/models.py`):
+
+All events flow through a shared `OnchainEvent` base model that is
+product-neutral. Product-specific subclasses extend it:
+
+```
+OnchainEvent (base)
+  ├── event_id, event_type, chain_id, tx_hash, block_number, block_hash,
+  │   log_index, contract_address, topic0, decoded_fields, timestamp,
+  │   execution (ExecutionBlock), identity, source
+  │
+  ├── PaymentEvent (Keeper)
+  │     └── payment: PaymentData (amount, token, from/to, nonce, authorizer)
+  │
+  └── TriggerEvent (Pulse)
+        └── trigger_id, trigger_name, filter_matched
+```
+
+The database schema (migration 026) adds event-neutral columns
+(`event_type`, `decoded_fields`, `source`, `trigger_id`, `product_source`)
+to the `events` table with safe defaults so existing Keeper payment rows
+are unaffected. The `product_source` column (`"keeper"` or `"pulse"`)
+enables operational routing queries.
+
+**Processor handler pattern**:
+
+The `EventProcessor` is event-type agnostic. It detects the event type
+from the raw log's topic0 signature and delegates to the first registered
+handler whose `can_handle()` returns True. Product-specific logic lives
+in `tripwire/ingestion/handlers/`:
+
+```
+EventProcessor.process_event(raw_log)
+  │
+  ├── _detect_event_type(raw_log)
+  │     Returns "erc3009_transfer" or ("dynamic", [triggers])
+  │
+  └── for handler in self._handlers:
+        if await handler.can_handle(detection, raw_log):
+            return await handler.handle(raw_log, processor, detection)
+```
+
+Two concrete handlers implement the `EventHandler` protocol
+(`tripwire/ingestion/handlers/base.py`):
+
+| Handler | Product | `can_handle()` | Processing |
+|---------|---------|-----------------|------------|
+| `PaymentHandler` | Keeper | `event_type == "erc3009_transfer"` | ERC3009Decoder → nonce dedup (correlation-aware) → finality + identity (parallel) → `_dispatch_for_transfer` |
+| `TriggerHandler` | Pulse | `isinstance(event_type, tuple)` | AbiGenericDecoder per trigger → filter → payment gate (C3) → dedup → identity → reputation gate → endpoint fetch → dispatch |
+
+The `EventHandler` protocol defines two methods:
+
+```python
+class EventHandler(Protocol):
+    async def can_handle(self, event_type, raw_log) -> bool: ...
+    async def handle(self, raw_log, processor, event_type) -> dict | None: ...
+```
+
+Handlers receive a `processor` reference to access shared utilities
+(endpoint cache, nonce repo, webhook provider, identity resolver, event
+recording, delivery recording).
 
 ---
 
@@ -97,7 +184,7 @@ serve different architectural roles and use different authentication.
                                  |
                         +--------+--------+
                         |   MCP Server    |  POST /mcp (JSON-RPC 2.0)
-                        |  8 tools        |  3-tier auth: PUBLIC / SIWX / X402
+                        |  8 tools        |  4-tier auth: PUBLIC / SIWX / SESSION / X402
                         +--------+--------+
                                  |
    +-----------------------------+-----------------------------+
@@ -298,7 +385,13 @@ and closed during application shutdown (`close_rpc_client()`).
 
 ## 4. Processing Pipeline
 
-### 4.1 Event Type Router
+### 4.1 Event Type Detection and Handler Routing
+
+Event processing follows a two-step dispatch: detection then handler
+delegation. The `EventProcessor` is a thin orchestrator -- all
+product-specific logic lives in handlers.
+
+**Step 1: Detection** (`_detect_event_type()`):
 
 ```python
 # tripwire/ingestion/processor.py :: _detect_event_type()
@@ -317,7 +410,25 @@ topic0 = topics[0].lower()
 3. Otherwise: return "unknown" (event is skipped)
 ```
 
-### 4.2 ERC-3009 Pipeline
+**Step 2: Handler delegation**:
+
+The processor iterates `self._handlers` (a list of `EventHandler`
+protocol implementors) and delegates to the first handler whose
+`can_handle()` returns True:
+
+```python
+for handler in self._handlers:
+    if await handler.can_handle(detection, raw_log):
+        return await handler.handle(raw_log, processor, detection)
+```
+
+Default handler chain: `[PaymentHandler(), TriggerHandler()]`.
+`PaymentHandler` matches `"erc3009_transfer"` detections (Keeper product).
+`TriggerHandler` matches `("dynamic", triggers)` tuples (Pulse product).
+Handlers receive the `processor` reference to access shared utilities
+(repos, webhook provider, identity resolver, caches).
+
+### 4.2 ERC-3009 Pipeline (PaymentHandler)
 
 ```
   Raw log
@@ -378,7 +489,7 @@ topic0 = topics[0].lower()
 Steps 3 and 4 (finality and identity) run in parallel via `asyncio.gather`
 since they have zero data dependencies on each other.
 
-### 4.3 Dynamic Trigger Pipeline
+### 4.3 Dynamic Trigger Pipeline (TriggerHandler)
 
 For each matched trigger:
 
@@ -1255,7 +1366,7 @@ Dropped columns: `api_key_hash` (migration 010), `webhook_secret`
 | type                | TEXT        | e.g. 'payment.confirmed' (migration 002)|
 | data                | JSONB       | Full event payload (migration 002)     |
 | chain_id            | INTEGER     |                                        |
-| tx_hash             | TEXT        |                                        |
+| tx_hash             | TEXT        | Nullable (migration 026)               |
 | block_number        | BIGINT      | Nullable (migration 002)               |
 | block_hash          | TEXT        | Nullable                               |
 | log_index           | INTEGER     | Nullable                               |
@@ -1269,12 +1380,19 @@ Dropped columns: `api_key_hash` (migration 010), `webhook_secret`
 | finality_depth      | INTEGER     | Current confirmation count             |
 | identity_data       | JSONB       | Resolved AgentIdentity                 |
 | endpoint_id         | TEXT        | Legacy single-endpoint FK              |
+| event_type          | TEXT        | Semantic type, e.g. 'erc3009.transfer' (migration 026, default 'erc3009.transfer') |
+| decoded_fields      | JSONB       | Generic decoded event data for Pulse triggers (migration 026, default '{}') |
+| source              | TEXT        | 'onchain', 'facilitator', 'manual' (migration 026, default 'onchain') |
+| trigger_id          | TEXT        | Nullable FK to triggers (Pulse events only, migration 026) |
+| product_source      | TEXT        | 'keeper' or 'pulse' (migration 026, default 'keeper') |
 | confirmed_at        | TIMESTAMPTZ |                                        |
 | created_at          | TIMESTAMPTZ |                                        |
 
 Key indexes: `(chain_id, tx_hash)`, `to_address`, `from_address`,
 `authorizer`, `(chain_id, nonce, authorizer)`, `status`,
-`(chain_id, block_number)`, `type`, `(endpoint_id, created_at DESC)`.
+`(chain_id, block_number)`, `type`, `(endpoint_id, created_at DESC)`,
+`event_type`, `(trigger_id) WHERE trigger_id IS NOT NULL`,
+`product_source`, `(event_type, created_at DESC)`.
 
 ### 10.4 event_endpoints (M2M join table, migration 014)
 
@@ -1412,10 +1530,16 @@ per the Model Context Protocol specification (version `2024-11-05`).
 ### 11.1 Authentication Tiers
 
 ```
-  PUBLIC   No auth required (initialize, tools/list)
-  SIWX     Wallet signature via SIWE (free tools)
-  X402     Per-call x402 micropayment (paid tools, hooks-based lifecycle via x402_tool_executor)
+  PUBLIC    No auth required (initialize, tools/list)
+  SIWX      Wallet signature via SIWE (free tools)
+  SESSION   Pre-funded session with budget (bypasses per-call x402)
+  X402      Per-call x402 micropayment (paid tools, hooks-based lifecycle via x402_tool_executor)
 ```
+
+The four tiers are ordered by increasing trust and cost. The `tools/call`
+handler checks for a session token BEFORE falling through to X402
+payment verification. This means an agent with an active session can call
+paid tools without per-call payment negotiation.
 
 Per-address rate limiting: 60 calls/minute via Redis counter. Fails open
 if Redis is unavailable.
@@ -1423,24 +1547,109 @@ if Redis is unavailable.
 Reputation gating: Tools with `min_reputation > 0` require the caller's
 ERC-8004 reputation score to meet the threshold.
 
+### 11.1a Session System (Keeper)
+
+Sessions provide a pre-authorized spending limit so agents can make
+multiple MCP tool calls without per-call x402 payment negotiation.
+Feature-flagged via `SESSION_ENABLED` (default: false). Sessions are
+currently free to create (gated only by SIWE auth); the budget is a
+server-side spending limit, not a prepayment.
+
+**Architecture:**
+
+```
+  Agent
+    |
+    +-- POST /auth/session (SIWE auth) ───> SessionManager.create()
+    |     Returns: session_id, budget, expires_at
+    |
+    +-- POST /mcp (X-TripWire-Session: <session_id>)
+    |     │
+    |     ├── _verify_session() ──> SessionManager.validate_and_decrement()
+    |     │     Atomic Lua script: check existence + expiry + budget → decrement
+    |     │     Returns MCPAuthContext with auth_tier=SESSION
+    |     │
+    |     ├── Reputation check (cached from session creation)
+    |     ├── Rate limit check
+    |     ├── Tool execution
+    |     └── On failure: SessionManager.refund() returns budget
+    |
+    +-- GET /auth/session/{id} (SIWE auth) ───> SessionManager.get()
+    |     Returns: current budget_remaining, status
+    |
+    +-- DELETE /auth/session/{id} (SIWE auth) ───> SessionManager.close()
+          Returns: final state, removes from Redis
+```
+
+**SessionManager** (`tripwire/session/manager.py`):
+
+All state lives in Redis. Each session is a Redis hash at
+`session:{session_id}` with fields: `wallet_address`, `budget_total`,
+`budget_remaining`, `expires_at`, `ttl_seconds`, `chain_id`,
+`reputation_score`, `agent_class`, `created_at`.
+
+**Atomic Lua decrement**: The critical `validate_and_decrement()` operation
+uses a pre-loaded Lua script that runs atomically inside Redis:
+
+```
+1. Check session existence (HGET) → -1 if not found
+2. Check expiry (expires_at vs now) → -2 if expired
+3. Check budget (budget_remaining vs cost) → -3 if insufficient
+4. Decrement budget_remaining → return new balance
+```
+
+This prevents race conditions when an agent makes concurrent tool calls.
+
+**Session data** (`SessionData` dataclass):
+
+| Field             | Type    | Description                              |
+|-------------------|---------|------------------------------------------|
+| session_id        | str     | URL-safe random token (24 bytes)         |
+| wallet_address    | str     | Verified wallet (from SIWE at creation)  |
+| budget_total      | int     | Total budget in smallest USDC units      |
+| budget_remaining  | int     | Current remaining budget                 |
+| expires_at        | float   | Unix timestamp of expiry                 |
+| ttl_seconds       | int     | Session lifetime                         |
+| chain_id          | int     | Chain ID context                         |
+| reputation_score  | float   | Cached from identity at creation         |
+| agent_class       | str     | Cached from identity at creation         |
+
+**Refund semantics**: If a tool call fails (reputation gate, execution
+error), the session budget is refunded via `HINCRBY`. This is a
+best-effort operation -- if the refund itself fails, the budget loss is
+logged but not retried.
+
+**Redis TTL**: Each session hash has a Redis-level `EXPIRE` set to
+`ttl_seconds + 60` (slightly beyond the session's logical expiry) to
+ensure automatic cleanup even if the agent never calls `DELETE`.
+
 ### 11.2 Tool Registry
 
-| Tool               | Auth Tier | Price   | Description                           |
-|--------------------|-----------|---------|---------------------------------------|
-| register_middleware| X402      | $0.003  | Create endpoint + triggers in one call|
-| create_trigger     | X402      | $0.003  | Create custom trigger for endpoint    |
-| list_triggers      | SIWX      | free    | List caller's active triggers         |
-| delete_trigger     | SIWX      | free    | Soft-delete a trigger                 |
-| list_templates     | SIWX      | free    | Browse Bazaar templates               |
-| activate_template  | X402      | $0.001  | Instantiate template for endpoint     |
-| get_trigger_status | SIWX      | free    | Check trigger health + event count    |
-| search_events      | SIWX      | free    | Query recent events                   |
+| Tool               | Auth Tier | Price   | Product | Description                           |
+|--------------------|-----------|---------|---------|---------------------------------------|
+| register_middleware| X402      | $0.003  | keeper  | Create endpoint + triggers in one call|
+| create_trigger     | X402      | $0.003  | pulse   | Create custom trigger for endpoint    |
+| list_triggers      | SIWX      | free    | pulse   | List caller's active triggers         |
+| delete_trigger     | SIWX      | free    | pulse   | Soft-delete a trigger                 |
+| list_templates     | SIWX      | free    | pulse   | Browse Bazaar templates               |
+| activate_template  | X402      | $0.001  | pulse   | Instantiate template for endpoint     |
+| get_trigger_status | SIWX      | free    | pulse   | Check trigger health + event count    |
+| search_events      | SIWX      | free    | both    | Query recent events                   |
+
+The `product` tag on each tool (`ToolDef.product`) controls visibility
+based on `PRODUCT_MODE`. Tools tagged `"pulse"` are hidden in Keeper-only
+mode, and `"keeper"` tools are hidden in Pulse-only mode. Tools tagged
+`"both"` are always visible. X402-tier tools can also be called via an
+active session (SESSION tier), bypassing per-call payment negotiation.
 
 ### 11.3 x402 Payment Flow
 
-For X402-tier tools, the `tools/call` handler delegates to
-`_handle_x402_tool_call()`, which invokes the `x402_tool_executor()`
-orchestrator. The payment lifecycle is managed through a hooks pattern:
+For X402-tier tools that are NOT authenticated via a session, the
+`tools/call` handler delegates to `_handle_x402_tool_call()`, which
+invokes the `x402_tool_executor()` orchestrator. (If an
+`X-TripWire-Session` header is present and `SESSION_ENABLED=true`, the
+request is routed to `_handle_session_tool_call()` instead -- see
+Section 11.1a.) The payment lifecycle is managed through a hooks pattern:
 
 1. **Verify** -- The x402 SDK (`x402ResourceServer`) verifies the
    `PAYMENT-SIGNATURE` header and checks replay protection via Redis
@@ -1639,6 +1848,7 @@ or `.env` file. See `tripwire/config/settings.py`.
 
 | Variable                      | Default                | Description                          |
 |-------------------------------|------------------------|--------------------------------------|
+| PRODUCT_MODE                  | both                   | Product mode: pulse, keeper, or both |
 | APP_ENV                       | production             | development / production             |
 | APP_PORT                      | 3402                   | HTTP listen port                     |
 | APP_BASE_URL                  | http://localhost:3402  | Public base URL                      |
@@ -1671,6 +1881,11 @@ or `.env` file. See `tripwire/config/settings.py`.
 | X402_NETWORKS                 | ["eip155:8453"]        | Payment networks (multi-chain list)  |
 | SIWE_DOMAIN                   | tripwire.dev           | SIWE domain for auth                 |
 | AUTH_TIMESTAMP_TOLERANCE_SECONDS| 300                  | SIWE timestamp tolerance             |
+| SESSION_ENABLED               | false                  | Enable Redis-backed session system   |
+| SESSION_DEFAULT_TTL_SECONDS   | 900                    | Default session lifetime (15 min)    |
+| SESSION_MAX_TTL_SECONDS       | 1800                   | Maximum session lifetime (30 min)    |
+| SESSION_DEFAULT_BUDGET_USDC   | 10000000               | Default budget: 10 USDC (6 decimals) |
+| SESSION_MAX_BUDGET_USDC       | 100000000              | Maximum budget: 100 USDC             |
 | OTEL_ENABLED                  | false                  | Enable OpenTelemetry tracing         |
 | SENTRY_DSN                    |                        | Sentry error tracking DSN            |
 | METRICS_BEARER_TOKEN          |                        | Protect /metrics endpoint            |
@@ -1727,7 +1942,10 @@ Sentry capture).
 | GET    | /api/v1/stats                     | SIWE      | Dashboard statistics         |
 | POST   | /auth/verify                 | None      | SIWE signature verification  |
 | GET    | /auth/nonce                  | None      | SIWE nonce generation        |
-| POST   | /mcp                              | 3-tier    | MCP JSON-RPC endpoint        |
+| POST   | /auth/session                     | SIWE      | Open a Keeper session (budget+TTL)  |
+| GET    | /auth/session/{id}                | SIWE      | Get session status + remaining budget|
+| DELETE | /auth/session/{id}                | SIWE      | Close session and return final state |
+| POST   | /mcp                              | 4-tier    | MCP JSON-RPC endpoint        |
 | GET    | /.well-known/x402-manifest.json   | None      | x402 Bazaar manifest (returns 410 Gone; use /discovery/resources) |
 | GET    | /health                           | None      | Basic health check           |
 | GET    | /health/detailed                  | None      | Deep health with components  |

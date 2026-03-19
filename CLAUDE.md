@@ -22,20 +22,48 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - L2 Middleware: TripWire FastAPI (verification, deduplication, identity, policy engine)
 - L3 Delivery: Convoy + direct POST (webhook delivery with retries, HMAC signing, DLQ)
 - L4 Application: Developer's API (executes business logic on verified webhook)
-- L5 MCP: Agent interface (MCP tools for trigger management, middleware registration)
+- L5 MCP: Agent interface (MCP tools for trigger management, middleware registration). Tools tagged by product mode (Pulse/Keeper) and filtered at `tools/list` time
+
+## Dual-Product Platform
+TripWire is a dual-product platform controlled by `PRODUCT_MODE` ("pulse", "keeper", or "both"; default "both"):
+- **Pulse** — Generic onchain event triggers for any EVM event (DeFi swaps, NFT mints, governance votes, etc.)
+- **Keeper** — x402 payment monitoring (ERC-3009 transferWithAuthorization webhooks)
+
+The `settings.is_pulse` / `settings.is_keeper` properties gate which handlers, MCP tools, and API features are active. MCP tools are tagged with `product` ("pulse", "keeper", or "both") and filtered at `tools/list` time. Discovery at `/discovery/resources` includes product metadata.
+
+## Keeper Sessions
+Budget-based execution sessions for Keeper mode, gated by `SESSION_ENABLED` (default false). An agent opens a session via `POST /auth/session` with a budget (USDC amount) and TTL. The `SessionManager` (`tripwire/session/manager.py`) stores session state in Redis with TTL enforcement. Each tool call atomically decrements the session budget using a Lua script (`atomic_decrement.lua`) — if the remaining budget is insufficient the call is rejected. MCP server checks the `X-TripWire-Session` header before falling back to X402/SIWX auth. SDK exposes `open_session()`, `get_session()`, `close_session()` convenience methods. Sessions are a `SESSION` auth tier, distinct from X402 and SIWX.
 
 ## Key Directories
-- `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking, event_bus.py (Redis Streams pub/sub), trigger_worker.py (TriggerIndex, TriggerWorker, WorkerPool)
+- `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking, event_bus.py (Redis Streams pub/sub), trigger_worker.py (TriggerIndex, TriggerWorker, WorkerPool). processor.py split from 1753→923 lines; product-specific logic delegated to handlers
+- `tripwire/ingestion/handlers/` — Product-specific event handlers: `EventHandler` protocol (base.py), `PaymentHandler` (payment.py, Keeper), `TriggerHandler` (trigger.py, Pulse). Processor delegates to handlers via `can_handle()` dispatch
 - `tripwire/api/` — FastAPI routes, endpoint registration, subscription management
+- `tripwire/api/routes/session.py` — Session management REST API (POST/GET/DELETE /auth/session)
 - `tripwire/auth/` — SIWE (EIP-4361) message construction, signature verification, timestamp validation (single source of truth)
 - `tripwire/webhook/` — Convoy integration, webhook dispatch
+- `tripwire/webhook/payload.py` — Payload builders: `build_generic_payload()` (Pulse) and `build_payment_payload()` (Keeper)
 - `tripwire/identity/` — ERC-8004 identity resolution (mock for MVP), reputation scoring
+- `tripwire/session/` — Session management package: `SessionManager` (manager.py) with Redis-backed session lifecycle, atomic Lua budget decrement, TTL enforcement
 - `tripwire/db/` — Supabase client, repositories, SQL migrations
-- `tripwire/types/` — Shared Pydantic models
+- `tripwire/types/` — Shared Pydantic models (includes `ProductMode` enum, `OnchainEvent`/`PaymentEvent`/`TriggerEvent` hierarchy)
 - `tripwire/config/` — Settings via pydantic-settings
 - `tripwire/mcp/` — MCP server, tool handlers, agent middleware registration
 - `sdk/` — tripwire-sdk Python package
 - `tests/` — Unit and integration tests
+
+## Key Models
+- **`OnchainEvent`** (`tripwire/types/models.py`): Base model for all onchain events — chain_id, block_number, tx_hash, log_index, timestamp. Subclassed by `PaymentEvent` (Keeper) and `TriggerEvent` (Pulse).
+- **`PaymentEvent`**: Extends `OnchainEvent` with ERC-3009 payment fields (from, to, value, nonce, authorizer).
+- **`TriggerEvent`**: Extends `OnchainEvent` with trigger-specific fields (trigger_id, topic0, decoded_data).
+- **`ProductMode`** enum: `"pulse"`, `"keeper"`, `"both"`. Controls which handlers and MCP tools are active.
+- **`SessionData`** (`tripwire/session/`): Pydantic model for session state — session_id, wallet, budget_remaining, ttl, created_at.
+- **`EventHandler`** protocol (`tripwire/ingestion/handlers/base.py`): `can_handle(event) -> bool` + `handle(event) -> Result`. `PaymentHandler` (Keeper) and `TriggerHandler` (Pulse) implement it. Processor delegates via `can_handle()` dispatch.
+- **`ExecutionBlock`** (`tripwire/types/models.py`): Nested execution metadata — `state` (ExecutionState), `safe_to_execute` (bool), `trust_source` (TrustSource), `finality` (FinalityData | None). Used as the `execution` field on `WebhookPayload`.
+- **`derive_execution_metadata()`** returns `ExecutionBlock` (not a tuple). Derives execution state from event type and finality data.
+- **`check_finality_generic()`** (`tripwire/ingestion/finality.py`): Finality check using raw values (chain_id, block_number, tx_hash) — no `ERC3009Transfer` required. `check_finality()` delegates to it.
+- **Trigger** has `required_agent_class` (str | None) and `version` (str, default "1.0.0"). Migration 025.
+- **TriggerTemplate** has `version` (str, default "1.0.0"). Migration 025.
+- **Finality field**: `required_confirmations` (not `required`) on `FinalityData`.
 
 ## Key Protocols
 - **x402**: HTTP 402 micropayment protocol using ERC-3009 transferWithAuthorization. V2 migration complete: `PAYMENT-SIGNATURE` is the only accepted header (`PAYMENT-REQUIRED` and `PAYMENT-RESPONSE` are handled by the x402 SDK automatically). The v1 manifest (`/.well-known/x402-manifest.json`) returns 410 Gone. `GET /discovery/resources` is the V2 Bazaar endpoint
@@ -49,14 +77,6 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - **C1 (Implemented)**: Decoder protocol + DecodedEvent envelope + ERC3009Decoder + AbiGenericDecoder in `tripwire/ingestion/decoders/`. AbiGenericDecoder performs best-effort payment field extraction (`_extract_payment_fields`) so C3 payment gating works for dynamic triggers too.
 - **C2 (Implemented)**: Unified processing loop — single code path for ERC-3009 and dynamic triggers via `_process_unified()`. Feature-flagged: `UNIFIED_PROCESSOR=true` (default false). Dynamic triggers gain finality (via `check_finality_generic()`), policy, execution state (nested `ExecutionBlock`), notify mode, tracing, metrics.
 - **C3 (Implemented)**: Per-trigger payment gating — `require_payment`, `payment_token`, `min_payment_amount` on Trigger model. `payment_amount/token/from/to` on DecodedEvent. Migration 024.
-
-## Key Models
-- **`ExecutionBlock`** (`tripwire/types/models.py`): Nested execution metadata — `state` (ExecutionState), `safe_to_execute` (bool), `trust_source` (TrustSource), `finality` (FinalityData | None). Used as the `execution` field on `WebhookPayload`.
-- **`derive_execution_metadata()`** returns `ExecutionBlock` (not a tuple). Derives execution state from event type and finality data.
-- **`check_finality_generic()`** (`tripwire/ingestion/finality.py`): Finality check using raw values (chain_id, block_number, tx_hash) — no `ERC3009Transfer` required. `check_finality()` delegates to it.
-- **Trigger** has `required_agent_class` (str | None) and `version` (str, default "1.0.0"). Migration 025.
-- **TriggerTemplate** has `version` (str, default "1.0.0"). Migration 025.
-- **Finality field**: `required_confirmations` (not `required`) on `FinalityData`.
 
 ## Webhook Delivery (Convoy + direct httpx fast path)
 - Dual-path architecture: direct httpx POST for low-latency fast path; Convoy for managed delivery with retries, HMAC signing, and DLQ
@@ -99,3 +119,5 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - No web3.py — use httpx for raw JSON-RPC + eth-abi for decoding
 - Multi-chain: x402 payment networks configurable via `x402_networks` list setting (CAIP-2 format, default: Base)
 - MCP tools follow the Model Context Protocol spec — mounted at /mcp; MCP payment auth uses `TripWirePaymentHooks` pattern (not manual verify/settle)
+- `PRODUCT_MODE` setting controls active product ("pulse", "keeper", or "both"; default "both"). Access via `settings.is_pulse` / `settings.is_keeper`
+- `SESSION_ENABLED` setting (bool, default false) gates Keeper session system. When true, `POST/GET/DELETE /auth/session` routes are active and MCP server checks `X-TripWire-Session` header before X402/SIWX
