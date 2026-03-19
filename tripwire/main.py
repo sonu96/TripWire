@@ -233,6 +233,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("finality_poller_skipped", enabled=False)
 
+    # Pre-confirmed TTL sweeper (Keeper-only — expires provisional events that never land onchain)
+    pre_confirmed_sweeper = None
+    if settings.is_keeper:
+        from tripwire.ingestion.ttl_sweeper import PreConfirmedSweeper
+
+        pre_confirmed_sweeper = PreConfirmedSweeper(
+            supabase=supabase,
+            webhook_dispatcher=None,  # Wire dispatcher for payment.failed webhooks if needed
+        )
+        await pre_confirmed_sweeper.start()
+        app.state.pre_confirmed_sweeper = pre_confirmed_sweeper
+        logger.info("pre_confirmed_sweeper_ready")
+    else:
+        logger.info("pre_confirmed_sweeper_skipped", reason="product_mode does not include keeper")
+
     # Session manager (Keeper-only — Redis-backed session lifecycle)
     if settings.is_keeper and settings.session_enabled:
         from tripwire.session.manager import SessionManager
@@ -285,6 +300,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Stop finality poller if running
     if finality_poller is not None:
         await finality_poller.stop()
+
+    # Stop pre-confirmed TTL sweeper if running
+    if pre_confirmed_sweeper is not None:
+        await pre_confirmed_sweeper.stop()
 
     # Stop nonce archiver if running
     if nonce_archiver is not None:

@@ -46,6 +46,10 @@ from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
 
+# Postgres advisory lock ID for leader election (must not collide with
+# other background tasks — see also ttl_sweeper._SWEEPER_LOCK_ID = 839202)
+_FINALITY_POLLER_LOCK_ID = 839201
+
 # Maps ChainId → settings attribute name for poll interval
 _CHAIN_INTERVAL_ATTR: dict[ChainId, str] = {
     ChainId.ARBITRUM: "finality_poll_interval_arbitrum",
@@ -147,7 +151,46 @@ class FinalityPoller:
     # ------------------------------------------------------------------
 
     async def _poll_chain(self, chain_id: ChainId) -> None:
-        """Fetch pending events for *chain_id* and process each one."""
+        """Fetch pending events for *chain_id* and process each one.
+
+        Acquires a Postgres advisory lock first so only one instance polls
+        when multiple TripWire replicas are running.
+        """
+        # --- Leader election via advisory lock ---
+        try:
+            lock_result = await asyncio.to_thread(
+                lambda: self._event_repo._sb.rpc(
+                    "try_acquire_leader_lock",
+                    {"lock_id": _FINALITY_POLLER_LOCK_ID},
+                ).execute()
+            )
+            if not lock_result.data:
+                logger.debug(
+                    "finality_poll_skipped",
+                    reason="another instance holds lock",
+                    chain=chain_id.name,
+                )
+                return
+        except Exception:
+            logger.debug("finality_lock_unavailable", chain=chain_id.name)
+            return
+
+        try:
+            await self._poll_chain_inner(chain_id)
+        finally:
+            # Always release the advisory lock
+            try:
+                await asyncio.to_thread(
+                    lambda: self._event_repo._sb.rpc(
+                        "release_leader_lock",
+                        {"lock_id": _FINALITY_POLLER_LOCK_ID},
+                    ).execute()
+                )
+            except Exception:
+                logger.debug("finality_lock_release_failed", chain=chain_id.name)
+
+    async def _poll_chain_inner(self, chain_id: ChainId) -> None:
+        """Core poll logic — called only after advisory lock is acquired."""
         # Query events table for status="pending" on this chain
         pending_events = await asyncio.to_thread(
             self._fetch_pending_events, chain_id

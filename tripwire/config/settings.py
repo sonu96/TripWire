@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     finality_poll_interval_base: int = 10
     finality_poll_interval_ethereum: int = 30
 
+    # Pre-confirmed event TTL (how long to wait for onchain confirmation)
+    pre_confirmed_ttl_seconds: int = 1800  # 30 minutes
+    pre_confirmed_sweep_interval_seconds: int = 300  # Check every 5 minutes
+
     # Identity resolver
     identity_cache_ttl: int = 300
 
