@@ -27,6 +27,7 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 ## Key Directories
 - `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking, event_bus.py (Redis Streams pub/sub), trigger_worker.py (TriggerIndex, TriggerWorker, WorkerPool)
 - `tripwire/api/` — FastAPI routes, endpoint registration, subscription management
+- `tripwire/auth/` — SIWE (EIP-4361) message construction, signature verification, timestamp validation (single source of truth)
 - `tripwire/webhook/` — Convoy integration, webhook dispatch
 - `tripwire/identity/` — ERC-8004 identity resolution (mock for MVP), reputation scoring
 - `tripwire/db/` — Supabase client, repositories, SQL migrations
@@ -37,12 +38,12 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - `tests/` — Unit and integration tests
 
 ## Key Protocols
-- **x402**: HTTP 402 micropayment protocol using ERC-3009 transferWithAuthorization. V2 migration in progress: `PAYMENT-SIGNATURE` replaces `X-PAYMENT` (V1 deprecated but still accepted), SIWX (`SIGN-IN-WITH-X` header) replaces custom SIWE for MCP auth, `GET /discovery/resources` is the V2 Bazaar endpoint
+- **x402**: HTTP 402 micropayment protocol using ERC-3009 transferWithAuthorization. V2 migration complete: `PAYMENT-SIGNATURE` is the only accepted header (`PAYMENT-REQUIRED` and `PAYMENT-RESPONSE` are handled by the x402 SDK automatically). The v1 manifest (`/.well-known/x402-manifest.json`) returns 410 Gone. `GET /discovery/resources` is the V2 Bazaar endpoint
 - **ERC-3009**: transferWithAuthorization standard for gasless USDC transfers
 - **ERC-8004**: Onchain AI agent identity registry (went mainnet Jan 29 2026)
 - **TWSS-1**: TripWire Skill Spec — execution-aware skill standard defining lifecycle states (provisional/confirmed/finalized/reorged), three-layer gating (can_pay/can_trust/is_safe), and two-phase execution (prepare/commit). See docs/SKILL-SPEC.md
 - **Trigger Registry**: Dynamic trigger system — create triggers for any EVM event via MCP or API, no deploy needed
-- **x402 Bazaar**: Agent service discovery via /.well-known/x402-manifest.json (V1) + /discovery/resources (V2) + /.well-known/tripwire-skill-spec.json
+- **x402 Bazaar**: Agent service discovery via /discovery/resources (V2) + /.well-known/tripwire-skill-spec.json. V1 manifest (/.well-known/x402-manifest.json) returns 410 Gone
 
 ## Decoder Phases (C1-C3)
 - **C1 (Implemented)**: Decoder protocol + DecodedEvent envelope + ERC3009Decoder + AbiGenericDecoder in `tripwire/ingestion/decoders/`. AbiGenericDecoder performs best-effort payment field extraction (`_extract_payment_fields`) so C3 payment gating works for dynamic triggers too.
@@ -96,4 +97,5 @@ TripWire is a programmable onchain event trigger platform for AI agents — the 
 - All amounts in smallest unit (USDC = 6 decimals)
 - structlog for structured JSON logging
 - No web3.py — use httpx for raw JSON-RPC + eth-abi for decoding
-- MCP tools follow the Model Context Protocol spec — mounted at /mcp
+- Multi-chain: x402 payment networks configurable via `x402_networks` list setting (CAIP-2 format, default: Base)
+- MCP tools follow the Model Context Protocol spec — mounted at /mcp; MCP payment auth uses `TripWirePaymentHooks` pattern (not manual verify/settle)

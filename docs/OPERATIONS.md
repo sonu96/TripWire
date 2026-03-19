@@ -353,9 +353,9 @@ All migrations live in `tripwire/db/migrations/` and are numbered sequentially. 
 | `003_realtime_events.sql` | Creates `realtime_events` table for Notify-mode Supabase Realtime delivery. |
 | `004_add_endpoint_id_to_events.sql` | Adds `endpoint_id` FK column to `events` for endpoint matching. |
 | `005_api_key_index.sql` | Index on `api_key_hash` for fast API key lookups. |
-| `006_svix_ids.sql` | Adds Svix provider ID columns to `endpoints`. |
+| `006_svix_ids.sql` | Adds Svix provider ID columns to `endpoints`. (Historical -- Svix has been fully replaced by Convoy) |
 | `007_key_rotation.sql` | Adds `old_api_key_hash` and `key_rotated_at` for API key rotation with 24h grace period. |
-| `008_svix_to_convoy.sql` | Renames Svix columns to Convoy equivalents (Svix to Convoy migration). |
+| `008_svix_to_convoy.sql` | Renames Svix columns to Convoy equivalents (Svix to Convoy migration). (Historical -- Svix has been fully replaced by Convoy) |
 | `009_performance_indexes.sql` | Composite indexes for common query patterns on `webhook_deliveries` and other tables. |
 | `010_wallet_auth.sql` | Adds `owner_address`, `registration_tx_hash`, `registration_chain_id` for wallet-based auth. |
 | `011_rls_policies.sql` | Row Level Security policies for multi-tenant wallet isolation using `app.current_wallet`. |

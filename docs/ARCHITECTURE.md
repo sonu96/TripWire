@@ -1414,7 +1414,7 @@ per the Model Context Protocol specification (version `2024-11-05`).
 ```
   PUBLIC   No auth required (initialize, tools/list)
   SIWX     Wallet signature via SIWE (free tools)
-  X402     Per-call x402 micropayment (paid tools, settled after execution)
+  X402     Per-call x402 micropayment (paid tools, hooks-based lifecycle via x402_tool_executor)
 ```
 
 Per-address rate limiting: 60 calls/minute via Redis counter. Fails open
@@ -1438,20 +1438,44 @@ ERC-8004 reputation score to meet the threshold.
 
 ### 11.3 x402 Payment Flow
 
-For X402-tier tools:
+For X402-tier tools, the `tools/call` handler delegates to
+`_handle_x402_tool_call()`, which invokes the `x402_tool_executor()`
+orchestrator. The payment lifecycle is managed through a hooks pattern:
 
-1. Client includes `PAYMENT-SIGNATURE` header with x402 payment proof
-2. `build_auth_context()` validates the payment proof and deduplicates
-   via Redis key `x402:payment:{hash}:{tool_name}`
-3. Tool executes
-4. `settle_payment()` settles the x402 payment on success
-5. If settlement fails, the dedup key is cleaned up so the payer can
-   retry, and the tool result is withheld
+1. **Verify** -- The x402 SDK (`x402ResourceServer`) verifies the
+   `PAYMENT-SIGNATURE` header and checks replay protection via Redis
+   key `x402:payment:{hash}:{tool_name}`
+2. **`before_execution` hooks** -- `TripWirePaymentHooks.before_execution`
+   runs identity resolution (ERC-8004), reputation gating, and rate
+   limiting
+3. **Tool execution** -- The tool handler executes
+4. **`after_execution` hooks** -- `TripWirePaymentHooks.after_execution`
+   performs audit logging
+5. **Settlement** -- The x402 SDK's `x402ResourceServer.settle()`
+   finalizes the payment
+6. **`on_settlement_success`** -- Confirms the dedup key
+7. **`on_settlement_failure`** -- Cleans up the dedup key so the payer
+   can retry, and withholds the tool result
+
+The x402 SDK handles protocol-level verify/settle and
+`PAYMENT-REQUIRED`/`PAYMENT-RESPONSE` headers automatically. TripWire
+adds its unique value -- identity resolution, reputation gating, rate
+limiting, execution states, and audit logging -- via the
+`TripWirePaymentHooks` class.
+
+`build_auth_context()` handles only PUBLIC and SIWX tiers; X402
+authentication is fully delegated to the x402 SDK + hooks pattern.
+
+Multi-chain support: tools declare `x402_networks: list[str]` (replacing
+the former singular `x402_network: str`), and `ToolDef.networks: list[str]`
+(replacing `ToolDef.network: str`). Payments are accepted on Base,
+Ethereum, and Arbitrum.
 
 ### 11.4 x402 Bazaar
 
-The `/.well-known/x402-manifest.json` endpoint exposes the service
-discovery manifest for agent marketplaces.
+The legacy `/.well-known/x402-manifest.json` endpoint now returns
+**410 Gone**. Service discovery is served by `GET /discovery/resources`
+(the x402 V2 Bazaar endpoint).
 
 ---
 
@@ -1644,7 +1668,7 @@ or `.env` file. See `tripwire/config/settings.py`.
 | TRIPWIRE_TREASURY_ADDRESS     | (required in prod)     | x402 payment recipient               |
 | X402_FACILITATOR_URL          | https://x402.org/facilitator | Facilitator endpoint          |
 | X402_REGISTRATION_PRICE       | $1.00                  | Endpoint registration price          |
-| X402_NETWORK                  | eip155:8453            | Payment network                      |
+| X402_NETWORKS                 | ["eip155:8453"]        | Payment networks (multi-chain list)  |
 | SIWE_DOMAIN                   | tripwire.dev           | SIWE domain for auth                 |
 | AUTH_TIMESTAMP_TOLERANCE_SECONDS| 300                  | SIWE timestamp tolerance             |
 | OTEL_ENABLED                  | false                  | Enable OpenTelemetry tracing         |
@@ -1704,7 +1728,7 @@ Sentry capture).
 | POST   | /auth/verify                 | None      | SIWE signature verification  |
 | GET    | /auth/nonce                  | None      | SIWE nonce generation        |
 | POST   | /mcp                              | 3-tier    | MCP JSON-RPC endpoint        |
-| GET    | /.well-known/x402-manifest.json   | None      | x402 Bazaar manifest         |
+| GET    | /.well-known/x402-manifest.json   | None      | x402 Bazaar manifest (returns 410 Gone; use /discovery/resources) |
 | GET    | /health                           | None      | Basic health check           |
 | GET    | /health/detailed                  | None      | Deep health with components  |
 | GET    | /ready                            | None      | Readiness probe              |

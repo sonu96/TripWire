@@ -69,32 +69,15 @@ The **statement** field is constructed as:
 
 This binds the signature to a specific HTTP request (method, path, and body), preventing a signature for one request from being used against a different endpoint or with a different payload.
 
-### KNOWN BUG: Chain ID Mismatch
+### RESOLVED: Chain ID Mismatch
 
-The server-side `_build_siwe_message` in `tripwire/api/auth.py` defaults to **`chain_id=8453`** (Base mainnet) at line 33:
-
-```python
-def _build_siwe_message(
-    ...
-    chain_id: int = 8453,
-) -> str:
-```
-
-The SDK's `_build_siwe_message` in `sdk/tripwire_sdk/signer.py` hardcodes **`Chain ID: 1`** (Ethereum mainnet) at line 40:
-
-```python
-f"Chain ID: 1\n"
-```
-
-**Impact:** Any request signed by the SDK will produce a different SIWE message than what the server reconstructs. Signature verification will fail because the recovered address will not match. The SDK and server are currently incompatible on this field.
-
-**Severity:** High. The SDK cannot authenticate against the server until one side is updated to match the other.
+Previously, the SDK's `signer.py` hardcoded `Chain ID: 1` (Ethereum mainnet) while the server defaulted to `chain_id=8453` (Base mainnet), causing SIWE message reconstruction to fail. This was fixed by deleting `signer.py` entirely and unifying chain ID to 8453 across both SDK and server. The canonical SIWE module is now `tripwire/auth/siwe.py`. See commit 672a0c9.
 
 ---
 
 ## 3. Request Signing Flow
 
-Step-by-step flow using the SDK (`sdk/tripwire_sdk/signer.py`):
+Step-by-step flow using the SDK (`TripwireClient` handles this automatically):
 
 1. **Fetch a nonce** -- `GET /auth/nonce` returns a `secrets.token_urlsafe(32)` nonce stored in Redis with a 5-minute TTL. The nonce endpoint is rate-limited to 30 requests/minute per IP and 1000/minute globally.
 
@@ -108,19 +91,15 @@ Step-by-step flow using the SDK (`sdk/tripwire_sdk/signer.py`):
 
 6. **Server verifies** -- Reconstructs the same SIWE message, recovers the signer via `Account.recover_message`, compares addresses (case-insensitive), atomically consumes the nonce from Redis, and checks expiration.
 
-SDK convenience function:
+SDK usage (auth is handled automatically by `TripwireClient`):
 
 ```python
-from tripwire_sdk.signer import make_auth_headers
+from tripwire_sdk import TripwireClient
 
-headers = make_auth_headers(
-    key_or_account=private_key,
-    address="0x...",
-    path="/endpoints",
-    nonce=nonce,
-    method="POST",
-    body_bytes=json.dumps(payload).encode(),
-)
+async with TripwireClient(private_key="0x...") as client:
+    endpoints = await client.list_endpoints()
+    # Auth headers (nonce fetch, SIWE signing, header attachment)
+    # are generated automatically per-request via _make_auth_headers()
 ```
 
 ---
@@ -526,7 +505,7 @@ x402 V2 introduces updated header conventions and authentication primitives. Tri
 
 | Issue | Location | Severity | Status | Description |
 |---|---|---|---|---|
-| Chain ID mismatch | `tripwire/api/auth.py:33` vs `sdk/tripwire_sdk/signer.py:40` | High | Open | Server uses 8453, SDK hardcodes 1. SDK-signed requests will fail verification. |
+| ~~Chain ID mismatch~~ | ~~`tripwire/api/auth.py:33` vs `sdk/tripwire_sdk/signer.py:40`~~ | ~~High~~ | **Resolved** | Fixed: `signer.py` deleted, chain ID unified to 8453 across server and SDK (commit 672a0c9). |
 | MCP register_middleware webhook secret | `tripwire/mcp/tools.py:76` | High | Open | Generates a secret but never passes it to Convoy. Returned secret is useless. No Convoy project/endpoint created. |
 | RLS policies inert | `tripwire/api/__init__.py:13` | Medium | Open | `get_supabase_scoped` exists but is never called. All routes use the service role, bypassing RLS. |
 | ~~Vestigial webhook_signing_secret~~ | ~~`tripwire/config/settings.py`~~ | ~~Low~~ | **Resolved** | Removed from settings.py. Was dead configuration never referenced in any code path. |
@@ -536,3 +515,4 @@ x402 V2 introduces updated header conventions and authentication primitives. Tri
 | Issue | Resolution | Migration |
 |---|---|---|
 | Nonce TOCTOU race (facilitator vs Goldsky) | Fixed via `SELECT FOR UPDATE` in the `record_nonce_or_correlate` Postgres function. The conflicting row is locked before reading, eliminating the read-then-write race window. | `020_unified_event_lifecycle.sql` |
+| Chain ID mismatch (SDK=1, server=8453) | `signer.py` deleted; SDK auth now handled by `TripwireClient._make_auth_headers()` with chain ID 8453. Server and SDK unified. | Commit 672a0c9 |

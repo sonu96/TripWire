@@ -86,7 +86,7 @@ sdk/
   tripwire_sdk/    Python SDK package for API consumers
     client.py      TripwireClient (async context manager, SIWE auth)
     verify.py      Webhook signature verification (HMAC-SHA256)
-    signer.py      SIWE message construction and EIP-191 signing
+    (deleted)      Auth is now handled internally by TripwireClient
     types.py       Pydantic models: Endpoint, Subscription, Event, etc.
     errors.py      TripWireError exception hierarchy
 
@@ -227,15 +227,17 @@ Tolerance: 300 seconds (5 minutes)
 
 For testing, `sign_payload(payload, secret)` generates valid TripWire signature headers without a running server.
 
-### Auth Helpers
+### Auth Handling
 
-`signer.py` provides low-level SIWE auth primitives:
+SDK auth is handled automatically by `TripwireClient`. The previously exported `signer.py` module (`build_auth_message`, `sign_auth_message`, `make_auth_headers`) has been deleted. Auth headers are now generated internally via the private `_make_auth_headers()` method on each request. No manual signing is required:
 
-- `sign_auth_message(key_or_account, address, nonce, method, path, body_bytes)` -- returns `(signature_hex, issued_at, expiration_time)`
-- `make_auth_headers(key_or_account, address, path, nonce=..., method=...)` -- returns the five auth headers dict: `X-TripWire-Address`, `X-TripWire-Signature`, `X-TripWire-Nonce`, `X-TripWire-Issued-At`, `X-TripWire-Expiration`
-- `build_auth_message(address, nonce, method, path, body_bytes)` -- returns `(message_text, issued_at, expiration_time)` without signing
+```python
+async with TripwireClient(private_key="0x...") as client:
+    endpoints = await client.list_endpoints()
+    # Auth headers are generated automatically per-request
+```
 
-The SIWE statement embeds a body hash: `{METHOD} {path} {sha256(body_bytes)}`.
+The SIWE statement embeds a body hash: `{METHOD} {path} {sha256(body_bytes)}`. The canonical SIWE module is now `tripwire/auth/siwe.py`.
 
 ### Types
 
@@ -270,16 +272,6 @@ TripWireError (base, carries status_code + detail)
   TripWireServerError       5xx
   TripWireValidationError   response parsing failures (status_code=0)
 ```
-
-### Known Bug: Chain ID Mismatch in signer.py
-
-`signer.py` hardcodes `Chain ID: 1` (Ethereum mainnet) in the SIWE message at line 40:
-
-```python
-f"Chain ID: 1\n"
-```
-
-The server's `settings.py` defaults to `x402_network = "eip155:8453"` (Base mainnet, chain ID 8453). This mismatch means the SIWE chain ID in signed messages does not match the server's expected chain. Because the chain ID is embedded in the SIWE message text, a mismatch causes the server to reconstruct a different message than what the client signed. The recovered signer address will not match the claimed address, so authentication fails. The SDK and server are currently incompatible on this field.
 
 ---
 
@@ -529,11 +521,9 @@ Previously, concurrent facilitator and Goldsky events could race on nonce insert
 
 The `tripwire:dlq` stream was previously write-only (trigger workers wrote permanently-failed events but nothing read them). The new `tripwire/ingestion/dlq_consumer.py` runs as a background task when `EVENT_BUS_ENABLED=true`, reading failed events, logging them, firing an alert webhook if configured, and incrementing a Prometheus counter.
 
-### Bug: Chain ID Mismatch (SDK signer vs. server)
+### Fixed: Chain ID Mismatch (SDK signer vs. server)
 
-**Location:** `sdk/tripwire_sdk/signer.py` line 40
-
-The SIWE message hardcodes `Chain ID: 1` (Ethereum mainnet), but the server defaults to Base mainnet (`chain_id=8453`, configured as `x402_network = "eip155:8453"` in `settings.py`). This is currently harmless because the server does not validate the chain ID field in SIWE messages. If chain ID validation is added, all SDK clients will fail authentication.
+**Resolved:** `signer.py` was deleted and SDK auth is now handled internally by `TripwireClient._make_auth_headers()`. Both the SDK and server use chain ID 8453 (Base mainnet). The mismatch no longer exists.
 
 ### Bug: MCP `register_middleware` Does Not Register with Convoy
 

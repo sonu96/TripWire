@@ -84,18 +84,18 @@ Payment is verified before tool execution but settled only after successful exec
 
 ### Pricing Table
 
-| Tool                | Auth Tier | Price   | Network        | Min Reputation |
-|---------------------|-----------|---------|----------------|----------------|
-| `register_middleware` | X402    | $0.003  | eip155:8453    | 10.0           |
-| `create_trigger`      | X402    | $0.003  | eip155:8453    | 10.0           |
-| `activate_template`   | X402    | $0.001  | eip155:8453    | 10.0           |
-| `list_triggers`       | SIWX    | free    | --             | 0              |
-| `delete_trigger`      | SIWX    | free    | --             | 0              |
-| `list_templates`      | SIWX    | free    | --             | 0              |
-| `get_trigger_status`  | SIWX    | free    | --             | 0              |
-| `search_events`       | SIWX    | free    | --             | 0              |
+| Tool                | Auth Tier | Price   | Networks                              | Min Reputation |
+|---------------------|-----------|---------|---------------------------------------|----------------|
+| `register_middleware` | X402    | $0.003  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
+| `create_trigger`      | X402    | $0.003  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
+| `activate_template`   | X402    | $0.001  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
+| `list_triggers`       | SIWX    | free    | --                                    | 0              |
+| `delete_trigger`      | SIWX    | free    | --                                    | 0              |
+| `list_templates`      | SIWX    | free    | --                                    | 0              |
+| `get_trigger_status`  | SIWX    | free    | --                                    | 0              |
+| `search_events`       | SIWX    | free    | --                                    | 0              |
 
-All x402 payments are on Base (chain ID 8453) and paid to the treasury address configured in `TRIPWIRE_TREASURY_ADDRESS`.
+x402 payments are supported on multiple chains (Base, Ethereum, Arbitrum) via `x402_networks` configuration, and paid to the treasury address configured in `TRIPWIRE_TREASURY_ADDRESS`.
 
 ---
 
@@ -481,11 +481,7 @@ Agents should gate irreversible side-effects (e.g., releasing goods, granting ac
 
 ## x402 Bazaar
 
-The x402 Bazaar is a service discovery mechanism. TripWire publishes a manifest at:
-
-```
-GET /.well-known/x402-manifest.json
-```
+The x402 Bazaar is a service discovery mechanism. TripWire previously published a manifest at `GET /.well-known/x402-manifest.json`, which now returns **410 Gone**. The V2 discovery endpoint `GET /discovery/resources` is the active replacement.
 
 The manifest advertises available paid services, MCP tools, auth configuration, and supported chains. Agents and clients can fetch this to discover what TripWire offers and how to authenticate.
 
@@ -508,7 +504,7 @@ The manifest advertises available paid services, MCP tools, auth configuration, 
     },
     "x402": {
       "facilitator": "<facilitator URL>",
-      "network": "<CAIP-2 network>",
+      "networks": ["eip155:8453", "eip155:1", "eip155:42161"],
       "pay_to": "<treasury address>"
     }
   },
@@ -528,7 +524,7 @@ The manifest advertises available paid services, MCP tools, auth configuration, 
       "method": "POST",
       "scheme": "exact",
       "price": "$0.003",
-      "network": "eip155:8453",
+      "networks": ["eip155:8453", "eip155:1", "eip155:42161"],
       "pay_to": "<treasury address>"
     }
   ],
@@ -544,13 +540,13 @@ The `identity.protocol` field is set to `"ERC-8004"` to signal that TripWire use
 
 ### Bazaar V2 Endpoint
 
-x402 V2 introduces `GET /discovery/resources` as the standardized Bazaar discovery endpoint. This endpoint serves the same role as `GET /.well-known/x402-manifest.json` but follows the V2 resource discovery convention. Both endpoints are available; V2 clients should prefer `/discovery/resources`.
+`GET /discovery/resources` is the active Bazaar discovery endpoint. The legacy `GET /.well-known/x402-manifest.json` now returns **410 Gone**. All clients should use `/discovery/resources`.
 
 ### Discovery Flow
 
-1. Agent fetches `GET /.well-known/x402-manifest.json` (V1) or `GET /discovery/resources` (V2)
+1. Agent fetches `GET /discovery/resources`
 2. Reads `auth.siwe.nonce_endpoint` to get a SIWE nonce
-3. Reads `auth.x402` for payment facilitator config
+3. Reads `auth.x402` for payment facilitator config (note: `networks` is a list for multi-chain support)
 4. Reads `mcp.tools` to discover available tools and their auth tiers
 5. Calls `POST /mcp` with `tools/list` for full input schemas
 6. Calls tools with appropriate auth headers
@@ -567,22 +563,26 @@ Every `tools/call` request follows this pipeline:
 
 2. **Resolve tool** -- The tool name is looked up in the registry. Unknown tools return `-32601 Method not found`.
 
-3. **Authenticate** -- `build_auth_context()` runs the appropriate auth flow based on the tool's `AuthTier`:
+3. **Authenticate & Route** -- The `tools/call` handler routes based on the tool's `AuthTier`:
    - PUBLIC: no-op
-   - SIWX: verify SIWE headers, recover wallet address, consume nonce
-   - X402: verify `PAYMENT-SIGNATURE` header, check replay protection, verify payment proof via facilitator
+   - SIWX: `build_auth_context()` verifies SIWE headers, recovers wallet address, consumes nonce
+   - X402: delegated to `_handle_x402_tool_call()` (see step 3a below)
+
+   For SIWX and PUBLIC tools, `_handle_siwx_public_tool_call()` handles execution directly.
+
+   **3a. X402 payment lifecycle** -- For X402 tools, the `x402_tool_executor()` orchestrates the full payment lifecycle: verify → `before_execution` hooks (identity, reputation, rate limit) → tool execution → `after_execution` hooks (audit) → settlement. Settlement is handled by the x402 SDK's `x402ResourceServer.settle()`, with `TripWirePaymentHooks.on_settlement_success/failure` managing dedup cleanup and result withholding. The x402 SDK handles protocol-level verify/settle and `PAYMENT-REQUIRED`/`PAYMENT-RESPONSE` headers automatically.
 
 4. **Agent address check** -- Non-PUBLIC tools require a resolved `agent_address`. If missing, returns `-32000`.
 
-5. **Reputation check** -- If the tool has `min_reputation > 0`, the agent's reputation score is compared against the threshold. The score is sourced from the ERC-8004 `ReputationRegistry` contract on Base (chain ID 8453) via a raw JSON-RPC call; results are cached for 300 seconds to avoid per-request onchain lookups. Below threshold returns `-32001`.
+5. **Reputation check** -- If the tool has `min_reputation > 0`, the agent's reputation score is compared against the threshold. The score is sourced from the ERC-8004 `ReputationRegistry` contract on Base (chain ID 8453) via a raw JSON-RPC call; results are cached for 300 seconds to avoid per-request onchain lookups. Below threshold returns `-32001`. For X402 tools, this check is performed inside `TripWirePaymentHooks.before_execution`.
 
-6. **Rate limit** -- Per-address rate limiting: 60 calls/minute per wallet address, enforced via Redis INCR with 60-second TTL. Exceeding the limit returns `-32003`. If Redis is unavailable, rate limiting fails open.
+6. **Rate limit** -- Per-address rate limiting: 60 calls/minute per wallet address, enforced via Redis INCR with 60-second TTL. Exceeding the limit returns `-32003`. If Redis is unavailable, rate limiting fails open. For X402 tools, this check is performed inside `TripWirePaymentHooks.before_execution`.
 
 7. **Execute** -- The tool handler is called with `(params, auth_context, repos)`. Unhandled exceptions return `-32603 Internal error`.
 
-8. **Settle** -- For X402 tools, if the tool returned a successful result (no `"error"` key), `settle_payment()` is called to finalize the x402 payment via the facilitator. If settlement fails, the tool result is withheld and the dedup key is cleaned up.
+8. **Settlement (X402 only)** -- After successful tool execution, the x402 SDK settles the payment via `x402ResourceServer.settle()`. On success, `TripWirePaymentHooks.on_settlement_success` fires. If settlement fails, `TripWirePaymentHooks.on_settlement_failure` withholds the tool result and cleans up the dedup key so the caller can retry.
 
-9. **Audit log** -- Every tool call is logged to the `audit_log` table via fire-and-forget write, recording: action, actor address, auth tier, payment status, arguments, and success/failure.
+9. **Audit log** -- Every tool call is logged to the `audit_log` table. For SIWX/PUBLIC tools this is a fire-and-forget write. For X402 tools, audit logging is performed by `TripWirePaymentHooks.after_execution`. Records: action, actor address, auth tier, payment status, arguments, and success/failure.
 
 10. **Return** -- The result is wrapped in MCP `content` format: `{ "content": [{ "type": "text", "text": "<JSON>" }], "isError": bool }`.
 

@@ -2,6 +2,32 @@
 
 All notable changes to TripWire are documented in this file.
 
+## [Unreleased] - 2026-03-18
+
+### Changed
+- **MCP auth refactored to hooks pattern**: `TripWirePaymentHooks` + `x402_tool_executor()` replace manual verify/settle flow. Identity resolution, reputation gating, rate limiting, and audit logging are now encapsulated as lifecycle hooks.
+- **Multi-chain x402 support**: `x402_networks: list[str]` replaces `x402_network: str`. Supports Base, Ethereum, Arbitrum, Polygon via CAIP-2 identifiers. Discovery endpoints generate per-network payment options.
+- **SDK upgraded to x402 v2 API**: Uses `x402HttpxClient` + `EthAccountSigner` + `register_exact_evm_client` with v1 → plain httpx fallback chain.
+- **SIWE consolidated**: Single source of truth at `tripwire/auth/siwe.py` replaces 4 duplicate implementations.
+- **v1 manifest deprecated**: `/.well-known/x402-manifest.json` now returns 410 Gone with redirect to `/discovery/resources`.
+
+### Removed
+- `sdk/tripwire_sdk/signer.py` — auth header construction inlined into `TripwireClient`
+- `_verify_x402_payment()`, `settle_payment()` — replaced by hooks pattern
+- Public SDK exports: `build_auth_message`, `sign_auth_message`, `make_auth_headers`
+
+### Fixed
+- **Chain ID mismatch (critical)**: SDK hardcoded Chain ID 1 (Ethereum) while server used 8453 (Base). Authentication via SDK could never verify. Now unified to 8453.
+- **Redis mock target in tests**: Tests patched non-existent `_get_redis` instead of `get_redis`. Now correctly mocking Redis in wallet auth tests.
+
+### Added
+- `tripwire/auth/siwe.py` — canonical SIWE message construction, verification, timestamp validation
+- `tripwire/utils/caip.py` — CAIP-2 network identifier parsing (`caip2_to_chain_id()`)
+- `TripWirePaymentHooks` class with `before_execution`, `after_execution`, `on_settlement_success`, `on_settlement_failure` lifecycle hooks
+- `x402_tool_executor()` — orchestrates full x402 payment lifecycle for MCP tools
+- `siwe_chain_id` setting for configurable SIWE chain ID
+- `@field_validator` for comma-separated `X402_NETWORKS` env var parsing
+
 ## [2026-03-18] — x402 V2 Migration
 
 ### Changed
