@@ -37,6 +37,15 @@ The dev server starts on port **3402** by default (`http://localhost:3402`). It 
 
 **Session system:** Set `SESSION_ENABLED=true` to enable the Keeper session system. Sessions provide a pre-authorized spending limit for MCP tool calls, eliminating per-call x402 payment negotiation. Sessions are Keeper-only. Related env vars: `SESSION_DEFAULT_TTL_SECONDS` (default 900), `SESSION_MAX_TTL_SECONDS` (default 1800), `SESSION_DEFAULT_BUDGET_USDC` (default 10000000), `SESSION_MAX_BUDGET_USDC` (default 100000000).
 
+**TTL sweeper and quotas:** The following env vars control the pre-confirmed event sweeper and per-wallet resource quotas:
+
+| Variable | Default | Description |
+|---|---|---|
+| `PRE_CONFIRMED_TTL_SECONDS` | 1800 (30 min) | Max age for `pre_confirmed` events before the sweeper expires them |
+| `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` | 60 | How often the `PreConfirmedSweeper` background task runs |
+| `MAX_TRIGGERS_PER_WALLET` | 50 | Maximum triggers a single wallet can create |
+| `MAX_ENDPOINTS_PER_WALLET` | 20 | Maximum endpoints a single wallet can register |
+
 Minimum `.env` for local dev (Supabase required):
 
 ```
@@ -65,8 +74,9 @@ tripwire/
   api/             FastAPI routes, auth middleware, rate limiting
   config/          Settings via pydantic-settings (.env loading)
   db/              Supabase client, repositories, SQL migrations
-    migrations/    Numbered SQL migration files (001..026)
-    repositories/  Data access: endpoints, events, nonces, triggers, webhooks
+    migrations/    Numbered SQL migration files (001..027)
+    repositories/  Data access: endpoints, events, nonces, triggers, webhooks, quotas
+      quotas.py    Resource quota enforcement (per-wallet trigger/endpoint limits)
   identity/        ERC-8004 identity resolution
     resolver.py    ERC8004Resolver (prod, makes eth_call to onchain registry)
                    and MockResolver (dev, returns hardcoded identities)
@@ -87,6 +97,7 @@ tripwire/
     manager.py     SessionManager: create, get, validate_and_decrement, refund, close
                    Atomic budget decrement via Lua script; SessionData dataclass;
                    SessionError/SessionNotFound/SessionExpired/InsufficientBudget exceptions
+  cache.py         Redis-backed shared cache (cross-instance state: leader election, quotas)
   rpc.py           Goldsky Edge RPC client: eth_call, eth_blockNumber, lazy singleton
                    httpx.AsyncClient; used by finality poller and identity resolver
   types/           Shared Pydantic v2 models
@@ -323,6 +334,7 @@ There is no automated migration runner. Run them in order against your Supabase 
 | 024 | `024_trigger_payment_gating.sql` | Add `require_payment`, `payment_token`, `min_payment_amount` columns to triggers for per-trigger payment gating (C3) |
 | 025 | `025_skill_spec_alignment.sql` | Add `version`, `status`/lifecycle, `required_agent_class` columns to triggers and `version` to trigger_templates |
 | 026 | `026_event_neutral_schema.sql` | Make events table event-neutral for Pulse/Keeper product split: adds `event_type`, `decoded_fields`, `source`, `trigger_id`, `product_source` columns |
+| 027 | `027_advisory_lock_functions.sql` | Postgres advisory lock functions for preventing duplicate webhook dispatch in multi-instance deployments |
 
 ---
 
@@ -539,6 +551,10 @@ The monolithic `EventProcessor` has been refactored. Product-specific event hand
 - `trigger.py` handles Pulse (dynamic trigger) events, including the unified processing loop (`_process_unified`) and C3 payment gating.
 
 The `EventProcessor` iterates over registered handlers and delegates to the first one whose `can_handle()` returns True. Contributors adding new event types should implement the `EventHandler` protocol rather than modifying the processor directly.
+
+### Note: PreConfirmedSweeper Background Task (Keeper Only)
+
+The `PreConfirmedSweeper` is a Keeper-only background task that runs on a configurable interval (`PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS`, default 60s). It queries for `pre_confirmed` events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800s / 30 minutes) and expires them, preventing indefinite provisional state when the corresponding onchain transaction never arrives via Goldsky. The sweeper is started during app lifespan and only runs on the leader instance (via Redis-based leader election).
 
 ### Note: Redis Streams DLQ Is Now Consumed
 

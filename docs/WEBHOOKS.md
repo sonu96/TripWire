@@ -47,7 +47,7 @@ The **facilitator fast path** (`payment.pre_confirmed`) bypasses Goldsky entirel
 | `payment.confirmed` | Transfer confirmed onchain (block depth meets chain-specific threshold) |
 | `payment.finalized` | Transfer has reached the finality depth threshold (per-chain default or per-endpoint override) |
 | `payment.pending` | Transfer detected but not yet confirmed |
-| `payment.failed` | Transfer processing failed |
+| `payment.failed` | Transfer processing failed, or `pre_confirmed` event expired by the TTL sweeper (PreConfirmedSweeper) |
 | `payment.reorged` | Transfer was reorganized out of the canonical chain |
 | `wire.triggered` | Custom event type from the dynamic trigger registry (legacy) |
 | `trigger.matched` | Pulse: dynamic trigger matched an onchain event (initial detection) |

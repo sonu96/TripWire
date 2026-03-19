@@ -4,6 +4,23 @@ All notable changes to TripWire are documented in this file.
 
 ## [Unreleased] - 2026-03-18
 
+### Added (a396e73 — Trigger/Endpoint Quotas + Redis Shared Caches)
+- **`tripwire/cache.py`** — Redis-backed shared cache with in-memory fallback (fail-open). Used by processor and trigger_worker for cross-instance cache coherence.
+- **`tripwire/db/repositories/quotas.py`** — Per-wallet resource quota enforcement (`MAX_TRIGGERS_PER_WALLET`, `MAX_ENDPOINTS_PER_WALLET`).
+- **`max_triggers_per_wallet` / `max_endpoints_per_wallet` settings** — Configurable per-wallet resource caps. Exceeding returns HTTP 429 / JSON-RPC `-32003`.
+
+### Added (db4e633 — Leader Election + TTL Sweeper)
+- **Migration 027** — Postgres advisory lock helper functions for leader election.
+- **`PreConfirmedSweeper`** (`tripwire/ingestion/ttl_sweeper.py`) — Background worker that expires stale `pre_confirmed` events to `payment.failed` after `pre_confirmed_ttl_seconds`.
+- **`pre_confirmed_ttl_seconds` setting** — TTL before a `pre_confirmed` event is swept to `payment.failed` (default configurable).
+- **`pre_confirmed_sweep_interval_seconds` setting** — How often the sweeper runs its expiry scan.
+
+### Changed (a396e73 — Trigger/Endpoint Quotas + Redis Shared Caches)
+- **Processor + trigger_worker use Redis-backed caches** — Shared caches via `tripwire/cache.py` replace per-instance in-memory caches for better cross-instance consistency.
+
+### Changed (db4e633 — Leader Election + TTL Sweeper)
+- **Finality poller uses advisory lock** — Only one instance acquires the Postgres advisory lock and runs the finality poller, making multi-instance deployments safe.
+
 ### Added (fb5fb45 — Dual-Product Platform)
 - **`OnchainEvent`/`PaymentEvent`/`TriggerEvent` model hierarchy** — Base onchain event model with product-specific subclasses in `tripwire/types/models.py`.
 - **`EventHandler` protocol** — `can_handle()` + `handle()` dispatch interface in `tripwire/ingestion/handlers/base.py`.

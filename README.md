@@ -22,6 +22,8 @@ Deploy as Pulse-only, Keeper-only, or both (default) via the `PRODUCT_MODE` envi
 - **Per-trigger payment gating.** Triggers can require that the decoded event contains a payment meeting a minimum threshold before dispatch proceeds. Gate on token contract, minimum amount, or both.
 - **Keeper sessions.** Pre-authorized spending limits stored in Redis with atomic Lua-script budget decrements. Agents open a session once, then make multiple MCP tool calls using the `X-TripWire-Session` header instead of per-call x402 payments. Feature-flagged via `SESSION_ENABLED`.
 - **Delivers signed webhooks via Convoy** with at-least-once guarantees. HMAC-signed payloads, exponential backoff retries (10 attempts), and a dead-letter queue ensure nothing is silently dropped.
+- **Resource quotas.** Per-wallet caps on triggers and endpoints (`MAX_TRIGGERS_PER_WALLET`, `MAX_ENDPOINTS_PER_WALLET`) prevent runaway resource creation.
+- **Multi-instance coordination.** Postgres advisory locks provide leader election for the finality poller and TTL sweeper, so multiple TripWire instances can run safely without duplicate background work.
 
 ---
 

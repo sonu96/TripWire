@@ -131,6 +131,8 @@ Payment is verified before tool execution but settled only after successful exec
 
 x402 payments are supported on multiple chains (Base, Ethereum, Arbitrum) via `x402_networks` configuration, and paid to the treasury address configured in `TRIPWIRE_TREASURY_ADDRESS`.
 
+**Resource quotas:** `create_trigger`, `register_middleware`, and `activate_template` enforce per-wallet resource quotas (`MAX_TRIGGERS_PER_WALLET`, `MAX_ENDPOINTS_PER_WALLET`). When a wallet exceeds its quota the tool returns JSON-RPC error code `-32003` (HTTP 429 equivalent).
+
 **Product tags:** Each tool carries a `product` tag (`"pulse"`, `"keeper"`, or `"both"`) on its `ToolDef`. When `PRODUCT_MODE` is set to `"pulse"`, keeper-only tools are hidden from `tools/list`; when `"keeper"`, pulse-only tools are hidden. Tools tagged `"both"` are always visible.
 
 **Session alternative:** All X402-tier tools can also be called via an active session (`X-TripWire-Session` header), which deducts the tool's price from the session's pre-funded budget instead of requiring a per-call x402 payment. SIWX-tier tools (free) do not consume session budget.
@@ -656,7 +658,7 @@ Every `tools/call` request follows this pipeline:
 | `-32000` | Auth required     | Missing or invalid SIWE headers; no agent address resolved |
 | `-32001` | Reputation too low| Agent reputation below tool's `min_reputation` threshold   |
 | `-32002` | Payment required  | Missing, invalid, replayed, or failed x402 payment; or session expired/insufficient budget |
-| `-32003` | Rate limited      | Exceeded 60 tool calls per minute for this address         |
+| `-32003` | Rate limited      | Exceeded 60 tool calls per minute for this address, or per-wallet resource quota exceeded |
 
 All errors are returned with HTTP status 200 (per JSON-RPC convention). The error object includes `code` and `message`; some include a `data` field with additional context.
 

@@ -1,6 +1,6 @@
 # TripWire Security Model
 
-> Last updated: 2026-03-17
+> Last updated: 2026-03-18
 
 This document describes TripWire's authentication, authorization, and secret management as implemented in the codebase. It is intended as an honest reference for auditors and contributors. Known bugs and gaps are called out explicitly.
 
@@ -20,7 +20,11 @@ This document describes TripWire's authentication, authorization, and secret man
 10. [x402 Payment Security](#10-x402-payment-security)
 11. [Webhook Delivery Security](#11-webhook-delivery-security)
 12. [Session Security (Keeper Only)](#12-session-security-keeper-only)
-13. [Dev Mode](#13-dev-mode)
+13. [Resource Quotas](#13-resource-quotas)
+14. [Advisory Locks](#14-advisory-locks)
+15. [TTL Sweep](#15-ttl-sweep)
+16. [Dev Mode](#16-dev-mode)
+17. [x402 V1 to V2 Migration](#17-x402-v1-to-v2-migration)
 
 ---
 
@@ -507,7 +511,36 @@ Sessions are gated behind `SESSION_ENABLED=false` (default). When disabled, all 
 
 ---
 
-## 13. Dev Mode
+## 13. Resource Quotas
+
+Per-wallet resource quotas prevent resource exhaustion attacks by limiting the number of triggers and endpoints any single wallet can create.
+
+| Resource | Limit | Setting |
+|---|---|---|
+| Triggers per wallet | 50 | `MAX_TRIGGERS_PER_WALLET` |
+| Endpoints per wallet | 20 | `MAX_ENDPOINTS_PER_WALLET` |
+
+Quotas are enforced **server-side before the database write**. When a wallet exceeds its quota, the server returns HTTP **429** with a `detail` message indicating which quota was exceeded. This applies to both the REST API (`POST /endpoints`) and MCP tools (`create_trigger`, `register_middleware`, `activate_template`).
+
+This prevents a single wallet from monopolizing database resources or inflating table sizes, even if the wallet holds valid authentication credentials and sufficient x402 payment balance.
+
+---
+
+## 14. Advisory Locks
+
+Postgres advisory locks are used to prevent duplicate webhook dispatch in multi-instance deployments. When the event processor prepares to dispatch a webhook for a given event, it acquires an advisory lock keyed on the event ID. This ensures that only one TripWire instance dispatches the webhook even when multiple instances process the same event concurrently (e.g., during leader failover or event bus redelivery). The lock functions are defined in migration `027_advisory_lock_functions.sql`.
+
+---
+
+## 15. TTL Sweep
+
+Events created via the facilitator fast path enter the system with status `pre_confirmed`. If the corresponding onchain transaction never arrives via Goldsky (e.g., the ERC-3009 authorization expires or is never submitted), the event would remain in `pre_confirmed` state indefinitely.
+
+The `PreConfirmedSweeper` background task (Keeper-only) runs on a configurable interval and expires any `pre_confirmed` event older than **30 minutes** (configurable via `PRE_CONFIRMED_TTL_SECONDS`). This prevents indefinite provisional state and ensures stale facilitator events do not accumulate in the database.
+
+---
+
+## 16. Dev Mode
 
 `dev_server.py` provides a development-only auth bypass. It:
 
@@ -523,7 +556,7 @@ Additionally, both the Goldsky and facilitator webhook authentication dependenci
 
 ---
 
-## 14. x402 V1 to V2 Migration
+## 17. x402 V1 to V2 Migration
 
 x402 V2 introduces updated header conventions and authentication primitives. TripWire is migrating to support both V1 and V2 during the transition period.
 

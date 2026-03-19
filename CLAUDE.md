@@ -35,7 +35,7 @@ The `settings.is_pulse` / `settings.is_keeper` properties gate which handlers, M
 Budget-based execution sessions for Keeper mode, gated by `SESSION_ENABLED` (default false). An agent opens a session via `POST /auth/session` with a budget (USDC amount) and TTL. The `SessionManager` (`tripwire/session/manager.py`) stores session state in Redis with TTL enforcement. Each tool call atomically decrements the session budget using a Lua script (`atomic_decrement.lua`) — if the remaining budget is insufficient the call is rejected. MCP server checks the `X-TripWire-Session` header before falling back to X402/SIWX auth. SDK exposes `open_session()`, `get_session()`, `close_session()` convenience methods. Sessions are a `SESSION` auth tier, distinct from X402 and SIWX.
 
 ## Key Directories
-- `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking, event_bus.py (Redis Streams pub/sub), trigger_worker.py (TriggerIndex, TriggerWorker, WorkerPool). processor.py split from 1753→923 lines; product-specific logic delegated to handlers
+- `tripwire/ingestion/` — Goldsky pipeline config, ERC-3009 event processing, finality tracking, event_bus.py (Redis Streams pub/sub), trigger_worker.py (TriggerIndex, TriggerWorker, WorkerPool), ttl_sweeper.py (PreConfirmedSweeper — expires stale pre_confirmed events → payment.failed). processor.py split from 1753→923 lines; product-specific logic delegated to handlers
 - `tripwire/ingestion/handlers/` — Product-specific event handlers: `EventHandler` protocol (base.py), `PaymentHandler` (payment.py, Keeper), `TriggerHandler` (trigger.py, Pulse). Processor delegates to handlers via `can_handle()` dispatch
 - `tripwire/api/` — FastAPI routes, endpoint registration, subscription management
 - `tripwire/api/routes/session.py` — Session management REST API (POST/GET/DELETE /auth/session)
@@ -44,7 +44,9 @@ Budget-based execution sessions for Keeper mode, gated by `SESSION_ENABLED` (def
 - `tripwire/webhook/payload.py` — Payload builders: `build_generic_payload()` (Pulse) and `build_payment_payload()` (Keeper)
 - `tripwire/identity/` — ERC-8004 identity resolution (mock for MVP), reputation scoring
 - `tripwire/session/` — Session management package: `SessionManager` (manager.py) with Redis-backed session lifecycle, atomic Lua budget decrement, TTL enforcement
+- `tripwire/cache.py` — Redis-backed shared cache with in-memory fallback (fail-open)
 - `tripwire/db/` — Supabase client, repositories, SQL migrations
+- `tripwire/db/repositories/quotas.py` — Per-wallet resource quota enforcement
 - `tripwire/types/` — Shared Pydantic models (includes `ProductMode` enum, `OnchainEvent`/`PaymentEvent`/`TriggerEvent` hierarchy)
 - `tripwire/config/` — Settings via pydantic-settings
 - `tripwire/mcp/` — MCP server, tool handlers, agent middleware registration
@@ -121,3 +123,5 @@ Budget-based execution sessions for Keeper mode, gated by `SESSION_ENABLED` (def
 - MCP tools follow the Model Context Protocol spec — mounted at /mcp; MCP payment auth uses `TripWirePaymentHooks` pattern (not manual verify/settle)
 - `PRODUCT_MODE` setting controls active product ("pulse", "keeper", or "both"; default "both"). Access via `settings.is_pulse` / `settings.is_keeper`
 - `SESSION_ENABLED` setting (bool, default false) gates Keeper session system. When true, `POST/GET/DELETE /auth/session` routes are active and MCP server checks `X-TripWire-Session` header before X402/SIWX
+- `MAX_TRIGGERS_PER_WALLET` and `MAX_ENDPOINTS_PER_WALLET` settings enforce per-wallet resource quotas (HTTP 429 / JSON-RPC -32003 when exceeded)
+- **Multi-instance coordination**: Finality poller and PreConfirmedSweeper use Postgres advisory locks for leader election — only one instance runs each background task at a time. The event state machine is closed: every event reaches a terminal state (finalized, failed, or reorged)

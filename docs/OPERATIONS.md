@@ -97,6 +97,20 @@ All configuration is loaded from environment variables (or a `.env` file) via py
 | `EVENT_BUS_ENABLED` | bool | `false` | No | Enable Redis Streams event bus for async event processing. |
 | `EVENT_BUS_WORKERS` | int | `3` | No | Number of TriggerWorker consumers for the event bus. |
 
+### PreConfirmed Sweeper
+
+| Variable | Type | Default | Required in prod | Description |
+|---|---|---|---|---|
+| `PRE_CONFIRMED_TTL_SECONDS` | int | `1800` | No | Seconds before a `pre_confirmed` event is marked as `payment.failed` (30 minutes). |
+| `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` | int | `300` | No | How often (seconds) the sweeper checks for stale events (5 minutes). |
+
+### Resource Quotas
+
+| Variable | Type | Default | Required in prod | Description |
+|---|---|---|---|---|
+| `MAX_TRIGGERS_PER_WALLET` | int | `50` | No | Maximum active triggers per wallet. HTTP 429 on exceed. |
+| `MAX_ENDPOINTS_PER_WALLET` | int | `20` | No | Maximum active endpoints per wallet. HTTP 429 on exceed. |
+
 ### Finality Poller
 
 | Variable | Type | Default | Required in prod | Description |
@@ -152,20 +166,22 @@ The FastAPI lifespan manager (`tripwire/main.py`) runs the following steps in or
 12. **Event bus worker pool** (if `EVENT_BUS_ENABLED=true`) -- Initializes stream keys from Redis, creates and starts the WorkerPool. **Degrades gracefully**: if the worker pool fails to start, the error is logged but the application continues without event bus workers.
 13. **Redis DLQ consumer** (if `EVENT_BUS_ENABLED=true`) -- Starts after the worker pool. Reads from `tripwire:dlq`, logs errors, fires alerts, trims stream. See Background Tasks section.
 14. **DLQ handler** (if `DLQ_ENABLED=true` and Convoy is configured) -- Background poller for failed Convoy deliveries.
-15. **Finality poller** (if `FINALITY_POLLER_ENABLED=true`) -- One asyncio task per chain for confirming pending events.
-16. **Nonce archiver** -- Daily background task to move old nonces to archive. **Degrades gracefully**: if it fails to start, the error is logged and the app continues.
-17. **Prometheus build info** -- Sets version and environment labels.
-18. **Ready flag** -- `app.state.ready = True` signals readiness to the `/ready` probe.
+15. **Finality poller** (if `FINALITY_POLLER_ENABLED=true`) -- One asyncio task per chain for confirming pending events. Leader-elected via advisory lock 839201.
+16. **PreConfirmedSweeper** (if Keeper mode active) -- Sweeps stale pre_confirmed events. Leader-elected via advisory lock 839202.
+17. **Nonce archiver** -- Daily background task to move old nonces to archive. **Degrades gracefully**: if it fails to start, the error is logged and the app continues.
+18. **Prometheus build info** -- Sets version and environment labels.
+19. **Ready flag** -- `app.state.ready = True` signals readiness to the `/ready` probe.
 
 ### Shutdown Sequence
 
 1. Stop worker pool (30s timeout; force-cancels tasks if exceeded)
 2. Stop Redis DLQ consumer
 3. Stop finality poller (cancels per-chain tasks)
-4. Stop nonce archiver
-5. Stop DLQ handler
-6. Close shared RPC HTTP client
-7. Flush and shut down OpenTelemetry tracing
+4. Stop PreConfirmedSweeper
+5. Stop nonce archiver
+6. Stop DLQ handler
+7. Close shared RPC HTTP client
+8. Flush and shut down OpenTelemetry tracing
 
 ---
 
@@ -189,6 +205,8 @@ Middleware is applied in reverse declaration order (outermost runs first). The e
 ## 4. Background Tasks
 
 ### Finality Poller
+
+**Leader-elected**: Uses Postgres advisory lock 839201 via `try_acquire_leader_lock()`. Safe for multi-instance deployment -- only one instance polls per cycle.
 
 Spawns one asyncio task per supported chain. Each chain polls on its own cadence because finality semantics differ:
 
@@ -215,6 +233,16 @@ Tracks retry counts in the `dlq_retry_count` column on `webhook_deliveries` (mig
 Runs daily (every 86400 seconds). Calls the `archive_old_nonces` database function to move nonces older than 30 days to the `nonces_archive` table. Processes in batches of 5000.
 
 **Hardcoded config** (in `tripwire/db/archival.py`): `_DEFAULT_AGE_DAYS=30`, `_DEFAULT_BATCH_SIZE=5000`, `_POLL_INTERVAL=86400`.
+
+### PreConfirmedSweeper
+
+Background task that marks stale `pre_confirmed` events as `payment.failed`. Runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes). Events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800 = 30 minutes) are swept. Dispatches `payment.failed` webhooks to linked endpoints.
+
+**Keeper-only**: Only active when `PRODUCT_MODE` includes Keeper (`keeper` or `both`).
+
+**Leader-elected**: Uses Postgres advisory lock 839202 via `try_acquire_leader_lock()`. Safe for multi-instance deployment -- only one instance sweeps per cycle. Non-leaders skip silently.
+
+**Config knobs**: `PRE_CONFIRMED_TTL_SECONDS` (default 1800), `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300).
 
 ### Redis DLQ Consumer
 
@@ -390,6 +418,7 @@ All migrations live in `tripwire/db/migrations/` and are numbered sequentially. 
 | `024_trigger_payment_gating.sql` | Adds `require_payment`, `payment_token`, `min_payment_amount` to triggers for per-trigger payment gating. |
 | `025_skill_spec_alignment.sql` | Adds `version`, `status`/lifecycle, `required_agent_class` to triggers and templates. |
 | `026_event_neutral_schema.sql` | Makes events table event-neutral for Pulse/Keeper split: adds `event_type`, `decoded_fields`, `source`, `trigger_id`, `product_source` columns. |
+| `027_advisory_locks.sql` | Creates `try_acquire_leader_lock(bigint)` and `release_leader_lock(bigint)` SQL functions wrapping `pg_try_advisory_lock` / `pg_advisory_unlock`. Used for leader election by FinalityPoller (lock 839201) and PreConfirmedSweeper (lock 839202). |
 
 ### How to Run
 
@@ -512,11 +541,14 @@ Deployed via docker-compose. A direct httpx fast path for low-latency delivery i
 
 ### Redis
 
-Used for four purposes:
+Used for five purposes:
 1. SIWE nonce storage (always required when auth is used)
 2. Rate limiting via SlowAPI
 3. Event bus streams (only when `EVENT_BUS_ENABLED=true`)
 4. Session storage (only when `SESSION_ENABLED=true`) -- each session is a Redis hash at `session:{session_id}` with fields for wallet address, budget, TTL, identity data. Budget decrements use an atomic Lua script (`EVALSHA`). Sessions have a Redis-level TTL of `ttl_seconds + 60` for automatic cleanup.
+5. Shared caches for endpoints and triggers (`tripwire/cache.py` `RedisCache`). Keys use the `cache:` prefix. Cache invalidation on mutation ensures near-instant cross-instance visibility.
+
+**Fail-open**: The shared caches degrade gracefully -- if Redis is unavailable, the app falls back to per-instance in-memory caches. All other functionality (auth, rate limiting, event bus, sessions) continues to require Redis when enabled.
 
 Configured via `REDIS_URL` (default `redis://localhost:6379`). This is a separate Redis instance from Convoy's internal Redis (port 6380).
 
@@ -581,39 +613,42 @@ TripWire resolves onchain AI agent identities via the ERC-8004 registries deploy
 - [ ] Configure container orchestrator to use `/health` for liveness and `/ready` for readiness probes.
 - [ ] Monitor `/health/detailed` for dependency health and background task staleness.
 
-### Single-Instance Constraints
+### Multi-Instance Deployment
 
-The following components must run as singletons. Running multiple instances causes duplicate processing:
+Postgres advisory locks (migration 027) make the following background tasks safe for multi-instance deployment without manual configuration:
 
-- **Finality poller** -- Multiple instances will confirm the same events and send duplicate webhooks.
-- **DLQ handler** -- Multiple instances will retry the same failed deliveries.
-- **Nonce archiver** -- Multiple instances will attempt concurrent archival (not harmful but wasteful).
+- **Finality poller** (lock 839201) -- Only one instance polls per cycle. Losing instances skip silently.
+- **PreConfirmedSweeper** (lock 839202) -- Only one instance sweeps per cycle.
 
-If you need multiple API server instances for request handling, disable these background tasks on all but one instance using `FINALITY_POLLER_ENABLED=false`, `DLQ_ENABLED=false`.
+The following components do NOT have advisory locks and still require manual singleton control:
+
+- **DLQ handler** -- Multiple instances will retry the same failed deliveries. Use `DLQ_ENABLED=false` on extra instances.
+- **Nonce archiver** -- Multiple instances will attempt concurrent archival (not harmful but wasteful, uses `FOR UPDATE SKIP LOCKED` at the DB level).
 
 ---
 
 ## 12. Known Operational Limitations
 
-### Single-Instance Finality Poller
+### Finality Poller Leader Election
 
-The finality poller runs as asyncio tasks within a single process. There is no distributed lock (e.g., Redis-based leader election) to prevent duplicate polling across multiple instances. If you scale to multiple instances, exactly one must have `FINALITY_POLLER_ENABLED=true`.
+The finality poller uses a Postgres advisory lock (lock ID 839201, migration 027) for leader election. In a multi-instance deployment, only one instance runs the finality poll per cycle. Non-leaders skip silently and retry on the next interval. No manual `FINALITY_POLLER_ENABLED` toggling is required across instances.
 
-### In-Process Caches
+### Caches
 
-Several components use in-memory caches that are not shared across instances:
+**Shared (Redis-backed)**: Endpoint and trigger caches are now backed by `tripwire/cache.py` `RedisCache`. Cache keys are invalidated on mutation (create/update/delete), so new triggers and endpoints are visible across instances within seconds.
 
-- **TriggerIndex** -- Refreshes from DB every 10 seconds with a lock-guarded double-check. Each instance maintains its own copy.
+**Still in-process** (not shared across instances):
+
 - **Event bus consumer group cache** (`_known_groups`) -- Tracks which streams have consumer groups created. Invalidated on NOGROUP errors.
 - **Event bus stream key cache** (`_known_stream_keys`) -- Tracks distinct stream keys for MAX_STREAMS enforcement. Populated from Redis on startup.
 - **TriggerWorker failure counts** -- Per-message failure counts for DLQ routing. Lost on restart; messages may be retried from zero.
 - **Identity resolver cache** -- TTL-based cache (`IDENTITY_CACHE_TTL=300s`). Each instance has independent cache state.
 
-There is no cross-instance cache invalidation mechanism. Cache updates (e.g., new triggers, identity changes) propagate only via TTL expiry, which can cause stale reads for up to the cache TTL duration.
+The identity resolver cache remains per-instance. Identity updates propagate only via TTL expiry (up to 300s staleness).
 
-### No Distributed Lock
+### Advisory Lock Coordination
 
-There is no Redis-based or database-based distributed lock for any background task. Coordination between instances must be done at the deployment level (e.g., run background tasks on a single designated instance).
+Postgres advisory locks (migration 027) coordinate the finality poller (lock 839201) and PreConfirmedSweeper (lock 839202) across instances. Other background tasks (DLQ handler, nonce archiver) do not have advisory locks and must be coordinated at the deployment level.
 
 ### Event Bus Stream Cap
 
@@ -623,9 +658,9 @@ The `MAX_STREAMS=500` cap is enforced per-process using an in-memory set. In a m
 
 The `/ingest` endpoint rejects payloads with more than 1000 logs (HTTP 400). If Goldsky sends larger batches, they must be split upstream.
 
-### Stranded pre_confirmed Events
+### Pre-Confirmed Event TTL
 
-Events that reach `pre_confirmed` status (e.g., from the x402 facilitator) but never receive a corresponding Goldsky confirmation may remain stranded indefinitely. There is no background cleanup task to detect and resolve these orphaned events.
+Events that reach `pre_confirmed` status (e.g., from the x402 facilitator) but never receive a corresponding Goldsky confirmation are now swept by the `PreConfirmedSweeper` background task. Events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800 = 30 minutes) are marked as `payment.failed` and `payment.failed` webhooks are dispatched to linked endpoints. The sweeper runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes) and is protected by advisory lock 839202.
 
 ### Nonce Archival Timing
 

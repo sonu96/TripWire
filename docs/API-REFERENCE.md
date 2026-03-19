@@ -191,6 +191,8 @@ Register a new webhook endpoint. For `execute` mode, a Convoy application and en
 
 > **Important**: `webhook_secret` is returned **only once** at creation time. It is never stored in TripWire's database and cannot be retrieved again. Store it securely -- you will need it to verify HMAC signatures on incoming webhooks.
 
+**Resource quotas**: Each wallet is limited to **20 endpoints** (`MAX_ENDPOINTS_PER_WALLET`). If the wallet already owns the maximum number of active endpoints, the server returns HTTP **429** with `detail: "Endpoint quota exceeded: max 20 per wallet"`. This limit is enforced server-side before the database write.
+
 **URL validation**: Endpoint URLs are validated for safety. Blocked: localhost, loopback, link-local, private IP ranges, and DNS names that resolve to private IPs. HTTP is allowed only when `APP_ENV=development`.
 
 ### GET /api/v1/endpoints
@@ -1030,7 +1032,7 @@ Prometheus metrics endpoint. If `METRICS_BEARER_TOKEN` is configured, requires `
 | 404 | Resource not found |
 | 409 | Conflict (unique constraint violation, e.g. duplicate endpoint) |
 | 422 | Unprocessable entity (foreign key or check constraint violation, invalid facilitator payload) |
-| 429 | Rate limit exceeded (includes `Retry-After` header) |
+| 429 | Rate limit exceeded (includes `Retry-After` header) or resource quota exceeded (per-wallet endpoint/trigger limit) |
 | 500 | Internal server error |
 | 502 | Upstream service error (Convoy retry failure, PostgREST error) |
 | 503 | Service temporarily unavailable (network timeout, connectivity issue) |
@@ -1225,3 +1227,15 @@ Paid MCP tools require a minimum agent reputation score to invoke. This prevents
 Agents with a reputation score below 10.0 (or with no registered ERC-8004 onchain identity) will receive a rejection error when calling these tools. Reputation is resolved from the ERC-8004 registry at invocation time.
 
 Public and SIWX-tier MCP tools (e.g., `list_templates`, `list_triggers`) do not enforce a reputation threshold.
+
+### MCP Resource Quotas
+
+The following MCP tools enforce per-wallet resource quotas. If the wallet has reached its quota, the tool returns an error (equivalent to HTTP 429):
+
+| MCP Tool | Quota | Limit |
+|---|---|---|
+| `create_trigger` | Triggers per wallet | 50 (`MAX_TRIGGERS_PER_WALLET`) |
+| `register_middleware` | Endpoints per wallet | 20 (`MAX_ENDPOINTS_PER_WALLET`) |
+| `activate_template` | Triggers per wallet | 50 (`MAX_TRIGGERS_PER_WALLET`) |
+
+Quota checks are performed server-side before the database write. The error detail indicates which quota was exceeded.

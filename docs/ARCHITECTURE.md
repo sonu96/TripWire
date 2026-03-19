@@ -746,17 +746,12 @@ to be processed as a new event when it reappears in a different block.
 - **No exactly-once delivery.** TripWire provides at-least-once delivery
   only. The consumer is responsible for deduplication via the
   `idempotency_key` included in every webhook payload.
-- **No distributed finality poller coordination.** The finality poller is
-  single-instance only. In a multi-instance deployment, each instance runs
-  its own poller, which can produce duplicate confirmation webhooks for the
-  same event. Mitigation: run a single instance, or add a Redis/Postgres
-  advisory lock (see Known Limitations P1).
-- **Pre-confirmed events can strand.** If the facilitator fast path creates
-  a `payment.pre_confirmed` event but the transaction never lands onchain,
-  the event remains in `pre_confirmed` status indefinitely. The unified
-  lifecycle (migration 020) ensures promotion when Goldsky delivers the
-  real tx, but if the authorization expires and the tx is never mined, the
-  event has no cleanup mechanism yet (see Known Limitations P2).
+- **Finality poller uses advisory-lock leader election.** In a
+  multi-instance deployment, Postgres advisory locks (lock 839201) ensure
+  only one instance runs the finality poller per cycle. See Section 16a.
+- **Pre-confirmed events are swept after TTL.** The `PreConfirmedSweeper`
+  marks stale `pre_confirmed` events as `payment.failed` after
+  `PRE_CONFIRMED_TTL_SECONDS` (default 30 minutes). See Section 16b.
 - **30s cache TTL means new triggers are invisible for up to 30 seconds.**
   The endpoint cache (`processor.py`), trigger topic cache
   (`triggers.py`), and TriggerIndex (`trigger_worker.py`) all use
@@ -1793,41 +1788,41 @@ Additional time from first delivery (pending) to confirmed webhook:
 
 ### PENDING Issues
 
-**P1. Finality poller has no distributed lock.**
-Multiple TripWire instances will each run their own finality poller,
-causing duplicate confirmation webhooks for the same event. Mitigation:
-run a single instance, or add a Redis/Postgres advisory lock.
+**P1. ~~Finality poller has no distributed lock.~~ RESOLVED.**
+Postgres advisory locks (migration 027) provide leader election for the
+finality poller (lock 839201) and the pre_confirmed sweeper (lock 839202).
+See Section 16a.
 
-**P2. Stranded pre_confirmed events.**
-If the facilitator fast path creates a `pre_confirmed` event but the
-transaction never lands onchain, the event stays in `pre_confirmed` status
-indefinitely. The unified lifecycle (migration 020) ensures that when
-Goldsky delivers the real tx, the event is promoted. However, if the tx
-is NEVER mined (e.g. authorization expired), the event still has no
-cleanup mechanism. Needs a TTL-based sweeper for pre_confirmed events
-older than a configurable threshold.
+**P2. ~~Stranded pre_confirmed events.~~ RESOLVED.**
+The `PreConfirmedSweeper` background task marks stale `pre_confirmed`
+events as `payment.failed` after `PRE_CONFIRMED_TTL_SECONDS` (default
+30 minutes). See Section 16b.
 
-**P3. In-process caches are not shared across instances.**
-The endpoint cache (30s TTL in `processor.py`), trigger topic cache
-(30s TTL in `triggers.py`), and the TriggerIndex (10s refresh in
-`trigger_worker.py`) are all in-process dicts. Multiple instances will
-have independent caches with potential staleness after writes.
+**P3. ~~In-process caches are not shared across instances.~~ RESOLVED.**
+`tripwire/cache.py` `RedisCache` provides shared Redis-backed caches for
+endpoints and triggers with in-memory fallback. Cache invalidation on
+mutation ensures near-instant visibility. See Section 16d.
 
-**P4. No per-wallet trigger cap.**
-A single wallet can create an unlimited number of triggers. Combined
-with the 500-stream cap, this could starve other users. Needs a
-per-owner-address limit enforced at the API/MCP layer.
+**P4. ~~No per-wallet trigger cap.~~ RESOLVED.**
+Per-wallet quotas enforce `MAX_TRIGGERS_PER_WALLET` (default 50) and
+`MAX_ENDPOINTS_PER_WALLET` (default 20). HTTP 429 on quota exceeded.
+See Section 16c.
 
-**P5. Identity cache is in-process only.**
-The ERC-8004 identity resolver caches results in-process with a
-configurable TTL (default 300s). In a multi-instance deployment, each
-instance makes redundant RPC calls. A shared Redis cache would reduce
-RPC load.
+**P5. ~~Identity cache is in-process only.~~ RESOLVED (partially).**
+The endpoint and trigger caches now use shared Redis via `RedisCache`
+(see Section 16d). The identity resolver cache remains in-process (per
+Section 6.3) but benefits from reduced overall RPC pressure since
+endpoint/trigger lookups no longer cause redundant DB queries across
+instances.
 
 ### RESOLVED Issues
 
 | Issue | Description                                     | Resolution           |
 |-------|-------------------------------------------------|----------------------|
+| P1    | Finality poller has no distributed lock          | Migration 027 (advisory lock leader election, lock 839201) |
+| P2    | Stranded pre_confirmed events                   | PreConfirmedSweeper (30 min TTL, advisory lock 839202) |
+| P3    | In-process caches not shared across instances   | `tripwire/cache.py` RedisCache with in-memory fallback |
+| P4    | No per-wallet trigger cap                       | Resource quotas: 50 triggers, 20 endpoints per wallet |
 | #7    | events.endpoint_id only records first match     | Migration 014 (event_endpoints join table) |
 | #8    | DB breach exposes webhook signing secrets        | Migration 016 (dropped webhook_secret; Convoy is sole HMAC signer) |
 | #9    | topic0 key mismatch (human sig vs keccak hash)  | Migration 017 (precomputed topic0 column) |
@@ -1886,6 +1881,10 @@ or `.env` file. See `tripwire/config/settings.py`.
 | SESSION_MAX_TTL_SECONDS       | 1800                   | Maximum session lifetime (30 min)    |
 | SESSION_DEFAULT_BUDGET_USDC   | 10000000               | Default budget: 10 USDC (6 decimals) |
 | SESSION_MAX_BUDGET_USDC       | 100000000              | Maximum budget: 100 USDC             |
+| PRE_CONFIRMED_TTL_SECONDS     | 1800                   | TTL before pre_confirmed events are marked failed (30 min) |
+| PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS | 300             | How often the sweeper runs (5 min)   |
+| MAX_TRIGGERS_PER_WALLET       | 50                     | Max active triggers per wallet       |
+| MAX_ENDPOINTS_PER_WALLET      | 20                     | Max active endpoints per wallet      |
 | OTEL_ENABLED                  | false                  | Enable OpenTelemetry tracing         |
 | SENTRY_DSN                    |                        | Sentry error tracking DSN            |
 | METRICS_BEARER_TOKEN          |                        | Protect /metrics endpoint            |
@@ -1898,15 +1897,135 @@ The application lifespan starts and stops these background tasks:
 
 | Task             | Condition                        | Interval  | Description                    |
 |------------------|----------------------------------|-----------|--------------------------------|
-| FinalityPoller   | FINALITY_POLLER_ENABLED          | Per-chain | Promotes pending→confirmed→finalized |
-| WorkerPool       | EVENT_BUS_ENABLED                | Continuous| Redis Streams consumers        |
-| RedisDLQConsumer | EVENT_BUS_ENABLED                | 30s       | Consumes dead-lettered events from tripwire:dlq |
-| DLQHandler       | DLQ_ENABLED + CONVOY_API_KEY set | 60s       | Retries failed Convoy deliveries|
-| NonceArchiver    | Always                           | 24h       | Archives old nonces            |
-| Stream discovery | EVENT_BUS_ENABLED                | 30s       | Discovers new Redis streams    |
+| FinalityPoller       | FINALITY_POLLER_ENABLED          | Per-chain | Promotes pending→confirmed→finalized. Leader-elected (lock 839201). |
+| PreConfirmedSweeper  | Keeper mode                      | 5min      | Marks stale pre_confirmed events as failed after 30min TTL. Leader-elected (lock 839202). |
+| WorkerPool           | EVENT_BUS_ENABLED                | Continuous| Redis Streams consumers        |
+| RedisDLQConsumer     | EVENT_BUS_ENABLED                | 30s       | Consumes dead-lettered events from tripwire:dlq |
+| DLQHandler           | DLQ_ENABLED + CONVOY_API_KEY set | 60s       | Retries failed Convoy deliveries|
+| NonceArchiver        | Always                           | 24h       | Archives old nonces            |
+| Stream discovery     | EVENT_BUS_ENABLED                | 30s       | Discovers new Redis streams    |
 
 Graceful shutdown order: WorkerPool -> RedisDLQConsumer -> FinalityPoller ->
-NonceArchiver -> DLQHandler -> RPC client close -> OTel flush.
+PreConfirmedSweeper -> NonceArchiver -> DLQHandler -> RPC client close -> OTel flush.
+
+---
+
+## 16a. Coordination (Leader Election)
+
+Background tasks that must run as singletons (finality poller, TTL sweeper)
+use Postgres advisory locks for leader election. This replaces the previous
+requirement to manually disable tasks on all-but-one instance.
+
+**Mechanism**: `pg_try_advisory_lock(lock_id)` via Supabase RPC wrappers
+`try_acquire_leader_lock(lock_id)` and `release_leader_lock(lock_id)` (migration
+027). The lock is non-blocking: if another instance already holds the lock,
+`pg_try_advisory_lock` returns `false` and the losing instance skips the
+cycle silently. Locks are session-scoped and automatically released on
+disconnect.
+
+**Lock IDs**:
+
+| Lock ID | Owner              | Description                          |
+|---------|--------------------|--------------------------------------|
+| 839201  | FinalityPoller     | Finality confirmation poll cycle     |
+| 839202  | PreConfirmedSweeper| TTL sweep for stale pre_confirmed events |
+
+**Behavior**: At the start of each poll/sweep cycle, the task calls
+`try_acquire_leader_lock`. If it returns `true`, the task proceeds normally
+and releases the lock at the end of the cycle. If it returns `false`, the
+task sleeps until the next interval. This means exactly one instance
+processes per cycle, even in a multi-instance deployment.
+
+**SQL functions** (migration 027):
+
+```sql
+-- try_acquire_leader_lock(lock_id bigint) -> boolean
+-- release_leader_lock(lock_id bigint) -> void
+```
+
+These are thin wrappers around `pg_try_advisory_lock` / `pg_advisory_unlock`
+exposed as Supabase RPC functions so they can be called via supabase-py.
+
+---
+
+## 16b. Event Lifecycle Completeness
+
+The event state machine is now **closed** -- every event that enters the
+system reaches a terminal state:
+
+```
+  pre_confirmed ──[Goldsky confirms]──> confirmed ──[finality depth]──> finalized
+       │                                     │
+       │                                     └──[reorg detected]──> reorged
+       │
+       └──[30 min TTL expires]──> failed  (PreConfirmedSweeper)
+```
+
+**Terminal states**: `finalized`, `failed`, `reorged`.
+
+Previously, `pre_confirmed` events whose underlying transaction was never
+mined (e.g., expired ERC-3009 authorization) could remain stranded
+indefinitely. The `PreConfirmedSweeper` background task now marks these
+events as `payment.failed` after the configurable TTL
+(`PRE_CONFIRMED_TTL_SECONDS`, default 1800 = 30 minutes).
+
+The sweeper:
+- Runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes)
+- Queries events with `status = 'pre_confirmed'` and `created_at < now() - TTL`
+- Updates status to `failed`
+- Dispatches `payment.failed` webhooks to linked endpoints
+- Protected by advisory lock 839202 (Keeper-only, single-instance execution)
+
+---
+
+## 16c. Resource Quotas
+
+Per-wallet resource limits prevent a single agent from monopolizing trigger
+and endpoint capacity.
+
+| Resource                | Limit | Config variable             |
+|-------------------------|-------|-----------------------------|
+| Triggers per wallet     | 50    | `MAX_TRIGGERS_PER_WALLET`   |
+| Endpoints per wallet    | 20    | `MAX_ENDPOINTS_PER_WALLET`  |
+
+**Enforcement points**:
+- MCP tools (`create_trigger`, `register_middleware`, `activate_template`):
+  quota is checked before creation. Exceeding the limit returns an MCP error.
+- REST API (`POST /api/v1/endpoints`): quota is checked before creation.
+  Exceeding the limit returns HTTP 429 Too Many Requests.
+
+Quotas are evaluated with a `SELECT COUNT(*)` against the owner's active
+resources before any INSERT. This is a soft limit (not enforced at the DB
+level) and is checked at the application layer.
+
+---
+
+## 16d. Shared Caches (Redis)
+
+`tripwire/cache.py` provides a `RedisCache` class that replaces the
+per-instance in-process caches for endpoints and triggers with a shared
+Redis-backed cache. This resolves the stale-cache problem in multi-instance
+deployments (former P3 and P5 known limitations).
+
+**Design**: Redis-backed with in-memory fallback (fail-open). If Redis is
+unavailable, the cache degrades to a per-instance in-memory dict. The
+application continues to function without Redis, but caches are not shared
+across instances.
+
+**Usage**:
+
+| Consumer         | Cache key pattern          | TTL  | Description                    |
+|------------------|----------------------------|------|--------------------------------|
+| EventProcessor   | `cache:endpoints:{recipient}` | 30s  | Endpoint lookup by recipient   |
+| TriggerIndex     | `cache:triggers:{topic0}`  | 10s  | Trigger lookup by topic0       |
+
+**Cache invalidation**: Mutations (endpoint create/update/delete, trigger
+create/update/delete) invalidate the relevant cache key immediately after
+the database write. This ensures that new triggers and endpoints are visible
+to all instances within seconds, rather than waiting for TTL expiry.
+
+**Redis key prefix**: All cache keys use the `cache:` prefix to avoid
+collisions with other Redis consumers (event bus, sessions, rate limiting).
 
 ---
 
