@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine
 
@@ -34,5 +34,10 @@ class ToolDef:
     handler: Callable[..., Coroutine[Any, Any, dict]]
     auth_tier: AuthTier = AuthTier.SIWX
     price: str | None = None        # e.g. "$0.003" for x402 tools
-    network: str = "eip155:8453"    # CAIP-2 chain for x402 payment
+    networks: list[str] = field(default_factory=lambda: ["eip155:8453"])
     min_reputation: float = 0.0
+
+    @property
+    def network(self) -> str:
+        """Primary network (backward compat)."""
+        return self.networks[0] if self.networks else "eip155:8453"

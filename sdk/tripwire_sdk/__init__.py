@@ -11,7 +11,6 @@ from tripwire_sdk.errors import (
     TripWireServerError,
     TripWireValidationError,
 )
-from tripwire_sdk.signer import build_auth_message, make_auth_headers, sign_auth_message
 from tripwire_sdk.types import (
     ChainId,
     Endpoint,
@@ -45,10 +44,6 @@ __all__ = [
     "TripWireRateLimitError",
     "TripWireServerError",
     "TripWireValidationError",
-    # Auth helpers
-    "build_auth_message",
-    "sign_auth_message",
-    "make_auth_headers",
     # Webhook verification
     "WebhookVerificationError",
     "verify_webhook_signature",

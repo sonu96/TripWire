@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json as json_mod
 import logging
 import warnings
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from eth_account import Account
+from eth_account.messages import encode_defunct
 from eth_account.signers.local import LocalAccount
 
 logger = logging.getLogger(__name__)
@@ -20,7 +23,6 @@ from tripwire_sdk.errors import (
     TripWireRateLimitError,
     TripWireServerError,
 )
-from tripwire_sdk.signer import make_auth_headers
 from tripwire_sdk.types import (
     Endpoint,
     EndpointMode,
@@ -30,6 +32,10 @@ from tripwire_sdk.types import (
     Subscription,
     SubscriptionFilter,
 )
+
+# SIWE defaults
+_SIWE_DOMAIN = "tripwire.dev"
+_EXPIRATION_MINUTES = 5
 
 
 class TripwireClient:
@@ -87,21 +93,33 @@ class TripwireClient:
 
         if self._enable_x402:
             try:
-                from x402.client import x402Client
+                from x402 import x402Client
+                from x402.http.clients import x402HttpxClient
+                from x402.mechanisms.evm import EthAccountSigner
+                from x402.mechanisms.evm.exact.register import register_exact_evm_client
 
-                self._http = x402Client(
-                    wallet=self._account,
-                    **client_kwargs,
-                )
-                logger.debug("x402 payment handling enabled")
+                x402_client = x402Client()
+                register_exact_evm_client(x402_client, EthAccountSigner(self._account))
+                self._http = x402HttpxClient(x402_client, **client_kwargs)
+                logger.debug("x402 v2 payment handling enabled")
             except ImportError:
-                warnings.warn(
-                    "x402 package is not installed — HTTP 402 Payment Required "
-                    "responses will not be auto-handled. Install with: "
-                    "pip install tripwire-sdk[x402]",
-                    stacklevel=2,
-                )
-                self._http = httpx.AsyncClient(**client_kwargs)
+                try:
+                    # Fallback: try v1-style import path
+                    from x402.client import x402Client as x402ClientV1
+
+                    self._http = x402ClientV1(
+                        wallet=self._account,
+                        **client_kwargs,
+                    )
+                    logger.debug("x402 v1 payment handling enabled (upgrade to v2 recommended)")
+                except ImportError:
+                    warnings.warn(
+                        "x402 package is not installed — HTTP 402 Payment Required "
+                        "responses will not be auto-handled. Install with: "
+                        "pip install tripwire-sdk[x402]",
+                        stacklevel=2,
+                    )
+                    self._http = httpx.AsyncClient(**client_kwargs)
         else:
             self._http = httpx.AsyncClient(**client_kwargs)
 
@@ -158,6 +176,56 @@ class TripwireClient:
 
         raise TripWireError(status, detail)
 
+    def _make_auth_headers(
+        self,
+        path: str,
+        *,
+        nonce: str,
+        method: str = "GET",
+        body_bytes: bytes = b"",
+        domain: str = _SIWE_DOMAIN,
+    ) -> dict[str, str]:
+        """Build and sign a SIWE message, returning authentication headers.
+
+        Headers returned:
+            X-TripWire-Address    -- checksummed wallet address
+            X-TripWire-Signature  -- hex EIP-191 signature
+            X-TripWire-Nonce      -- server-issued nonce
+            X-TripWire-Issued-At  -- ISO-8601 timestamp
+            X-TripWire-Expiration -- ISO-8601 expiration timestamp
+        """
+        now = datetime.now(timezone.utc)
+        issued_at = now.isoformat()
+        expiration_time = (now + timedelta(minutes=_EXPIRATION_MINUTES)).isoformat()
+
+        body_hash = hashlib.sha256(body_bytes).hexdigest()
+        statement = f"{method} {path} {body_hash}"
+
+        message_text = (
+            f"{domain} wants you to sign in with your Ethereum account:\n"
+            f"{self._address}\n"
+            f"\n"
+            f"{statement}\n"
+            f"\n"
+            f"URI: https://{domain}\n"
+            f"Version: 1\n"
+            f"Chain ID: 8453\n"
+            f"Nonce: {nonce}\n"
+            f"Issued At: {issued_at}\n"
+            f"Expiration Time: {expiration_time}"
+        )
+
+        signable = encode_defunct(text=message_text)
+        signed = self._account.sign_message(signable)
+
+        return {
+            "X-TripWire-Address": self._address,
+            "X-TripWire-Signature": signed.signature.hex(),
+            "X-TripWire-Nonce": nonce,
+            "X-TripWire-Issued-At": issued_at,
+            "X-TripWire-Expiration": expiration_time,
+        }
+
     async def get_nonce(self) -> str:
         """Fetch a fresh one-time nonce from the server for SIWE authentication."""
         try:
@@ -187,9 +255,7 @@ class TripwireClient:
         # Fetch a fresh nonce before each authenticated request
         nonce = await self.get_nonce()
 
-        auth_headers = make_auth_headers(
-            self._account,
-            self._address,
+        auth_headers = self._make_auth_headers(
             path,
             nonce=nonce,
             method=method.upper(),

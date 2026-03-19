@@ -25,8 +25,8 @@ from tests._wallet_helpers import (
     OTHER_PRIVATE_KEY,
     MockRedis,
     make_auth_headers,
-    _build_siwe_message,
 )
+from tripwire.auth.siwe import build_siwe_message
 from tripwire.config.settings import settings
 
 
@@ -74,7 +74,7 @@ class TestValidSignatures:
         mock_redis = MockRedis()
         headers = _make_headers_and_seed(mock_redis, _PRIMARY, method="GET", path="/protected")
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -87,7 +87,7 @@ class TestValidSignatures:
         mock_redis = MockRedis()
         headers = _make_headers_and_seed(mock_redis, _PRIMARY, method="GET", path="/protected")
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -111,7 +111,7 @@ class TestInvalidSignatures:
         headers = _make_headers_and_seed(mock_redis, _OTHER, method="GET", path="/protected")
         headers["X-TripWire-Address"] = _PRIMARY.address
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -135,7 +135,7 @@ class TestInvalidSignatures:
         tampered = bytes([sig_bytes[0] ^ 0xFF]) + sig_bytes[1:]
         headers["X-TripWire-Signature"] = "0x" + tampered.hex()
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -152,7 +152,7 @@ class TestInvalidSignatures:
         # Swap in PRIMARY's address
         headers["X-TripWire-Address"] = _PRIMARY.address
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -177,7 +177,7 @@ class TestExpiredTimestamps:
             expiration_time=past,
         )
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -196,7 +196,7 @@ class TestExpiredTimestamps:
             expiration_time=old,
         )
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -227,7 +227,7 @@ class TestPartialHeaders:
         headers = _make_headers_and_seed(mock_redis, _PRIMARY, method="GET", path="/protected")
         del headers[missing_header]
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -260,7 +260,7 @@ class TestCaseInsensitive:
         assert headers["X-TripWire-Address"] == _PRIMARY.address
         assert any(c.isupper() for c in headers["X-TripWire-Address"][2:])
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -290,13 +290,14 @@ class TestCaseInsensitive:
         body_hash = hashlib.sha256(b"").hexdigest()
         statement = f"GET /protected {body_hash}"
 
-        message_text = _build_siwe_message(
+        message_text = build_siwe_message(
             domain=settings.siwe_domain,
             address=address_lower,
             statement=statement,
             nonce=nonce,
             issued_at=issued_at,
             expiration_time=expiration_time,
+            chain_id=settings.siwe_chain_id,
         )
         signable = encode_defunct(text=message_text)
         signed = _PRIMARY.sign_message(signable)
@@ -310,7 +311,7 @@ class TestCaseInsensitive:
             "X-TripWire-Expiration": expiration_time,
         }
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)
@@ -333,7 +334,7 @@ class TestNonceReplay:
         mock_redis = MockRedis()
         headers = _make_headers_and_seed(mock_redis, _PRIMARY, method="GET", path="/protected")
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 # First request succeeds
@@ -353,7 +354,7 @@ class TestNonceReplay:
         # Build headers but do NOT seed the nonce
         headers = make_auth_headers(_PRIMARY, method="GET", path="/protected")
 
-        with patch("tripwire.api.auth._get_redis", return_value=mock_redis):
+        with patch("tripwire.api.auth.get_redis", return_value=mock_redis):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
                 resp = await client.get("/protected", headers=headers)

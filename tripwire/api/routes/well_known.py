@@ -1,11 +1,14 @@
-"""x402 service manifest and TWSS-1 skill spec for Bazaar discovery."""
+"""x402 service discovery and TWSS-1 skill spec for Bazaar discovery."""
+
+from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from fastapi import APIRouter
+from fastapi.responses import JSONResponse
 
 from tripwire.config.settings import settings
-from tripwire.mcp.types import AuthTier
+from tripwire.mcp.types import AuthTier, ToolDef
 
 router = APIRouter()
 
@@ -115,73 +118,61 @@ async def skill_spec():
     }
 
 
-@router.get("/.well-known/x402-manifest.json")
+@router.get("/.well-known/x402-manifest.json", status_code=410)
 async def x402_manifest():
-    # Import here to avoid circular imports (server.py registers tools at module level)
-    from tripwire.mcp.server import TOOLS
+    """x402 v1 manifest — deprecated. Use GET /discovery/resources."""
+    return JSONResponse(
+        status_code=410,
+        content={
+            "error": "Gone",
+            "message": "x402 v1 manifest is deprecated. Use GET /discovery/resources for x402 V2 Bazaar format.",
+            "redirect": "/discovery/resources",
+        },
+    )
 
-    # Build services list from x402-gated tools
-    services = []
-    for tool_def in TOOLS.values():
-        if tool_def.auth_tier == AuthTier.X402 and tool_def.price:
-            services.append({
-                "name": tool_def.name,
-                "description": tool_def.description,
-                "endpoint": "/mcp",
-                "method": "POST",
+
+def _tool_to_resource(tool_def: ToolDef, now: str, networks: list[str]) -> dict:
+    """Convert a ToolDef into a Bazaar discovery resource dict.
+
+    For X402 tools, emits one PaymentOption per network in the tool's
+    ``networks`` list (multi-chain support).
+    """
+    accepts: list[dict] = []
+    if tool_def.auth_tier == AuthTier.X402 and tool_def.price:
+        # Emit one accept entry per network the tool supports
+        for net in tool_def.networks:
+            if net in networks:
+                accepts.append({
+                    "scheme": "exact",
+                    "price": tool_def.price,
+                    "network": net,
+                    "payTo": settings.tripwire_treasury_address,
+                    "asset": "USDC",
+                })
+        # Fallback: if none of the tool's networks match, use primary
+        if not accepts:
+            accepts.append({
                 "scheme": "exact",
                 "price": tool_def.price,
-                "network": tool_def.network,
-                "pay_to": settings.tripwire_treasury_address,
+                "network": networks[0],
+                "payTo": settings.tripwire_treasury_address,
+                "asset": "USDC",
             })
 
-    # Build full tool list with auth tiers
-    mcp_tools = []
-    for tool_def in TOOLS.values():
-        tool_info = {
-            "name": tool_def.name,
-            "auth_tier": tool_def.auth_tier.value,
-        }
-        if tool_def.price:
-            tool_info["price"] = tool_def.price
-        mcp_tools.append(tool_info)
-
     return {
-        "@context": "https://x402.org/context",
-        "name": "TripWire",
-        "description": "Programmable onchain event triggers for AI agents — middleware + event trigger platform",
-        "version": "1.0.0",
-        "identity": {
-            "protocol": "ERC-8004",
-            "registry": settings.erc8004_identity_registry,
-        },
-        "auth": {
-            "siwe": {
-                "nonce_endpoint": "/auth/nonce",
-                "domain": settings.siwe_domain,
-            },
-            "x402": {
-                "facilitator": settings.x402_facilitator_url,
-                "network": settings.x402_network,
-                "pay_to": settings.tripwire_treasury_address,
-            },
-        },
-        "mcp": {
-            "endpoint": "/mcp",
+        "resource": f"{settings.app_base_url}/mcp#{tool_def.name}",
+        "type": "mcp",
+        "x402Version": 2,
+        "accepts": accepts,
+        "extensions": ["sign-in-with-x"],
+        "metadata": {
+            "tool": tool_def.name,
+            "description": tool_def.description,
+            "inputSchema": tool_def.input_schema,
             "transport": "json-rpc",
-            "tools": mcp_tools,
+            "minReputation": tool_def.min_reputation,
         },
-        "services": services,
-        "supported_chains": [
-            {"chain_id": 8453, "name": "Base"},
-            {"chain_id": 1, "name": "Ethereum"},
-            {"chain_id": 42161, "name": "Arbitrum"},
-        ],
-        "skill_spec": {
-            "version": TWSS_VERSION,
-            "url": f"{settings.app_base_url}/.well-known/tripwire-skill-spec.json",
-        },
-        "_deprecation": "Use GET /discovery/resources for x402 V2 Bazaar format",
+        "lastUpdated": now,
     }
 
 
@@ -192,36 +183,7 @@ async def discovery_resources():
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    resources = []
-    for tool_def in TOOLS.values():
-        # Build accepts: payment-gated tools get a PaymentOption, auth-only tools get empty list
-        if tool_def.auth_tier == AuthTier.X402 and tool_def.price:
-            accepts = [
-                {
-                    "scheme": "exact",
-                    "price": tool_def.price,
-                    "network": tool_def.network,
-                    "payTo": settings.tripwire_treasury_address,
-                    "asset": "USDC",
-                }
-            ]
-        else:
-            accepts = []
+    # Multi-chain: use all configured networks
+    networks: list[str] = settings.x402_networks
 
-        resources.append({
-            "resource": f"{settings.app_base_url}/mcp#{tool_def.name}",
-            "type": "mcp",
-            "x402Version": 2,
-            "accepts": accepts,
-            "extensions": ["sign-in-with-x"],
-            "metadata": {
-                "tool": tool_def.name,
-                "description": tool_def.description,
-                "inputSchema": tool_def.input_schema,
-                "transport": "json-rpc",
-                "minReputation": tool_def.min_reputation,
-            },
-            "lastUpdated": now,
-        })
-
-    return resources
+    return [_tool_to_resource(td, now, networks) for td in TOOLS.values()]

@@ -26,7 +26,11 @@ from tripwire.db.repositories.triggers import (
 from tripwire.observability.audit import AuditLogger, fire_and_forget
 
 from tripwire.mcp.types import AuthTier, MCPAuthContext, ToolDef
-from tripwire.mcp.auth import build_auth_context, settle_payment
+from tripwire.mcp.auth import (
+    build_auth_context,
+    TripWirePaymentHooks,
+    x402_tool_executor,
+)
 from tripwire.mcp import tools as tool_handlers
 
 logger = structlog.get_logger(__name__)
@@ -388,111 +392,12 @@ def create_mcp_app() -> FastAPI:
                 )
 
             tool_def = TOOLS[tool_name]
-
-            # ── Authenticate via 3-tier auth ────────────────
             parent_app = request.app.state.parent_app
             identity_resolver = parent_app.state.identity_resolver
-            try:
-                ctx: MCPAuthContext = await build_auth_context(
-                    request, tool_def, identity_resolver
-                )
-            except HTTPException as exc:
-                # Map HTTP status codes to JSON-RPC error codes
-                if exc.status_code == 402:
-                    code = _PAYMENT_REQUIRED
-                elif exc.status_code == 403:
-                    code = _REPUTATION_TOO_LOW
-                else:
-                    code = _AUTH_REQUIRED
-                return JSONResponse(
-                    content=_jsonrpc_error(
-                        req_id,
-                        code,
-                        exc.detail if isinstance(exc.detail, str) else str(exc.detail),
-                    ),
-                    status_code=200,
-                )
-            except Exception as exc:
-                # Redis down, network errors, etc. — return JSON-RPC error, not HTTP 500
-                logger.exception(
-                    "mcp_auth_unexpected_error",
-                    tool=tool_name,
-                    error=str(exc),
-                )
-                return JSONResponse(
-                    content=_jsonrpc_error(
-                        req_id,
-                        _INTERNAL_ERROR,
-                        "Authentication service unavailable",
-                    ),
-                    status_code=200,
-                )
+            audit_logger: AuditLogger = parent_app.state.audit_logger
 
-            # ── Require agent_address for non-PUBLIC tools ──
-            if tool_def.auth_tier != AuthTier.PUBLIC and not ctx.agent_address:
-                return JSONResponse(
-                    content=_jsonrpc_error(
-                        req_id,
-                        _AUTH_REQUIRED,
-                        "Could not determine agent address from authentication",
-                    ),
-                    status_code=200,
-                )
-
-            # ── Reputation gating ───────────────────────────
-            if tool_def.min_reputation > 0:
-                if ctx.reputation_score < tool_def.min_reputation:
-                    logger.warning(
-                        "mcp_reputation_gate_blocked",
-                        agent=ctx.agent_address,
-                        tool=tool_name,
-                        reputation=ctx.reputation_score,
-                        required=tool_def.min_reputation,
-                    )
-                    return JSONResponse(
-                        content=_jsonrpc_error(
-                            req_id,
-                            _REPUTATION_TOO_LOW,
-                            f"Reputation too low: {ctx.reputation_score:.1f} < {tool_def.min_reputation:.1f}",
-                            data={
-                                "reputation": ctx.reputation_score,
-                                "required": tool_def.min_reputation,
-                            },
-                        ),
-                        status_code=200,
-                    )
-
-            # ── Per-address rate limiting ────────────────────
-            if ctx.agent_address:
-                try:
-                    from tripwire.api.redis import get_redis
-                    r = get_redis()
-                    rate_key = f"mcp:rate:{ctx.agent_address}"
-                    current = await r.incr(rate_key)
-                    if current == 1:
-                        await r.expire(rate_key, 60)  # 60-second window
-                    if current > 60:  # 60 calls/minute per address
-                        logger.warning(
-                            "mcp_rate_limited",
-                            agent=ctx.agent_address,
-                            tool=tool_name,
-                            count=current,
-                        )
-                        return JSONResponse(
-                            content=_jsonrpc_error(
-                                req_id,
-                                _RATE_LIMITED,
-                                "Rate limit exceeded: max 60 tool calls per minute",
-                            ),
-                            status_code=200,
-                        )
-                except Exception:
-                    # Redis down — fail open for rate limiting (auth already passed)
-                    logger.warning("mcp_rate_limit_redis_unavailable")
-
-            # ── Build repos dict from parent app state ──────
+            # Build repos dict from parent app state
             supabase = parent_app.state.supabase
-
             repos = {
                 "supabase": supabase,
                 "endpoint_repo": EndpointRepository(supabase),
@@ -501,99 +406,28 @@ def create_mcp_app() -> FastAPI:
                 "event_repo": EventRepository(supabase),
             }
 
-            # ── Execute the tool handler ────────────────────
-            _t0 = time.perf_counter()
-            try:
-                result = await tool_def.handler(tool_args, ctx, repos)
-            except Exception as exc:
-                logger.exception(
-                    "mcp_tool_call_failed",
-                    tool=tool_name,
-                    agent=ctx.agent_address,
-                    auth_tier=ctx.auth_tier.value,
-                    error=str(exc),
-                )
-                return JSONResponse(
-                    content=_jsonrpc_error(
-                        req_id,
-                        _INTERNAL_ERROR,
-                        "Tool execution failed",
-                    ),
-                    status_code=200,
+            # ── X402 path: delegate to payment hooks + executor ──
+            if tool_def.auth_tier == AuthTier.X402:
+                return await _handle_x402_tool_call(
+                    request=request,
+                    req_id=req_id,
+                    tool_def=tool_def,
+                    tool_args=tool_args,
+                    identity_resolver=identity_resolver,
+                    audit_logger=audit_logger,
+                    repos=repos,
                 )
 
-            # ── Settle x402 payment after successful execution
-            if tool_def.auth_tier == AuthTier.X402 and "error" not in result:
-                try:
-                    await settle_payment(request)
-                except Exception as exc:
-                    logger.error(
-                        "mcp_x402_settle_failed",
-                        tool=tool_name,
-                        agent=ctx.agent_address,
-                        error=str(exc),
-                    )
-                    # Clean up dedup key so the payer can retry with the same proof
-                    try:
-                        import hashlib as _hl
-                        from tripwire.api.redis import get_redis as _get_redis
-                        _payment = request.headers.get("PAYMENT-SIGNATURE", "")
-                        _ph = _hl.sha256(_payment.encode()).hexdigest()
-                        await _get_redis().delete(f"x402:payment:{_ph}:{tool_name}")
-                    except Exception:
-                        pass  # Best-effort cleanup
-                    # Do NOT return tool result if settlement fails —
-                    # prevents free service via settlement manipulation.
-                    return JSONResponse(
-                        content=_jsonrpc_error(
-                            req_id,
-                            _PAYMENT_REQUIRED,
-                            "Payment settlement failed — tool result withheld",
-                        ),
-                        status_code=200,
-                    )
-
-            # ── Audit log ───────────────────────────────────
-            _latency_ms = int((time.perf_counter() - _t0) * 1000)
-            audit_logger: AuditLogger = parent_app.state.audit_logger
-            fire_and_forget(audit_logger.log(
-                action=f"mcp.tools.{tool_name}",
-                actor=ctx.agent_address or "anonymous",
-                resource_type="mcp_tool",
-                resource_id=tool_name,
-                details={
-                    "arguments": tool_args,
-                    "auth_tier": ctx.auth_tier.value,
-                    "payment_verified": ctx.payment_verified,
-                    "success": "error" not in result,
-                    "execution_latency_ms": _latency_ms,
-                },
-                ip_address=(
-                    request.client.host if request.client else None
-                ),
-            ))
-
-            logger.info(
-                "mcp_tool_call",
-                tool=tool_name,
-                agent=ctx.agent_address,
-                auth_tier=ctx.auth_tier.value,
-                success="error" not in result,
-            )
-
-            # MCP tools/call returns content array
-            is_error = "error" in result
-            return JSONResponse(
-                content=_jsonrpc_success(req_id, {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": _serialize_result(result),
-                        }
-                    ],
-                    "isError": is_error,
-                }),
-                status_code=200,
+            # ── SIWX / PUBLIC path: existing logic ───────────────
+            return await _handle_siwx_public_tool_call(
+                request=request,
+                req_id=req_id,
+                tool_def=tool_def,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                identity_resolver=identity_resolver,
+                audit_logger=audit_logger,
+                repos=repos,
             )
 
         # ── Unknown method ──────────────────────────────────
@@ -605,6 +439,283 @@ def create_mcp_app() -> FastAPI:
         )
 
     return mcp_app
+
+
+# ── X402 tool call handler (hooks pattern) ─────────────────────
+
+
+async def _handle_x402_tool_call(
+    request: Request,
+    req_id: Any,
+    tool_def: ToolDef,
+    tool_args: dict,
+    identity_resolver: Any,
+    audit_logger: AuditLogger,
+    repos: dict,
+) -> JSONResponse:
+    """Handle an X402 tool call using TripWirePaymentHooks + x402_tool_executor."""
+    hooks = TripWirePaymentHooks(
+        tool_def=tool_def,
+        identity_resolver=identity_resolver,
+        audit_logger=audit_logger,
+    )
+
+    try:
+        outcome = await x402_tool_executor(
+            request=request,
+            tool_def=tool_def,
+            tool_handler=tool_def.handler,
+            tool_args=tool_args,
+            hooks=hooks,
+            repos=repos,
+        )
+    except HTTPException as exc:
+        # Map HTTP status codes to JSON-RPC error codes
+        if exc.status_code == 402:
+            code = _PAYMENT_REQUIRED
+        elif exc.status_code == 403:
+            code = _REPUTATION_TOO_LOW
+        elif exc.status_code == 429:
+            code = _RATE_LIMITED
+        elif exc.status_code == 401:
+            code = _AUTH_REQUIRED
+        else:
+            code = _AUTH_REQUIRED
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+
+        # Include reputation data for reputation gate errors
+        data = None
+        if exc.status_code == 403 and "Reputation too low" in detail:
+            # Parse reputation values from the detail message
+            data = {"detail": detail}
+
+        return JSONResponse(
+            content=_jsonrpc_error(req_id, code, detail, data=data),
+            status_code=200,
+        )
+    except Exception as exc:
+        logger.exception(
+            "mcp_x402_unexpected_error",
+            tool=tool_def.name,
+            error=str(exc),
+        )
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id,
+                _INTERNAL_ERROR,
+                "Payment service unavailable",
+            ),
+            status_code=200,
+        )
+
+    # x402_tool_executor returns {"result": ...} or {"error": ..., "code": ...}
+    if "error" in outcome:
+        error_msg = outcome["error"]
+        error_code = outcome.get("code", "INTERNAL_ERROR")
+
+        # Map known error codes to JSON-RPC error codes
+        if error_code == "SETTLEMENT_FAILED":
+            jsonrpc_code = _PAYMENT_REQUIRED
+        else:
+            jsonrpc_code = _INTERNAL_ERROR
+
+        return JSONResponse(
+            content=_jsonrpc_error(req_id, jsonrpc_code, error_msg),
+            status_code=200,
+        )
+
+    # Success — tool result is in outcome["result"]
+    tool_result = outcome["result"]
+    is_error = "error" in tool_result
+    return JSONResponse(
+        content=_jsonrpc_success(req_id, {
+            "content": [
+                {
+                    "type": "text",
+                    "text": _serialize_result(tool_result),
+                }
+            ],
+            "isError": is_error,
+        }),
+        status_code=200,
+    )
+
+
+# ── SIWX / PUBLIC tool call handler (unchanged logic) ──────────
+
+
+async def _handle_siwx_public_tool_call(
+    request: Request,
+    req_id: Any,
+    tool_def: ToolDef,
+    tool_name: str,
+    tool_args: dict,
+    identity_resolver: Any,
+    audit_logger: AuditLogger,
+    repos: dict,
+) -> JSONResponse:
+    """Handle a SIWX or PUBLIC tool call — preserves existing logic exactly."""
+    # ── Authenticate via build_auth_context ────────────────
+    try:
+        ctx: MCPAuthContext = await build_auth_context(
+            request, tool_def, identity_resolver
+        )
+    except HTTPException as exc:
+        # Map HTTP status codes to JSON-RPC error codes
+        if exc.status_code == 402:
+            code = _PAYMENT_REQUIRED
+        elif exc.status_code == 403:
+            code = _REPUTATION_TOO_LOW
+        else:
+            code = _AUTH_REQUIRED
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id,
+                code,
+                exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            ),
+            status_code=200,
+        )
+    except Exception as exc:
+        # Redis down, network errors, etc. — return JSON-RPC error, not HTTP 500
+        logger.exception(
+            "mcp_auth_unexpected_error",
+            tool=tool_name,
+            error=str(exc),
+        )
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id,
+                _INTERNAL_ERROR,
+                "Authentication service unavailable",
+            ),
+            status_code=200,
+        )
+
+    # ── Require agent_address for non-PUBLIC tools ──
+    if tool_def.auth_tier != AuthTier.PUBLIC and not ctx.agent_address:
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id,
+                _AUTH_REQUIRED,
+                "Could not determine agent address from authentication",
+            ),
+            status_code=200,
+        )
+
+    # ── Reputation gating ───────────────────────────
+    if tool_def.min_reputation > 0:
+        if ctx.reputation_score < tool_def.min_reputation:
+            logger.warning(
+                "mcp_reputation_gate_blocked",
+                agent=ctx.agent_address,
+                tool=tool_name,
+                reputation=ctx.reputation_score,
+                required=tool_def.min_reputation,
+            )
+            return JSONResponse(
+                content=_jsonrpc_error(
+                    req_id,
+                    _REPUTATION_TOO_LOW,
+                    f"Reputation too low: {ctx.reputation_score:.1f} < {tool_def.min_reputation:.1f}",
+                    data={
+                        "reputation": ctx.reputation_score,
+                        "required": tool_def.min_reputation,
+                    },
+                ),
+                status_code=200,
+            )
+
+    # ── Per-address rate limiting ────────────────────
+    if ctx.agent_address:
+        try:
+            from tripwire.api.redis import get_redis
+            r = get_redis()
+            rate_key = f"mcp:rate:{ctx.agent_address}"
+            current = await r.incr(rate_key)
+            if current == 1:
+                await r.expire(rate_key, 60)  # 60-second window
+            if current > 60:  # 60 calls/minute per address
+                logger.warning(
+                    "mcp_rate_limited",
+                    agent=ctx.agent_address,
+                    tool=tool_name,
+                    count=current,
+                )
+                return JSONResponse(
+                    content=_jsonrpc_error(
+                        req_id,
+                        _RATE_LIMITED,
+                        "Rate limit exceeded: max 60 tool calls per minute",
+                    ),
+                    status_code=200,
+                )
+        except Exception:
+            # Redis down — fail open for rate limiting (auth already passed)
+            logger.warning("mcp_rate_limit_redis_unavailable")
+
+    # ── Execute the tool handler ────────────────────
+    _t0 = time.perf_counter()
+    try:
+        result = await tool_def.handler(tool_args, ctx, repos)
+    except Exception as exc:
+        logger.exception(
+            "mcp_tool_call_failed",
+            tool=tool_name,
+            agent=ctx.agent_address,
+            auth_tier=ctx.auth_tier.value,
+            error=str(exc),
+        )
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id,
+                _INTERNAL_ERROR,
+                "Tool execution failed",
+            ),
+            status_code=200,
+        )
+
+    # ── Audit log ───────────────────────────────────
+    _latency_ms = int((time.perf_counter() - _t0) * 1000)
+    fire_and_forget(audit_logger.log(
+        action=f"mcp.tools.{tool_name}",
+        actor=ctx.agent_address or "anonymous",
+        resource_type="mcp_tool",
+        resource_id=tool_name,
+        details={
+            "arguments": tool_args,
+            "auth_tier": ctx.auth_tier.value,
+            "payment_verified": ctx.payment_verified,
+            "success": "error" not in result,
+            "execution_latency_ms": _latency_ms,
+        },
+        ip_address=(
+            request.client.host if request.client else None
+        ),
+    ))
+
+    logger.info(
+        "mcp_tool_call",
+        tool=tool_name,
+        agent=ctx.agent_address,
+        auth_tier=ctx.auth_tier.value,
+        success="error" not in result,
+    )
+
+    # MCP tools/call returns content array
+    is_error = "error" in result
+    return JSONResponse(
+        content=_jsonrpc_success(req_id, {
+            "content": [
+                {
+                    "type": "text",
+                    "text": _serialize_result(result),
+                }
+            ],
+            "isError": is_error,
+        }),
+        status_code=200,
+    )
 
 
 def _serialize_result(result: dict) -> str:

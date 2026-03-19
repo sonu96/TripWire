@@ -1,6 +1,6 @@
 """TripWire configuration via pydantic-settings."""
 
-from pydantic import SecretStr, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -41,13 +41,32 @@ class Settings(BaseSettings):
     # x402 Payment Gating
     x402_facilitator_url: str = "https://x402.org/facilitator"
     x402_registration_price: str = "$1.00"
-    x402_network: str = "eip155:8453"  # Base mainnet
+    x402_networks: list[str] = ["eip155:8453"]  # CAIP-2 chains (comma-separated in env)
+
+    @field_validator("x402_networks", mode="before")
+    @classmethod
+    def _parse_x402_networks(cls, v: object) -> list[str]:
+        """Accept both JSON arrays and comma-separated strings from env vars."""
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return v  # type: ignore[return-value]
+
+    @property
+    def x402_primary_network(self) -> str:
+        """Primary network for defaults."""
+        return self.x402_networks[0] if self.x402_networks else "eip155:8453"
+
+    @property
+    def x402_network(self) -> str:
+        """Deprecated: use x402_networks or x402_primary_network."""
+        return self.x402_primary_network
 
     # Wallet-based auth
     tripwire_treasury_address: str = ""  # USDC recipient for x402 registration payments
     auth_timestamp_tolerance_seconds: int = 300
     redis_url: str = "redis://localhost:6379"
     siwe_domain: str = "tripwire.dev"
+    siwe_chain_id: int = 8453
 
     # Dead Letter Queue
     dlq_poll_interval_seconds: int = 60

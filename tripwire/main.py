@@ -382,7 +382,8 @@ def create_app() -> FastAPI:
                     FacilitatorConfig(url=settings.x402_facilitator_url)
                 )
             )
-            x402_server.register(settings.x402_network, ExactEvmServerScheme())
+            for network in settings.x402_networks:
+                x402_server.register(network, ExactEvmServerScheme())
 
             x402_routes = {
                 "POST /api/v1/endpoints": RouteConfig(
@@ -390,16 +391,17 @@ def create_app() -> FastAPI:
                         PaymentOption(
                             scheme="exact",
                             price=settings.x402_registration_price,
-                            network=settings.x402_network,
+                            network=net,
                             pay_to=settings.tripwire_treasury_address,
                         )
+                        for net in settings.x402_networks
                     ]
                 ),
             }
             app.add_middleware(PaymentMiddlewareASGI, routes=x402_routes, server=x402_server)
             logger.info(
                 "x402_payment_gating_enabled",
-                network=settings.x402_network,
+                networks=settings.x402_networks,
                 price=settings.x402_registration_price,
                 pay_to=settings.tripwire_treasury_address,
             )

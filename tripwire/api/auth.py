@@ -1,15 +1,12 @@
 """SIWE (EIP-4361) wallet authentication with replay prevention for TripWire."""
 
-import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 import structlog
-from eth_account import Account
-from eth_account.messages import encode_defunct
 from fastapi import HTTPException, Request
 
 from tripwire.api.redis import get_redis
+from tripwire.auth.siwe import build_siwe_message, build_request_statement, verify_siwe_signature, validate_timestamps
 from tripwire.config.settings import settings
 from tripwire.observability.audit import fire_and_forget
 
@@ -21,31 +18,6 @@ class WalletAuthContext:
     """Authenticated caller context carrying the verified wallet address."""
 
     wallet_address: str
-
-
-def _build_siwe_message(
-    domain: str,
-    address: str,
-    statement: str,
-    nonce: str,
-    issued_at: str,
-    expiration_time: str,
-    chain_id: int = 8453,
-) -> str:
-    """Construct an EIP-4361 SIWE message string."""
-    return (
-        f"{domain} wants you to sign in with your Ethereum account:\n"
-        f"{address}\n"
-        f"\n"
-        f"{statement}\n"
-        f"\n"
-        f"URI: https://{domain}\n"
-        f"Version: 1\n"
-        f"Chain ID: {chain_id}\n"
-        f"Nonce: {nonce}\n"
-        f"Issued At: {issued_at}\n"
-        f"Expiration Time: {expiration_time}"
-    )
 
 
 
@@ -98,13 +70,8 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
 
     # --- Expiration validation ---
     try:
-        exp_dt = datetime.fromisoformat(expiration_time)
-        if exp_dt.tzinfo is None:
-            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=401, detail="Invalid expiration time format")
-
-    if datetime.now(timezone.utc) > exp_dt:
+        validate_timestamps(issued_at, expiration_time, check_issued_at_tolerance=False)
+    except ValueError as exc:
         _audit = _get_audit_logger(request)
         if _audit:
             fire_and_forget(_audit.log(
@@ -115,30 +82,41 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
                 details={"reason": "signature_expired"},
                 ip_address=request.client.host if request.client else None,
             ))
-        raise HTTPException(status_code=401, detail="Signature has expired")
+        raise HTTPException(status_code=401, detail=str(exc))
 
-    # --- Body hash ---
+    # --- Body hash + statement ---
     body_bytes = await request.body()
-    body_hash = hashlib.sha256(body_bytes).hexdigest()
-
-    # --- Reconstruct SIWE message ---
     method = request.method
     path = request.url.path
-    statement = f"{method} {path} {body_hash}"
+    statement = build_request_statement(method, path, body_bytes)
 
-    message_text = _build_siwe_message(
+    # --- Reconstruct SIWE message ---
+    message_text = build_siwe_message(
         domain=settings.siwe_domain,
         address=address,
         statement=statement,
         nonce=nonce,
         issued_at=issued_at,
         expiration_time=expiration_time,
+        chain_id=settings.siwe_chain_id,
     )
-    signable = encode_defunct(text=message_text)
 
-    # --- Signature recovery ---
+    # --- Signature recovery + address comparison ---
     try:
-        recovered = Account.recover_message(signable, signature=signature)
+        recovered = verify_siwe_signature(message_text, signature, address)
+    except ValueError as exc:
+        logger.warning("wallet_auth_recovery_failed", error=str(exc))
+        _audit = _get_audit_logger(request)
+        if _audit:
+            fire_and_forget(_audit.log(
+                action="auth.failed",
+                actor=address,
+                resource_type="auth",
+                resource_id="invalid_signature",
+                details={"reason": "signature_recovery_or_mismatch"},
+                ip_address=request.client.host if request.client else None,
+            ))
+        raise HTTPException(status_code=401, detail="Invalid signature or address mismatch")
     except Exception as exc:
         logger.warning("wallet_auth_recovery_failed", error=str(exc))
         _audit = _get_audit_logger(request)
@@ -152,25 +130,6 @@ async def require_wallet_auth(request: Request) -> WalletAuthContext:
                 ip_address=request.client.host if request.client else None,
             ))
         raise HTTPException(status_code=401, detail="Invalid signature")
-
-    # --- Address comparison (EIP-55 checksum-safe) ---
-    if recovered.lower() != address.lower():
-        logger.warning(
-            "wallet_auth_address_mismatch",
-            claimed=address,
-            recovered=recovered,
-        )
-        _audit = _get_audit_logger(request)
-        if _audit:
-            fire_and_forget(_audit.log(
-                action="auth.failed",
-                actor=address,
-                resource_type="auth",
-                resource_id="address_mismatch",
-                details={"reason": "address_mismatch", "claimed": address, "recovered": recovered},
-                ip_address=request.client.host if request.client else None,
-            ))
-        raise HTTPException(status_code=401, detail="Signature does not match claimed address")
 
     # --- Nonce consumption (atomic: delete returns 1 if key existed, 0 if not) ---
     r = get_redis()

@@ -12,36 +12,13 @@ from unittest.mock import AsyncMock
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
+from tripwire.auth.siwe import build_siwe_message
 from tripwire.config.settings import settings
 
 # ── Deterministic test wallets (Hardhat default accounts) ─────
 
 TEST_PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 OTHER_PRIVATE_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
-
-
-def _build_siwe_message(
-    domain: str,
-    address: str,
-    statement: str,
-    nonce: str,
-    issued_at: str,
-    expiration_time: str,
-) -> str:
-    """Construct an EIP-4361 SIWE message string (mirrors auth.py)."""
-    return (
-        f"{domain} wants you to sign in with your Ethereum account:\n"
-        f"{address}\n"
-        f"\n"
-        f"{statement}\n"
-        f"\n"
-        f"URI: https://{domain}\n"
-        f"Version: 1\n"
-        f"Chain ID: 1\n"
-        f"Nonce: {nonce}\n"
-        f"Issued At: {issued_at}\n"
-        f"Expiration Time: {expiration_time}"
-    )
 
 
 def make_auth_headers(
@@ -75,13 +52,14 @@ def make_auth_headers(
     body_hash = hashlib.sha256(body if isinstance(body, bytes) else body.encode()).hexdigest()
     statement = f"{method} {path} {body_hash}"
 
-    message_text = _build_siwe_message(
+    message_text = build_siwe_message(
         domain=settings.siwe_domain,
         address=address,
         statement=statement,
         nonce=nonce,
         issued_at=issued_at,
         expiration_time=expiration_time,
+        chain_id=settings.siwe_chain_id,
     )
     signable = encode_defunct(text=message_text)
     signed = account.sign_message(signable)
