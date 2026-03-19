@@ -31,6 +31,8 @@ from tripwire.mcp.auth import (
     build_auth_context,
     TripWirePaymentHooks,
     x402_tool_executor,
+    _verify_session,
+    _price_to_smallest_units,
 )
 from tripwire.mcp import tools as tool_handlers
 
@@ -428,6 +430,23 @@ def create_mcp_app() -> FastAPI:
                 "event_repo": EventRepository(supabase),
             }
 
+            # ── SESSION path: pre-funded session budget ──────────
+            session_header = request.headers.get("X-TripWire-Session")
+            if session_header and settings.session_enabled:
+                session_manager = getattr(parent_app.state, "session_manager", None)
+                if session_manager is not None:
+                    return await _handle_session_tool_call(
+                        request=request,
+                        req_id=req_id,
+                        tool_def=tool_def,
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        identity_resolver=identity_resolver,
+                        audit_logger=audit_logger,
+                        session_manager=session_manager,
+                        repos=repos,
+                    )
+
             # ── X402 path: delegate to payment hooks + executor ──
             if tool_def.auth_tier == AuthTier.X402:
                 return await _handle_x402_tool_call(
@@ -559,6 +578,202 @@ async def _handle_x402_tool_call(
             ],
             "isError": is_error,
         }),
+        status_code=200,
+    )
+
+
+# ── SESSION tool call handler ───────────────────────────────────
+
+
+async def _handle_session_tool_call(
+    request: Request,
+    req_id: Any,
+    tool_def: ToolDef,
+    tool_name: str,
+    tool_args: dict,
+    identity_resolver: Any,
+    audit_logger: AuditLogger,
+    session_manager: Any,
+    repos: dict,
+) -> JSONResponse:
+    """Handle a tool call authenticated via a pre-funded session.
+
+    Flow:
+    1. _verify_session() — validates session, checks budget, atomically decrements
+    2. Reputation gating (refund budget on gate failure)
+    3. Rate limiting
+    4. Execute tool handler
+    5. Audit log with session context
+    6. Return result with session metadata
+    """
+    # 1. Verify session + decrement budget
+    try:
+        ctx: MCPAuthContext = await _verify_session(request, tool_def, session_manager)
+    except HTTPException as exc:
+        if exc.status_code == 402:
+            code = _PAYMENT_REQUIRED
+        elif exc.status_code == 403:
+            code = _REPUTATION_TOO_LOW
+        else:
+            code = _AUTH_REQUIRED
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id,
+                code,
+                exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+            ),
+            status_code=200,
+        )
+    except Exception as exc:
+        logger.exception(
+            "mcp_session_auth_error",
+            tool=tool_name,
+            error=str(exc),
+        )
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id, _INTERNAL_ERROR, "Session validation failed"
+            ),
+            status_code=200,
+        )
+
+    # 2. Reputation gating (refund on failure)
+    if tool_def.min_reputation > 0:
+        if ctx.reputation_score < tool_def.min_reputation:
+            # Refund the budget since we already decremented
+            cost = _price_to_smallest_units(tool_def.price)
+            if cost > 0:
+                try:
+                    await session_manager.refund(ctx.session_id, cost)
+                except Exception:
+                    logger.warning(
+                        "session_refund_failed_on_reputation_gate",
+                        session_id=ctx.session_id,
+                        cost=cost,
+                    )
+
+            logger.warning(
+                "mcp_reputation_gate_blocked",
+                agent=ctx.agent_address,
+                tool=tool_name,
+                reputation=ctx.reputation_score,
+                required=tool_def.min_reputation,
+            )
+            return JSONResponse(
+                content=_jsonrpc_error(
+                    req_id,
+                    _REPUTATION_TOO_LOW,
+                    f"Reputation too low: {ctx.reputation_score:.1f} < {tool_def.min_reputation:.1f}",
+                    data={
+                        "reputation": ctx.reputation_score,
+                        "required": tool_def.min_reputation,
+                    },
+                ),
+                status_code=200,
+            )
+
+    # 3. Per-address rate limiting
+    if ctx.agent_address:
+        try:
+            from tripwire.api.redis import get_redis
+            r = get_redis()
+            rate_key = f"mcp:rate:{ctx.agent_address}"
+            current = await r.incr(rate_key)
+            if current == 1:
+                await r.expire(rate_key, 60)
+            if current > 60:
+                logger.warning(
+                    "mcp_rate_limited",
+                    agent=ctx.agent_address,
+                    tool=tool_name,
+                    count=current,
+                )
+                # Refund budget on rate limit
+                cost = _price_to_smallest_units(tool_def.price)
+                if cost > 0:
+                    try:
+                        await session_manager.refund(ctx.session_id, cost)
+                    except Exception:
+                        pass
+                return JSONResponse(
+                    content=_jsonrpc_error(
+                        req_id,
+                        _RATE_LIMITED,
+                        "Rate limit exceeded: max 60 tool calls per minute",
+                    ),
+                    status_code=200,
+                )
+        except Exception:
+            logger.warning("mcp_rate_limit_redis_unavailable")
+
+    # 4. Execute tool handler
+    _t0 = time.perf_counter()
+    try:
+        result = await tool_def.handler(tool_args, ctx, repos)
+    except Exception as exc:
+        logger.exception(
+            "mcp_tool_call_failed",
+            tool=tool_name,
+            agent=ctx.agent_address,
+            auth_tier=ctx.auth_tier.value,
+            session_id=ctx.session_id,
+            error=str(exc),
+        )
+        return JSONResponse(
+            content=_jsonrpc_error(
+                req_id, _INTERNAL_ERROR, "Tool execution failed"
+            ),
+            status_code=200,
+        )
+
+    # 5. Audit log with session context
+    _latency_ms = int((time.perf_counter() - _t0) * 1000)
+    fire_and_forget(audit_logger.log(
+        action=f"mcp.tools.{tool_name}",
+        actor=ctx.agent_address or "anonymous",
+        resource_type="mcp_tool",
+        resource_id=tool_name,
+        details={
+            "arguments": tool_args,
+            "auth_tier": ctx.auth_tier.value,
+            "payment_verified": ctx.payment_verified,
+            "session_id": ctx.session_id,
+            "budget_remaining": ctx.budget_remaining,
+            "success": "error" not in result,
+            "execution_latency_ms": _latency_ms,
+        },
+        ip_address=(
+            request.client.host if request.client else None
+        ),
+    ))
+
+    logger.info(
+        "mcp_tool_call",
+        tool=tool_name,
+        agent=ctx.agent_address,
+        auth_tier=ctx.auth_tier.value,
+        session_id=ctx.session_id,
+        budget_remaining=ctx.budget_remaining,
+        success="error" not in result,
+    )
+
+    # 6. Return result with session metadata
+    is_error = "error" in result
+    response_result = {
+        "content": [
+            {
+                "type": "text",
+                "text": _serialize_result(result),
+            }
+        ],
+        "isError": is_error,
+        "x-tripwire-session": {
+            "session_id": ctx.session_id,
+            "budget_remaining": ctx.budget_remaining,
+        },
+    }
+    return JSONResponse(
+        content=_jsonrpc_success(req_id, response_result),
         status_code=200,
     )
 

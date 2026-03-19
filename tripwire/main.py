@@ -233,6 +233,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.info("finality_poller_skipped", enabled=False)
 
+    # Session manager (Keeper-only — Redis-backed session lifecycle)
+    if settings.is_keeper and settings.session_enabled:
+        from tripwire.session.manager import SessionManager
+
+        session_manager = SessionManager(get_redis())
+        await session_manager.register_lua_scripts()
+        app.state.session_manager = session_manager
+        logger.info("session_manager_ready")
+    elif settings.is_keeper and not settings.session_enabled:
+        logger.info("session_manager_skipped", reason="session_enabled is false")
+    elif not settings.is_keeper:
+        logger.info("session_manager_skipped", reason="product_mode does not include keeper")
+
     # Nonce archiver (Keeper-only — daily background task to move old nonces to archive)
     from tripwire.db.archival import NonceArchiver
 
@@ -458,6 +471,11 @@ def create_app() -> FastAPI:
     # Keeper-only routes
     if settings.is_keeper:
         app.include_router(facilitator_router, prefix="/api/v1")
+
+    # Session routes (Keeper-only, feature-flagged)
+    if settings.is_keeper and settings.session_enabled:
+        from tripwire.api.routes.session import router as session_router
+        app.include_router(session_router, prefix="/api/v1")
 
     # Pulse-only routes (placeholder — currently no Pulse-exclusive REST routes)
     # if settings.is_pulse:

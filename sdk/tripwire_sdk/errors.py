@@ -39,3 +39,21 @@ class TripWireValidationError(TripWireError):
 
     def __init__(self, detail: str) -> None:
         super().__init__(status_code=0, detail=detail)
+
+
+class SessionError(TripWireError):
+    """Session operation failed (expired, budget exhausted, not found)."""
+
+    def __init__(self, status_code: int, detail: str, session_id: str | None = None) -> None:
+        super().__init__(status_code, detail)
+        self.session_id = session_id
+
+
+class SessionExpiredError(SessionError):
+    """Session has expired."""
+    pass
+
+
+class BudgetExhaustedError(SessionError):
+    """Session budget is exhausted."""
+    pass

@@ -141,3 +141,22 @@ class PaginatedResponse(TripWireBaseModel):
     data: list[Event]
     cursor: str | None = None
     has_more: bool = False
+
+
+# ── Session ──────────────────────────────────────────────────
+
+class Session(TripWireBaseModel):
+    """Keeper session — pre-funded budget for multiple tool calls."""
+
+    session_id: str
+    wallet_address: str
+    budget_total: int
+    budget_remaining: int
+    budget_currency: str = "USDC"
+    expires_at: str
+    ttl_seconds: int
+    chain_id: int = 8453
+    status: str = "active"
+    created_at: str = ""
+    reputation_score: float = 0.0
+    agent_class: str = "unknown"

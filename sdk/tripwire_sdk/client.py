@@ -17,6 +17,7 @@ from eth_account.signers.local import LocalAccount
 logger = logging.getLogger(__name__)
 
 from tripwire_sdk.errors import (
+    SessionError,
     TripWireAuthError,
     TripWireError,
     TripWireNotFoundError,
@@ -29,6 +30,7 @@ from tripwire_sdk.types import (
     EndpointPolicies,
     Event,
     PaginatedResponse,
+    Session,
     Subscription,
     SubscriptionFilter,
 )
@@ -68,6 +70,7 @@ class TripwireClient:
         self._address: str = self._account.address
         self._enable_x402 = enable_x402
         self._http: httpx.AsyncClient | None = None
+        self._session_id: str | None = None
 
     # ── Properties ─────────────────────────────────────────────
 
@@ -261,6 +264,11 @@ class TripwireClient:
             method=method.upper(),
             body_bytes=body_bytes,
         )
+
+        # Attach session token when a Keeper session is active
+        if self._session_id:
+            auth_headers["X-TripWire-Session"] = self._session_id
+
         try:
             # Send pre-serialized body bytes so the wire payload matches
             # the exact bytes that were hashed for the SIWE signature.
@@ -398,3 +406,45 @@ class TripwireClient:
             "GET", f"/api/v1/endpoints/{endpoint_id}/events", params=params
         )
         return PaginatedResponse(**data)
+
+    # ── Sessions (Keeper) ────────────────────────────────────
+
+    async def open_session(
+        self,
+        budget: int | None = None,
+        ttl_seconds: int | None = None,
+        chain_id: int = 8453,
+    ) -> Session:
+        """Open a pre-funded Keeper session.
+
+        After opening, all subsequent API/MCP calls automatically use
+        the session token instead of per-call x402 payments.
+        """
+        body: dict[str, Any] = {}
+        if budget is not None:
+            body["budget"] = budget
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = ttl_seconds
+        body["chain_id"] = chain_id
+
+        data = await self._request("POST", "/api/v1/auth/session", json=body)
+        session = Session(**data)
+        self._session_id = session.session_id
+        return session
+
+    async def get_session(self, session_id: str | None = None) -> Session:
+        """Get current session status."""
+        sid = session_id or self._session_id
+        if not sid:
+            raise SessionError(0, "No active session")
+        data = await self._request("GET", f"/api/v1/auth/session/{sid}")
+        return Session(**data)
+
+    async def close_session(self, session_id: str | None = None) -> Session:
+        """Close session early. Returns final budget state."""
+        sid = session_id or self._session_id
+        if not sid:
+            raise SessionError(0, "No active session")
+        data = await self._request("DELETE", f"/api/v1/auth/session/{sid}")
+        self._session_id = None
+        return Session(**data)

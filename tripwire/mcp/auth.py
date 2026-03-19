@@ -144,6 +144,92 @@ async def _verify_siwe(request: Request) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Session verification (SESSION tier)
+# ---------------------------------------------------------------------------
+
+
+def _price_to_smallest_units(price: str | None) -> int:
+    """Convert a price string like ``'$0.003'`` to smallest USDC units (6 decimals).
+
+    Examples
+    --------
+    >>> _price_to_smallest_units("$0.003")
+    3000
+    >>> _price_to_smallest_units(None)
+    0
+    >>> _price_to_smallest_units("$1.00")
+    1000000
+    """
+    if not price:
+        return 0
+    return int(float(price.lstrip("$")) * 1_000_000)
+
+
+async def _verify_session(
+    request: Request,
+    tool_def: ToolDef,
+    session_manager,
+) -> MCPAuthContext:
+    """Validate session token, check budget, atomically decrement.
+
+    Parameters
+    ----------
+    request:
+        The incoming FastAPI ``Request`` (carries ``X-TripWire-Session`` header).
+    tool_def:
+        The MCP tool being invoked (carries pricing info).
+    session_manager:
+        A ``SessionManager`` instance for session lifecycle operations.
+
+    Returns
+    -------
+    MCPAuthContext
+        Populated auth context for the SESSION tier.
+
+    Raises
+    ------
+    HTTPException
+        On missing header, session not found, expired, or insufficient budget.
+    """
+    from tripwire.session.manager import (
+        InsufficientBudget,
+        SessionExpired,
+        SessionNotFound,
+    )
+
+    session_id = request.headers.get("X-TripWire-Session")
+    if not session_id:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing X-TripWire-Session header",
+        )
+
+    cost = _price_to_smallest_units(tool_def.price)
+
+    try:
+        session_data = await session_manager.validate_and_decrement(session_id, cost)
+    except SessionNotFound:
+        raise HTTPException(status_code=401, detail="Session not found")
+    except SessionExpired:
+        raise HTTPException(status_code=401, detail="Session expired")
+    except InsufficientBudget:
+        raise HTTPException(
+            status_code=402,
+            detail="Insufficient session budget",
+        )
+
+    return MCPAuthContext(
+        auth_tier=AuthTier.SESSION,
+        agent_address=session_data.wallet_address,
+        reputation_score=session_data.reputation_score,
+        payment_verified=True,
+        payer_address=session_data.wallet_address,
+        session_id=session_id,
+        budget_remaining=session_data.budget_remaining,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API — build_auth_context (PUBLIC + SIWX tiers only)
 # ---------------------------------------------------------------------------
 

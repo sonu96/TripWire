@@ -4,6 +4,9 @@ __version__ = "0.1.0"
 
 from tripwire_sdk.client import TripwireClient
 from tripwire_sdk.errors import (
+    BudgetExhaustedError,
+    SessionError,
+    SessionExpiredError,
     TripWireAuthError,
     TripWireError,
     TripWireNotFoundError,
@@ -19,6 +22,7 @@ from tripwire_sdk.types import (
     Event,
     FinalityData,
     PaginatedResponse,
+    Session,
     Subscription,
     SubscriptionFilter,
     TransferData,
@@ -38,6 +42,9 @@ __all__ = [
     # Client
     "TripwireClient",
     # Errors
+    "BudgetExhaustedError",
+    "SessionError",
+    "SessionExpiredError",
     "TripWireError",
     "TripWireAuthError",
     "TripWireNotFoundError",
@@ -58,6 +65,7 @@ __all__ = [
     "Event",
     "FinalityData",
     "PaginatedResponse",
+    "Session",
     "Subscription",
     "SubscriptionFilter",
     "TransferData",

@@ -11,6 +11,7 @@ class AuthTier(str, Enum):
     """Authentication tier for MCP tools."""
     PUBLIC = "public"   # No auth needed (health, discovery)
     SIWX = "siwx"       # Wallet signature (free, identity-gated)
+    SESSION = "session"  # Pre-funded session with budget
     X402 = "x402"       # Payment required per-call
 
 
@@ -23,6 +24,8 @@ class MCPAuthContext:
     reputation_score: float = 0.0
     payment_verified: bool = False
     payer_address: str | None = None
+    session_id: str | None = None
+    budget_remaining: int | None = None
 
 
 @dataclass

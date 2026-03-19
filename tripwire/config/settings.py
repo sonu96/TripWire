@@ -121,6 +121,13 @@ class Settings(BaseSettings):
     otel_endpoint: str = ""
     otel_service_name: str = "tripwire"
 
+    # Session system (Keeper execution runtime)
+    session_enabled: bool = False
+    session_default_ttl_seconds: int = 900        # 15 min
+    session_max_ttl_seconds: int = 1800           # 30 min
+    session_default_budget_usdc: int = 10_000_000  # 10 USDC (6 decimals)
+    session_max_budget_usdc: int = 100_000_000     # 100 USDC
+
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> "Settings":
         """Ensure critical secrets are set in production."""
