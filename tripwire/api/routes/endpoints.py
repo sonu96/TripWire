@@ -21,6 +21,9 @@ from tripwire.types.models import (
 )
 from tripwire.observability.audit import fire_and_forget
 from tripwire.webhook.provider import WebhookProvider
+from tripwire.db.repositories.quotas import check_endpoint_quota
+from tripwire.cache import RedisCache
+from tripwire.api.redis import get_redis
 
 logger = structlog.get_logger(__name__)
 
@@ -75,6 +78,9 @@ async def register_endpoint(
     Also creates a corresponding Convoy application and endpoint so that
     webhook delivery is ready as soon as the endpoint is registered.
     """
+    # Quota check before creating endpoint
+    await check_endpoint_quota(sb, wallet.wallet_address)
+
     now = datetime.now(timezone.utc).isoformat()
     endpoint_id = nanoid(size=21)
 
@@ -149,6 +155,13 @@ async def register_endpoint(
             )
         except Exception:
             logger.exception("webhook_provider_setup_failed", endpoint_id=endpoint_id)
+
+    # Invalidate endpoint cache
+    try:
+        cache = RedisCache(get_redis(), prefix="tripwire:cache", default_ttl=30)
+        await cache.invalidate_pattern("endpoints:*")
+    except Exception:
+        logger.debug("endpoint_cache_invalidation_failed")
 
     fire_and_forget(request.app.state.audit_logger.log(
         action="endpoint.created",
@@ -226,6 +239,14 @@ async def update_endpoint(
     updates["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     result = sb.table("endpoints").update(updates).eq("id", endpoint_id).execute()
+
+    # Invalidate endpoint cache
+    try:
+        cache = RedisCache(get_redis(), prefix="tripwire:cache", default_ttl=30)
+        await cache.invalidate_pattern("endpoints:*")
+    except Exception:
+        logger.debug("endpoint_cache_invalidation_failed")
+
     fire_and_forget(request.app.state.audit_logger.log(
         action="endpoint.updated",
         actor=wallet_auth.wallet_address,
@@ -257,6 +278,14 @@ async def deactivate_endpoint(
         "active": False,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", endpoint_id).execute()
+
+    # Invalidate endpoint cache
+    try:
+        cache = RedisCache(get_redis(), prefix="tripwire:cache", default_ttl=30)
+        await cache.invalidate_pattern("endpoints:*")
+    except Exception:
+        logger.debug("endpoint_cache_invalidation_failed")
+
     fire_and_forget(request.app.state.audit_logger.log(
         action="endpoint.deleted",
         actor=wallet_auth.wallet_address,

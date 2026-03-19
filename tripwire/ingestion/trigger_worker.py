@@ -20,6 +20,7 @@ import structlog
 
 from tripwire.ingestion import event_bus
 from tripwire.api.redis import get_redis as _get_redis
+from tripwire.cache import RedisCache
 from tripwire.db.repositories.triggers import TriggerRepository
 from tripwire.types.models import Trigger
 
@@ -48,6 +49,8 @@ class TriggerIndex:
     """In-memory index for O(1) trigger lookup by topic0 (event_signature).
 
     Periodically refreshes from the database via TriggerRepository.
+    Uses a Redis-backed cache for multi-instance consistency with
+    in-memory fallback when Redis is unavailable.
     Shared across all workers in a pool.
     """
 
@@ -57,6 +60,11 @@ class TriggerIndex:
         self._last_refresh: float = 0.0
         self._refresh_interval: float = 10.0
         self._refresh_lock = asyncio.Lock()
+        # Redis-backed shared cache for cross-instance trigger lookups
+        try:
+            self._cache = RedisCache(_get_redis(), prefix="tripwire:triggers", default_ttl=10)
+        except Exception:
+            self._cache = RedisCache(None, prefix="tripwire:triggers", default_ttl=10)
 
     async def refresh(self) -> None:
         """Load all active triggers and rebuild the topic0 index."""
@@ -77,6 +85,14 @@ class TriggerIndex:
         self._index = new_index
         self._last_refresh = time.monotonic()
 
+        # Write each topic's triggers to Redis for cross-instance visibility
+        for topic_key, topic_triggers in new_index.items():
+            try:
+                serializable = [t.model_dump() for t in topic_triggers]
+                await self._cache.set(f"topic:{topic_key}", serializable, ttl=15)
+            except Exception:
+                logger.debug("trigger_cache_set_failed", topic=topic_key)
+
         logger.info(
             "trigger_index_refreshed",
             total_triggers=len(triggers),
@@ -86,6 +102,31 @@ class TriggerIndex:
     def match(self, topic0: str) -> list[Trigger]:
         """O(1) lookup of triggers matching a topic0 hash."""
         return self._index.get(topic0.lower(), [])
+
+    async def match_with_cache(self, topic0: str) -> list[Trigger]:
+        """Lookup triggers by topic0 with Redis cache fallback.
+
+        Checks in-memory index first, then falls back to Redis cache
+        for cross-instance consistency.
+        """
+        key = topic0.lower()
+        # In-memory first (fast path)
+        result = self._index.get(key)
+        if result:
+            return result
+
+        # Redis cache fallback (cross-instance)
+        try:
+            cached = await self._cache.get(f"topic:{key}")
+            if cached:
+                triggers = [Trigger(**t) if isinstance(t, dict) else t for t in cached]
+                # Populate in-memory index for subsequent lookups
+                self._index[key] = triggers
+                return triggers
+        except Exception:
+            logger.debug("trigger_cache_get_failed", topic=key)
+
+        return []
 
     async def maybe_refresh(self) -> None:
         """Refresh the index if it is stale (older than _refresh_interval).

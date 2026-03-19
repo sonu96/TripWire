@@ -60,6 +60,8 @@ from tripwire.ingestion.filter_engine import evaluate_filters
 from tripwire.ingestion.decoders import ERC3009Decoder, AbiGenericDecoder
 from tripwire.ingestion.decoders.protocol import DecodedEvent
 from tripwire.config.settings import settings
+from tripwire.cache import RedisCache
+from tripwire.api.redis import get_redis
 
 # Handler imports
 from tripwire.ingestion.handlers.base import EventHandler
@@ -130,6 +132,11 @@ class EventProcessor:
         self._sb = supabase_client or getattr(endpoint_repo, "_sb", None)
         self._trigger_repo = trigger_repo
         self._handlers = handlers if handlers is not None else list(_DEFAULT_HANDLERS)
+        # Redis-backed shared cache for multi-instance endpoint lookups
+        try:
+            self._endpoint_cache = RedisCache(get_redis(), prefix="tripwire:cache", default_ttl=30)
+        except Exception:
+            self._endpoint_cache = RedisCache(None, prefix="tripwire:cache", default_ttl=30)
 
     # ── Public entry point ────────────────────────────────────────
 
@@ -573,7 +580,7 @@ class EventProcessor:
 
         # 5. Match endpoints for this transfer's recipient + chain
         try:
-            endpoints = await asyncio.to_thread(self._fetch_matching_endpoints, transfer)
+            endpoints = await self._fetch_matching_endpoints_async(transfer)
         except Exception:
             logger.exception("endpoint_fetch_failed", tx_hash=tx_hash)
             return {"status": "error", "reason": "endpoint_fetch_failed", "tx_hash": tx_hash}
@@ -804,11 +811,37 @@ class EventProcessor:
 
     # ── Internal helpers ────────────────────────────────────────
 
-    def _fetch_matching_endpoints(self, transfer) -> list[Endpoint]:
+    async def _fetch_matching_endpoints_async(self, transfer) -> list[Endpoint]:
         """Fetch active endpoints whose recipient matches the transfer.
 
-        Uses an in-memory TTL cache to avoid hitting Supabase on every event.
-        Endpoints change rarely (only at registration time).
+        Uses a Redis-backed shared cache with in-memory fallback for
+        multi-instance consistency. Falls back to DB on cache miss.
+        """
+        cache_key = f"endpoints:{transfer.to_address.lower()}"
+        cached = await self._endpoint_cache.get(cache_key)
+        if cached is not None:
+            # Reconstruct Endpoint objects from cached dicts
+            try:
+                return [Endpoint(**ep) if isinstance(ep, dict) else ep for ep in cached]
+            except Exception:
+                logger.debug("endpoint_cache_deserialize_failed", cache_key=cache_key)
+
+        endpoints = await asyncio.to_thread(
+            self._endpoint_repo.list_by_recipient, transfer.to_address
+        )
+        # Cache as serializable dicts
+        try:
+            serializable = [ep.model_dump() for ep in endpoints]
+            await self._endpoint_cache.set(cache_key, serializable, ttl=ENDPOINT_CACHE_TTL)
+        except Exception:
+            logger.debug("endpoint_cache_set_failed", cache_key=cache_key)
+        return endpoints
+
+    def _fetch_matching_endpoints(self, transfer) -> list[Endpoint]:
+        """Sync fallback for endpoint fetching (uses in-memory cache only).
+
+        Kept for backward compatibility with code that calls this synchronously.
+        The async version ``_fetch_matching_endpoints_async`` is preferred.
         """
         cache_key = transfer.to_address.lower()
         now = time.monotonic()

@@ -158,6 +158,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.processor = processor
     logger.info("event_processor_ready")
 
+    # Shared Redis-backed cache (multi-instance consistency)
+    from tripwire.cache import RedisCache
+    try:
+        shared_cache = RedisCache(get_redis(), prefix="tripwire", default_ttl=30)
+        app.state.shared_cache = shared_cache
+        logger.info("shared_cache_ready")
+    except Exception:
+        app.state.shared_cache = RedisCache(None, prefix="tripwire", default_ttl=30)
+        logger.warning("shared_cache_fallback_to_local")
+
     # ── Event Bus: Trigger Worker Pool (Pulse-only) ─────────────
     redis_dlq_consumer = None
     if settings.is_pulse and settings.event_bus_enabled:

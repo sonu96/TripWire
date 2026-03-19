@@ -125,6 +125,10 @@ class Settings(BaseSettings):
     otel_endpoint: str = ""
     otel_service_name: str = "tripwire"
 
+    # Resource quotas
+    max_triggers_per_wallet: int = 50
+    max_endpoints_per_wallet: int = 20
+
     # Session system (Keeper execution runtime)
     session_enabled: bool = False
     session_default_ttl_seconds: int = 900        # 15 min

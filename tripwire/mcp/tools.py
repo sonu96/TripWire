@@ -23,8 +23,16 @@ from tripwire.db.repositories.triggers import (
 )
 from tripwire.types.models import EndpointMode, EndpointPolicies, execution_state_from_status
 from tripwire.utils.topic import compute_topic0
+from tripwire.db.repositories.quotas import check_endpoint_quota, check_trigger_quota
+from tripwire.cache import RedisCache
+from tripwire.api.redis import get_redis
 
 logger = structlog.get_logger(__name__)
+
+
+def _get_shared_cache(prefix: str) -> RedisCache:
+    """Return a RedisCache instance for the given prefix."""
+    return RedisCache(get_redis(), prefix=prefix, default_ttl=30)
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -69,6 +77,11 @@ async def register_middleware(
     policies: dict = params.get("policies", {})
     template_slugs: list[str] = params.get("template_slugs", [])
     custom_triggers: list[dict] = params.get("custom_triggers", [])
+
+    # Quota checks before creating resources
+    await check_endpoint_quota(supabase, ctx.agent_address)
+    if template_slugs or custom_triggers:
+        await check_trigger_quota(supabase, ctx.agent_address)
 
     # Create the endpoint
     now = _now_iso()
@@ -165,6 +178,16 @@ async def register_middleware(
             event_signature=ct["event_signature"],
         )
 
+    # Invalidate shared caches after creating endpoint and triggers
+    try:
+        cache = _get_shared_cache("tripwire:cache")
+        await cache.invalidate_pattern("endpoints:*")
+        if trigger_ids:
+            trigger_cache = _get_shared_cache("tripwire:triggers")
+            await trigger_cache.invalidate_pattern("topic:*")
+    except Exception:
+        logger.debug("mcp_cache_invalidation_failed")
+
     return {
         "endpoint_id": endpoint_id,
         "webhook_secret": webhook_secret,
@@ -182,6 +205,10 @@ async def create_trigger(
 ) -> dict:
     """Create a custom trigger for an existing endpoint."""
     endpoint_repo, trigger_repo, _, _ = _repos(repos)
+    supabase = repos["supabase"]
+
+    # Quota check before creating trigger
+    await check_trigger_quota(supabase, ctx.agent_address)
 
     endpoint_id: str = params["endpoint_id"]
     endpoint = endpoint_repo.get_by_id(endpoint_id)
@@ -219,6 +246,13 @@ async def create_trigger(
         agent=ctx.agent_address,
         endpoint_id=endpoint_id,
     )
+
+    # Invalidate trigger cache
+    try:
+        cache = _get_shared_cache("tripwire:triggers")
+        await cache.invalidate_pattern("topic:*")
+    except Exception:
+        logger.debug("mcp_cache_invalidation_failed")
 
     return {
         "trigger_id": trigger.id,
@@ -283,6 +317,13 @@ async def delete_trigger(
         agent=ctx.agent_address,
     )
 
+    # Invalidate trigger cache
+    try:
+        cache = _get_shared_cache("tripwire:triggers")
+        await cache.invalidate_pattern("topic:*")
+    except Exception:
+        logger.debug("mcp_cache_invalidation_failed")
+
     return {"trigger_id": trigger_id, "active": False}
 
 
@@ -325,6 +366,10 @@ async def activate_template(
 ) -> dict:
     """Instantiate a template with custom params for an endpoint."""
     endpoint_repo, trigger_repo, template_repo, _ = _repos(repos)
+    supabase = repos["supabase"]
+
+    # Quota check before creating trigger from template
+    await check_trigger_quota(supabase, ctx.agent_address)
 
     slug: str = params["slug"]
     endpoint_id: str = params["endpoint_id"]
@@ -389,6 +434,13 @@ async def activate_template(
         endpoint_id=endpoint_id,
         agent=ctx.agent_address,
     )
+
+    # Invalidate trigger cache
+    try:
+        cache = _get_shared_cache("tripwire:triggers")
+        await cache.invalidate_pattern("topic:*")
+    except Exception:
+        logger.debug("mcp_cache_invalidation_failed")
 
     return {
         "trigger_id": trigger.id,
