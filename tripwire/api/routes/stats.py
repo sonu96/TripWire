@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from tripwire.api import get_supabase
 from tripwire.api.auth import require_wallet_auth, WalletAuthContext
 from tripwire.api.ratelimit import CRUD_LIMIT, limiter
+from tripwire.config.settings import settings
 from tripwire.types.models import execution_state_from_status
 
 logger = structlog.get_logger(__name__)
@@ -122,6 +123,9 @@ async def get_stats(
         "active_endpoints": active_endpoints,
         "last_event_at": last_event_at,
         "execution_state_breakdown": execution_state_breakdown,
+        "product_mode": settings.product_mode,
+        "pulse_active": settings.is_pulse,
+        "keeper_active": settings.is_keeper,
     }
 
 

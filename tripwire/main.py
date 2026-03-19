@@ -85,6 +85,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         version=__version__,
         env=settings.app_env,
         port=settings.app_port,
+        product_mode=settings.product_mode,
+        is_pulse=settings.is_pulse,
+        is_keeper=settings.is_keeper,
     )
 
     # Optional OpenTelemetry distributed tracing (must be early so all spans are captured)
@@ -155,9 +158,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.processor = processor
     logger.info("event_processor_ready")
 
-    # ── Event Bus: Trigger Worker Pool ────────────────────────
+    # ── Event Bus: Trigger Worker Pool (Pulse-only) ─────────────
     redis_dlq_consumer = None
-    if settings.event_bus_enabled:
+    if settings.is_pulse and settings.event_bus_enabled:
         from tripwire.ingestion.event_bus import init_stream_keys
         from tripwire.ingestion.trigger_worker import WorkerPool
         from tripwire.ingestion.dlq_consumer import RedisDLQConsumer
@@ -188,10 +191,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("redis_dlq_consumer_ready")
         except Exception:
             logger.exception("redis_dlq_consumer_start_failed")
+    elif not settings.is_pulse and settings.event_bus_enabled:
+        logger.info("event_bus_skipped", reason="product_mode does not include pulse")
 
-    # Dead Letter Queue handler (background poller for failed Convoy deliveries)
+    # Dead Letter Queue handler (Keeper-only — background poller for failed Convoy deliveries)
     dlq_handler: DLQHandler | None = None
-    if settings.dlq_enabled and settings.convoy_api_key.get_secret_value():
+    if settings.is_keeper and settings.dlq_enabled and settings.convoy_api_key.get_secret_value():
         dlq_handler = DLQHandler(
             endpoint_repo=endpoint_repo,
             delivery_repo=delivery_repo,
@@ -200,6 +205,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await dlq_handler.start()
         app.state.dlq_handler = dlq_handler
         logger.info("dlq_handler_ready")
+    elif not settings.is_keeper:
+        logger.info("dlq_handler_skipped", reason="product_mode does not include keeper")
     else:
         logger.info(
             "dlq_handler_skipped",
@@ -207,9 +214,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             convoy_configured=bool(settings.convoy_api_key.get_secret_value()),
         )
 
-    # Finality poller (background task for confirming pending events & reorg detection)
+    # Finality poller (Keeper-only — background task for confirming pending events & reorg detection)
     finality_poller: FinalityPoller | None = None
-    if settings.finality_poller_enabled:
+    if settings.is_keeper and settings.finality_poller_enabled:
         finality_poller = FinalityPoller(
             event_repo=event_repo,
             endpoint_repo=endpoint_repo,
@@ -221,20 +228,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await finality_poller.start()
         app.state.finality_poller = finality_poller
         logger.info("finality_poller_ready")
+    elif not settings.is_keeper:
+        logger.info("finality_poller_skipped", reason="product_mode does not include keeper")
     else:
         logger.info("finality_poller_skipped", enabled=False)
 
-    # Nonce archiver (daily background task to move old nonces to archive)
+    # Nonce archiver (Keeper-only — daily background task to move old nonces to archive)
     from tripwire.db.archival import NonceArchiver
 
     nonce_archiver: NonceArchiver | None = None
-    try:
-        nonce_archiver = NonceArchiver(supabase)
-        await nonce_archiver.start()
-        app.state.nonce_archiver = nonce_archiver
-        logger.info("nonce_archiver_ready")
-    except Exception:
-        logger.exception("nonce_archiver_start_failed")
+    if settings.is_keeper:
+        try:
+            nonce_archiver = NonceArchiver(supabase)
+            await nonce_archiver.start()
+            app.state.nonce_archiver = nonce_archiver
+            logger.info("nonce_archiver_ready")
+        except Exception:
+            logger.exception("nonce_archiver_start_failed")
+    else:
+        logger.info("nonce_archiver_skipped", reason="product_mode does not include keeper")
 
     # Set Prometheus build info
     tripwire_build_info.info({"version": __version__, "env": settings.app_env})
@@ -368,8 +380,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # x402 payment gating (only enabled when treasury address is configured)
-    if settings.tripwire_treasury_address:
+    # x402 payment gating (Keeper-only — only enabled when treasury address is configured)
+    if settings.is_keeper and settings.tripwire_treasury_address:
         try:
             from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
             from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -410,6 +422,8 @@ def create_app() -> FastAPI:
                 "x402_payment_gating_unavailable",
                 reason="x402 package not installed; run: pip install x402[fastapi,evm]",
             )
+    elif not settings.is_keeper:
+        logger.info("x402_payment_gating_skipped", reason="product_mode does not include keeper")
     else:
         logger.warning("x402_payment_gating_disabled", reason="tripwire_treasury_address is empty")
 
@@ -431,16 +445,23 @@ def create_app() -> FastAPI:
             content={"detail": "Internal server error"},
         )
 
-    # Mount route groups
+    # Mount route groups — shared routes (always mounted)
     app.include_router(auth_router)
     app.include_router(deliveries_router, prefix="/api/v1")
     app.include_router(endpoints_router, prefix="/api/v1")
     app.include_router(subscriptions_router, prefix="/api/v1")
     app.include_router(events_router, prefix="/api/v1")
     app.include_router(ingest_router, prefix="/api/v1")
-    app.include_router(facilitator_router, prefix="/api/v1")
     app.include_router(stats_router, prefix="/api/v1")
     app.include_router(well_known_router)
+
+    # Keeper-only routes
+    if settings.is_keeper:
+        app.include_router(facilitator_router, prefix="/api/v1")
+
+    # Pulse-only routes (placeholder — currently no Pulse-exclusive REST routes)
+    # if settings.is_pulse:
+    #     pass
 
     # ── MCP server (Model Context Protocol for AI agents) ───────
     mcp_sub_app = create_mcp_app()

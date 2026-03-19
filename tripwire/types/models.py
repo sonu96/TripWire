@@ -1,10 +1,16 @@
 """Shared Pydantic models for TripWire."""
 
+from __future__ import annotations
+
+import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+if TYPE_CHECKING:
+    from tripwire.ingestion.decoders.protocol import DecodedEvent
 
 
 # ── Reusable Types ─────────────────────────────────────────────
@@ -93,6 +99,13 @@ class EndpointMode(str, Enum):
     EXECUTE = "execute"
 
 
+class ProductMode(str, Enum):
+    """Product mode — Pulse (generic triggers), Keeper (payment monitoring), or both."""
+    PULSE = "pulse"
+    KEEPER = "keeper"
+    BOTH = "both"
+
+
 class EndpointPolicies(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
@@ -158,12 +171,18 @@ class TrustSource(str, Enum):
 
 
 class WebhookEventType(str, Enum):
+    # Keeper (payment) event types
     PAYMENT_CONFIRMED = "payment.confirmed"
     PAYMENT_PENDING = "payment.pending"
     PAYMENT_PRE_CONFIRMED = "payment.pre_confirmed"
     PAYMENT_FAILED = "payment.failed"
     PAYMENT_REORGED = "payment.reorged"
     PAYMENT_FINALIZED = "payment.finalized"
+
+    # Pulse (generic trigger) event types
+    TRIGGER_MATCHED = "trigger.matched"
+    TRIGGER_CONFIRMED = "trigger.confirmed"
+    TRIGGER_FINALIZED = "trigger.finalized"
 
 
 class TransferData(BaseModel):
@@ -222,19 +241,25 @@ def derive_execution_metadata(
     Returns a nested ExecutionBlock per TWSS-1 Section 7.2.
 
     Mapping:
-    - PRE_CONFIRMED → provisional, false, facilitator
-    - REORGED/FAILED → reorged, false, onchain
-    - PAYMENT_FINALIZED or finality.is_finalized → finalized, true, onchain
-    - else → confirmed, false, onchain
+    - PRE_CONFIRMED -> provisional, false, facilitator
+    - REORGED/FAILED -> reorged, false, onchain
+    - PAYMENT_FINALIZED / TRIGGER_FINALIZED or finality.is_finalized -> finalized, true, onchain
+    - TRIGGER_MATCHED -> confirmed, false, onchain  (initial match, not yet final)
+    - TRIGGER_CONFIRMED -> confirmed, false, onchain
+    - else -> confirmed, false, onchain
     """
     if event_type == WebhookEventType.PAYMENT_PRE_CONFIRMED:
         state, safe, trust = ExecutionState.PROVISIONAL, False, TrustSource.FACILITATOR
     elif event_type in (WebhookEventType.PAYMENT_REORGED, WebhookEventType.PAYMENT_FAILED):
         state, safe, trust = ExecutionState.REORGED, False, TrustSource.ONCHAIN
-    elif event_type == WebhookEventType.PAYMENT_FINALIZED:
+    elif event_type in (WebhookEventType.PAYMENT_FINALIZED, WebhookEventType.TRIGGER_FINALIZED):
         state, safe, trust = ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
     elif finality is not None and finality.is_finalized:
         state, safe, trust = ExecutionState.FINALIZED, True, TrustSource.ONCHAIN
+    elif event_type == WebhookEventType.TRIGGER_MATCHED:
+        state, safe, trust = ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN
+    elif event_type == WebhookEventType.TRIGGER_CONFIRMED:
+        state, safe, trust = ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN
     else:
         state, safe, trust = ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN
 
@@ -268,10 +293,75 @@ def execution_state_from_status(
     )
 
 
-class WebhookData(BaseModel):
-    transfer: TransferData
-    finality: FinalityData | None = None
+# ── Event-Neutral Data Model (v2) ─────────────────────────────
+#
+# OnchainEvent is the product-neutral base for any onchain event.
+# PaymentEvent extends it for Keeper (x402 / ERC-3009 payments).
+# TriggerEvent extends it for Pulse (generic trigger-matched events).
+
+
+class OnchainEvent(BaseModel):
+    """Base event model — product-neutral. Any onchain event."""
+    event_id: str
+    event_type: str                    # e.g. "erc3009.transfer", "uniswap.swap", "aave.liquidation"
+    chain_id: int
+    tx_hash: str
+    block_number: int
+    block_hash: str = ""
+    log_index: int = 0
+    contract_address: str
+    topic0: str
+    decoded_fields: dict[str, Any]     # Generic decoded event data
+    timestamp: int
+    execution: ExecutionBlock          # Universal — provisional/confirmed/finalized
     identity: AgentIdentity | None = None
+    source: str = "onchain"            # "onchain", "facilitator", "manual"
+
+
+class PaymentData(BaseModel):
+    """Payment-specific fields for x402/ERC-3009 events."""
+    amount: str                        # Smallest unit (USDC = 6 decimals)
+    token: str                         # Token contract address
+    from_address: str
+    to_address: str
+    nonce: str = ""                    # ERC-3009 nonce
+    authorizer: str = ""               # ERC-3009 authorizer
+
+
+class PaymentEvent(OnchainEvent):
+    """Payment event — extends OnchainEvent with payment-specific data."""
+    event_type: str = "erc3009.transfer"
+    payment: PaymentData
+
+
+class TriggerEvent(OnchainEvent):
+    """Trigger-matched event — extends OnchainEvent with trigger context."""
+    trigger_id: str
+    trigger_name: str = ""
+    filter_matched: bool = True
+
+
+# ── Webhook Payload (v1 + v2) ─────────────────────────────────
+#
+# WebhookData supports both v1 (transfer-centric) and v2 (event-neutral)
+# formats.  The `transfer` field is preserved for Keeper backward
+# compatibility; the `event` field carries the new OnchainEvent hierarchy.
+
+
+class WebhookData(BaseModel):
+    """Webhook data — supports both v1 (transfer) and v2 (event) formats.
+
+    v1 payloads: ``transfer`` is set, ``event`` is None.
+    v2 payloads: ``event`` is always set; ``transfer`` may also be set
+    for Keeper backward compat.
+
+    ``event`` accepts ``OnchainEvent.model_dump()`` output or raw event
+    field dicts for Pulse (non-payment) events.
+    """
+    event: dict[str, Any] | None = None  # v2: event-neutral payload (model_dump()'d)
+    transfer: TransferData | None = None  # v1/backward compat for Keeper
+    finality: FinalityData | None = None
+    identity: AgentIdentity | dict | None = None
 
 
 class WebhookPayload(BaseModel):
@@ -283,6 +373,8 @@ class WebhookPayload(BaseModel):
     version: str = "v1"
     execution: ExecutionBlock
     data: WebhookData
+    # Optional trigger metadata for Pulse events
+    trigger_id: str | None = None
 
 
 # ── Subscription (Notify Mode) ────────────────────────────────
@@ -366,3 +458,109 @@ class TriggerTemplate(BaseModel):
     install_count: int = 0
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+# ── Conversion Helpers ────────────────────────────────────────
+#
+# Bridge legacy types (ERC3009Transfer, DecodedEvent) to the new
+# event-neutral OnchainEvent / PaymentEvent hierarchy.
+
+
+# ERC-3009 events emit a standard ERC-20 Transfer event onchain.
+# topic0 = keccak256("Transfer(address,address,uint256)")
+# This is the same constant as TRANSFER_TOPIC in tripwire/ingestion/decoder.py.
+_ERC3009_TOPIC0 = (
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f1"
+    "63c4a11628f55a4df523b3ef"
+)
+
+
+def erc3009_to_onchain_event(
+    transfer: ERC3009Transfer,
+    execution: ExecutionBlock,
+    identity: AgentIdentity | None = None,
+    event_id: str | None = None,
+) -> PaymentEvent:
+    """Convert a legacy ERC3009Transfer to the new PaymentEvent model.
+
+    This bridges the Keeper-era ERC3009Transfer into the event-neutral
+    PaymentEvent so that downstream code can work with a single type.
+    """
+    return PaymentEvent(
+        event_id=event_id or str(uuid.uuid4()),
+        event_type="erc3009.transfer",
+        chain_id=int(transfer.chain_id),
+        tx_hash=transfer.tx_hash,
+        block_number=transfer.block_number,
+        block_hash=transfer.block_hash,
+        log_index=transfer.log_index,
+        contract_address=transfer.token,
+        topic0=_ERC3009_TOPIC0,
+        decoded_fields={
+            "from": transfer.from_address,
+            "to": transfer.to_address,
+            "value": transfer.value,
+            "validAfter": transfer.valid_after,
+            "validBefore": transfer.valid_before,
+            "nonce": transfer.nonce,
+            "authorizer": transfer.authorizer,
+        },
+        timestamp=transfer.timestamp,
+        execution=execution,
+        identity=identity,
+        source="onchain",
+        payment=PaymentData(
+            amount=transfer.value,
+            token=transfer.token,
+            from_address=transfer.from_address,
+            to_address=transfer.to_address,
+            nonce=transfer.nonce,
+            authorizer=transfer.authorizer,
+        ),
+    )
+
+
+def decoded_event_to_onchain_event(
+    decoded: DecodedEvent,
+    execution: ExecutionBlock,
+    timestamp: int = 0,
+    identity: AgentIdentity | None = None,
+    event_id: str | None = None,
+    source: str = "onchain",
+) -> OnchainEvent:
+    """Convert a DecodedEvent to the new OnchainEvent model.
+
+    If the decoded event carries payment metadata (payment_amount is set),
+    a PaymentEvent is returned instead of a plain OnchainEvent.
+    """
+    common = dict(
+        event_id=event_id or str(uuid.uuid4()),
+        event_type=f"decoded.{decoded.decoder_name}",
+        chain_id=decoded.chain_id or 0,
+        tx_hash=decoded.tx_hash,
+        block_number=decoded.block_number,
+        block_hash=decoded.block_hash,
+        log_index=decoded.log_index,
+        contract_address=decoded.contract_address,
+        topic0=decoded.topic0,
+        decoded_fields=decoded.fields,
+        timestamp=timestamp,
+        execution=execution,
+        identity=identity,
+        source=source,
+    )
+
+    # If the decoded event contains payment metadata, produce a PaymentEvent.
+    if decoded.payment_amount is not None:
+        common["event_type"] = f"payment.{decoded.decoder_name}"
+        return PaymentEvent(
+            **common,
+            payment=PaymentData(
+                amount=decoded.payment_amount,
+                token=decoded.payment_token or "",
+                from_address=decoded.payment_from or "",
+                to_address=decoded.payment_to or "",
+            ),
+        )
+
+    return OnchainEvent(**common)

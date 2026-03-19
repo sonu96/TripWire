@@ -11,8 +11,13 @@ from tripwire.webhook.convoy_client import (
 )
 from tripwire.webhook.dispatcher import (
     dispatch_event,
+    dispatch_generic_event,
     match_endpoints,
     match_subscriptions,
+)
+from tripwire.webhook.payload import (
+    build_generic_payload,
+    build_payment_payload,
 )
 from tripwire.webhook.provider import (
     ConvoyProvider,
@@ -41,8 +46,12 @@ __all__ = [
     "DLQHandler",
     # Dispatcher
     "dispatch_event",
+    "dispatch_generic_event",
     "match_endpoints",
     "match_subscriptions",
+    # Payload builders
+    "build_generic_payload",
+    "build_payment_payload",
     # Verification
     "verify_webhook",
 ]

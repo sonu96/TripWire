@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import structlog
 from supabase import Client
@@ -17,8 +18,12 @@ from tripwire.types.models import (
     AgentIdentity,
     ERC3009Transfer,
     Endpoint,
+    ExecutionBlock,
+    ExecutionState,
+    FinalityData,
     FinalityStatus,
     TransferData,
+    TrustSource,
     WebhookEventType,
     build_finality_data,
     derive_execution_metadata,
@@ -158,3 +163,99 @@ class RealtimeNotifier:
             )
 
         return event_ids
+
+    # ── Generic (Pulse) notification ─────────────────────────────────
+
+    async def notify_generic(
+        self,
+        event: dict[str, Any],
+        endpoint_ids: list[str],
+        execution_block: dict[str, Any] | None = None,
+        identity_data: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Notify subscribed clients of a generic onchain event (Pulse).
+
+        Inserts into the same ``realtime_events`` table but with an
+        event-neutral payload structure. The ``data`` column contains the
+        full event dict under a ``"event"`` key rather than ``"transfer"``.
+
+        Parameters
+        ----------
+        event:
+            OnchainEvent-shaped dict. Should contain at least ``"event_id"``
+            (or ``"id"``), ``"event_type"``, and ``"chain_id"``.
+        endpoint_ids:
+            List of endpoint IDs to notify.
+        execution_block:
+            Optional pre-built execution metadata dict. If ``None``, defaults
+            to confirmed/not-safe.
+        identity_data:
+            Optional identity dict (AgentIdentity-shaped) for enrichment.
+
+        Returns
+        -------
+        list[str]
+            List of generated event IDs (one per endpoint).
+        """
+        if not endpoint_ids:
+            return []
+
+        event_type_str = event.get("event_type", "trigger.matched")
+        chain_id = event.get("chain_id")
+        tx_hash = event.get("tx_hash", "")
+        contract_address = event.get("contract_address", "")
+
+        # Build execution block
+        if execution_block is not None:
+            exec_data = execution_block
+        else:
+            exec_data = {
+                "state": ExecutionState.CONFIRMED.value,
+                "safe_to_execute": False,
+                "trust_source": TrustSource.ONCHAIN.value,
+                "finality": None,
+            }
+
+        data: dict[str, Any] = {
+            "event": event,
+            "timestamp": int(time.time()),
+            "version": "v1",
+            "execution": exec_data,
+        }
+        if identity_data is not None:
+            data["identity"] = identity_data
+
+        now = datetime.now(timezone.utc).isoformat()
+        rows: list[dict[str, Any]] = []
+        generated_ids: list[str] = []
+
+        for ep_id in endpoint_ids:
+            event_id = str(uuid.uuid4())
+            generated_ids.append(event_id)
+            rows.append({
+                "id": event_id,
+                "endpoint_id": ep_id,
+                "type": event_type_str,
+                "data": data,
+                "chain_id": chain_id,
+                "recipient": contract_address,
+                "created_at": now,
+            })
+
+        try:
+            self._sb.table("realtime_events").insert(rows).execute()
+            logger.info(
+                "realtime_generic_events_inserted",
+                count=len(rows),
+                event_type=event_type_str,
+                tx_hash=tx_hash,
+            )
+        except Exception:
+            logger.exception(
+                "realtime_generic_events_insert_failed",
+                count=len(rows),
+                event_type=event_type_str,
+                tx_hash=tx_hash,
+            )
+
+        return generated_ids

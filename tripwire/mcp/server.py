@@ -25,6 +25,7 @@ from tripwire.db.repositories.triggers import (
 )
 from tripwire.observability.audit import AuditLogger, fire_and_forget
 
+from tripwire.config.settings import settings
 from tripwire.mcp.types import AuthTier, MCPAuthContext, ToolDef
 from tripwire.mcp.auth import (
     build_auth_context,
@@ -50,6 +51,7 @@ def _register(
     auth_tier: AuthTier = AuthTier.SIWX,
     price: str | None = None,
     min_reputation: float = 0.0,
+    product: str = "both",
 ) -> None:
     TOOLS[name] = ToolDef(
         name=name,
@@ -59,6 +61,7 @@ def _register(
         auth_tier=auth_tier,
         price=price,
         min_reputation=min_reputation,
+        product=product,
     )
 
 
@@ -129,6 +132,7 @@ _register(
     auth_tier=AuthTier.X402,
     price="$0.003",
     min_reputation=10.0,
+    product="keeper",
 )
 
 _register(
@@ -166,6 +170,7 @@ _register(
     auth_tier=AuthTier.X402,
     price="$0.003",
     min_reputation=10.0,
+    product="pulse",
 )
 
 _register(
@@ -183,6 +188,7 @@ _register(
     },
     handler=tool_handlers.list_triggers,
     auth_tier=AuthTier.SIWX,
+    product="pulse",
 )
 
 _register(
@@ -197,6 +203,7 @@ _register(
     },
     handler=tool_handlers.delete_trigger,
     auth_tier=AuthTier.SIWX,
+    product="pulse",
 )
 
 _register(
@@ -213,6 +220,7 @@ _register(
     },
     handler=tool_handlers.list_templates,
     auth_tier=AuthTier.SIWX,
+    product="pulse",
 )
 
 _register(
@@ -234,6 +242,7 @@ _register(
     auth_tier=AuthTier.X402,
     price="$0.001",
     min_reputation=10.0,
+    product="pulse",
 )
 
 _register(
@@ -248,6 +257,7 @@ _register(
     },
     handler=tool_handlers.get_trigger_status,
     auth_tier=AuthTier.SIWX,
+    product="pulse",
 )
 
 _register(
@@ -359,8 +369,18 @@ def create_mcp_app() -> FastAPI:
 
         # ── Handle tools/list (PUBLIC) ──────────────────────
         if method == "tools/list":
+            # Filter tools by active product mode.
+            # td.product is a string that matches ProductMode enum values
+            # ("pulse", "keeper", "both"). Since ProductMode(str, Enum)
+            # compares equal to its string value, this works with both.
+            visible_tools = {
+                name: td for name, td in TOOLS.items()
+                if td.product == "both"
+                or (td.product == "pulse" and settings.is_pulse)
+                or (td.product == "keeper" and settings.is_keeper)
+            }
             tool_list = []
-            for tool_def in TOOLS.values():
+            for tool_def in visible_tools.values():
                 entry = {
                     "name": tool_def.name,
                     "description": tool_def.description,
@@ -370,6 +390,8 @@ def create_mcp_app() -> FastAPI:
                 if tool_def.auth_tier == AuthTier.X402 and tool_def.price:
                     entry["x-tripwire-price"] = tool_def.price
                     entry["x-tripwire-network"] = tool_def.network
+                # Include product tag so clients know which product the tool belongs to
+                entry["x-tripwire-product"] = tool_def.product
                 tool_list.append(entry)
             return JSONResponse(
                 content=_jsonrpc_success(req_id, {"tools": tool_list}),

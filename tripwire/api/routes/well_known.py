@@ -115,6 +115,19 @@ async def skill_spec():
             "Finality monotonicity: confirmations only increase (except on reorg)",
             "Nonce uniqueness: (chain_id, nonce, authorizer) is globally unique",
         ],
+
+        "products": {
+            "pulse": {
+                "description": "Self-service event trigger platform",
+                "capabilities": ["trigger_creation", "event_detection", "filter_evaluation"],
+                "active": settings.is_pulse,
+            },
+            "keeper": {
+                "description": "Managed x402 payment infrastructure",
+                "capabilities": ["payment_verification", "identity_resolution", "execution_gating"],
+                "active": settings.is_keeper,
+            },
+        },
     }
 
 
@@ -171,14 +184,31 @@ def _tool_to_resource(tool_def: ToolDef, now: str, networks: list[str]) -> dict:
             "inputSchema": tool_def.input_schema,
             "transport": "json-rpc",
             "minReputation": tool_def.min_reputation,
+            "product": tool_def.product,
         },
         "lastUpdated": now,
     }
 
 
+def _is_tool_visible(tool_def: ToolDef) -> bool:
+    """Return True if the tool should be visible under the current product mode.
+
+    ``tool_def.product`` may be a plain string or a ``ProductMode`` enum value.
+    Since ``ProductMode(str, Enum)`` means ``ProductMode.PULSE == "pulse"`` is
+    ``True``, the ``==`` comparisons below work for both representations.
+    """
+    if tool_def.product == "both":
+        return True
+    if tool_def.product == "pulse" and settings.is_pulse:
+        return True
+    if tool_def.product == "keeper" and settings.is_keeper:
+        return True
+    return False
+
+
 @router.get("/discovery/resources")
 async def discovery_resources():
-    """x402 V2 Bazaar discovery — returns all MCP tools as resources."""
+    """x402 V2 Bazaar discovery — returns MCP tools as resources, filtered by product mode."""
     from tripwire.mcp.server import TOOLS
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -186,4 +216,27 @@ async def discovery_resources():
     # Multi-chain: use all configured networks
     networks: list[str] = settings.x402_networks
 
-    return [_tool_to_resource(td, now, networks) for td in TOOLS.values()]
+    # Filter tools by active product mode
+    items = [
+        _tool_to_resource(td, now, networks)
+        for td in TOOLS.values()
+        if _is_tool_visible(td)
+    ]
+
+    return {
+        "x402Version": 2,
+        "platform": {
+            "name": "TripWire",
+            "products": {
+                "pulse": {
+                    "description": "Programmable onchain event triggers",
+                    "active": settings.is_pulse,
+                },
+                "keeper": {
+                    "description": "Managed x402 payment infrastructure",
+                    "active": settings.is_keeper,
+                },
+            },
+        },
+        "items": items,
+    }

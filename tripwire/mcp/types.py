@@ -36,6 +36,7 @@ class ToolDef:
     price: str | None = None        # e.g. "$0.003" for x402 tools
     networks: list[str] = field(default_factory=lambda: ["eip155:8453"])
     min_reputation: float = 0.0
+    product: str = "both"           # ProductMode value: "pulse", "keeper", or "both"
 
     @property
     def network(self) -> str:

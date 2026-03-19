@@ -3,6 +3,8 @@
 from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings
 
+from tripwire.types.models import ProductMode
+
 
 class Settings(BaseSettings):
     # App
@@ -11,6 +13,19 @@ class Settings(BaseSettings):
     app_base_url: str = "http://localhost:3402"
     log_level: str = "info"
     cors_allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:3402"]
+
+    # Product mode: "pulse" (generic triggers), "keeper" (x402 payments), or "both"
+    product_mode: ProductMode = ProductMode.BOTH
+
+    @property
+    def is_pulse(self) -> bool:
+        """True when running as Pulse (generic onchain triggers) or both."""
+        return self.product_mode in (ProductMode.PULSE, ProductMode.BOTH)
+
+    @property
+    def is_keeper(self) -> bool:
+        """True when running as Keeper (x402 payment webhooks) or both."""
+        return self.product_mode in (ProductMode.KEEPER, ProductMode.BOTH)
 
     # Supabase
     supabase_url: str = ""
