@@ -606,6 +606,13 @@ async def x402_tool_executor(
     try:
         tool_result = await tool_handler(tool_args, ctx, repos)
     except Exception as exc:
+        # Clean up dedup key so caller can retry with the same payment proof
+        try:
+            r = get_redis()
+            if r and pctx.dedup_key:
+                await r.delete(pctx.dedup_key)
+        except Exception:
+            pass  # best-effort cleanup
         logger.exception(
             "mcp_tool_call_failed",
             tool=tool_def.name,

@@ -70,7 +70,7 @@ async def _create_endpoint_core(
     """Core endpoint-creation logic shared by register_endpoint and register_middleware.
 
     Creates the endpoint row and returns a dict with endpoint_id, webhook_secret,
-    mode, and url.
+    mode, and url.  Returns an ``{"error": ...}`` dict on failure.
     """
     supabase = repos["supabase"]
 
@@ -157,11 +157,60 @@ async def _create_endpoint_core(
                 mode=mode,
             )
 
+    return {
+        "endpoint_id": endpoint_id,
+        "webhook_secret": webhook_secret,
+        "mode": mode,
+        "url": url,
+        "chains": chains,
+    }
+
+
+# ── 1a. register_endpoint ───────────────────────────────────
+
+
+async def register_endpoint(
+    params: dict, ctx: MCPAuthContext, repos: dict
+) -> dict:
+    """Create a webhook endpoint. Returns endpoint_id and webhook_secret."""
+    core_result = await _create_endpoint_core(params, ctx, repos)
+    if "error" in core_result:
+        return core_result
+
+    return {
+        "endpoint_id": core_result["endpoint_id"],
+        "webhook_secret": core_result["webhook_secret"],
+        "mode": core_result["mode"],
+        "url": core_result["url"],
+    }
+
+
+# ── 1b. register_middleware (deprecated) ─────────────────────
+
+
+async def register_middleware(
+    params: dict, ctx: MCPAuthContext, repos: dict
+) -> dict:
+    """(Deprecated) Register TripWire as middleware — creates endpoint + triggers."""
+    core_result = await _create_endpoint_core(params, ctx, repos)
+    if "error" in core_result:
+        return core_result
+
+    supabase = repos["supabase"]
+    _, trigger_repo, template_repo, _ = _repos(repos)
+
+    endpoint_id = core_result["endpoint_id"]
+    chains = core_result["chains"]
+    now = _now_iso()
+
+    template_slugs: list[str] = params.get("template_slugs", [])
+    custom_triggers: list[dict] = params.get("custom_triggers", [])
+
     # Create triggers from template slugs
     trigger_ids: list[str] = []
 
     for slug in template_slugs:
-        # Re-check quota before each insert to tighten the race window (Bug #7)
+        # Re-check quota before each insert to tighten the race window
         await check_trigger_quota(supabase, ctx.agent_address)
 
         template = template_repo.get_by_slug(slug)
@@ -198,7 +247,7 @@ async def _create_endpoint_core(
 
     # Create custom triggers
     for ct in custom_triggers:
-        # Re-check quota before each insert to tighten the race window (Bug #7)
+        # Re-check quota before each insert to tighten the race window
         await check_trigger_quota(supabase, ctx.agent_address)
 
         trigger_id = nanoid(size=21)
@@ -520,30 +569,54 @@ async def get_trigger_status(
     if trigger.owner_address.lower() != ctx.agent_address.lower():
         return {"error": "Not authorized", "code": "FORBIDDEN"}
 
-    # Count recent events matching this trigger's endpoint
+    # Count recent events matching this trigger.
+    # Prefer trigger_id column (added in migration 026) for accurate
+    # per-trigger counts; fall back to endpoint_id if the column is
+    # unavailable or the query fails.
     try:
         result = (
             supabase.table("events")
             .select("id", count="exact")
-            .eq("endpoint_id", trigger.endpoint_id)
+            .eq("trigger_id", trigger_id)
             .execute()
         )
         event_count = result.count if result.count is not None else len(result.data)
     except Exception:
-        logger.warning("mcp_event_count_failed", trigger_id=trigger_id)
-        event_count = -1
+        # Fallback: trigger_id column may not exist on older deployments
+        try:
+            result = (
+                supabase.table("events")
+                .select("id", count="exact")
+                .eq("endpoint_id", trigger.endpoint_id)
+                .execute()
+            )
+            event_count = result.count if result.count is not None else len(result.data)
+        except Exception:
+            logger.warning("mcp_event_count_failed", trigger_id=trigger_id)
+            event_count = -1
 
-    # Fetch the most recent event's status for execution state
+    # Fetch the most recent event's status for execution state.
+    # Same fallback strategy: prefer trigger_id, fall back to endpoint_id.
     last_event_execution_state = None
     try:
         last_evt = (
             supabase.table("events")
             .select("status")
-            .eq("endpoint_id", trigger.endpoint_id)
+            .eq("trigger_id", trigger_id)
             .order("created_at", desc=True)
             .limit(1)
             .execute()
         )
+        if not last_evt.data:
+            # Fallback to endpoint_id if no results with trigger_id
+            last_evt = (
+                supabase.table("events")
+                .select("status")
+                .eq("endpoint_id", trigger.endpoint_id)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
         if last_evt.data:
             state, _, _ = execution_state_from_status(last_evt.data[0].get("status", "pending"))
             last_event_execution_state = state.value

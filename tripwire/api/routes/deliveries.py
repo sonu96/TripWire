@@ -261,7 +261,9 @@ async def retry_delivery(
 
     convoy_project_id = ep.data[0]["convoy_project_id"]
 
-    # Use the provider_message_id as the Convoy event delivery ID for retry
+    # NOTE: provider_message_id stores the Convoy *event* ID, not the
+    # event-delivery ID.  retry_message() handles the lookup internally
+    # by querying Convoy for the event deliveries of this event.
     provider_message_id = delivery.get("provider_message_id")
     if not provider_message_id:
         raise HTTPException(status_code=400, detail="Delivery has no provider message ID for retry")

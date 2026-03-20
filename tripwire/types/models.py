@@ -125,7 +125,7 @@ class RegisterEndpointRequest(BaseModel):
     mode: EndpointMode
     chains: list[int] = Field(min_length=1)
     recipient: EthAddress
-    owner_address: EthAddress
+    owner_address: EthAddress | None = None  # Server overwrites from authenticated wallet
     policies: EndpointPolicies | None = None
 
     @field_validator("url")

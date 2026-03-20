@@ -867,6 +867,13 @@ async def _handle_session_tool_call(
     try:
         result = await tool_def.handler(tool_args, ctx, repos)
     except Exception as exc:
+        # Refund budget — tool didn't complete
+        try:
+            cost = _price_to_smallest_units(tool_def.price)
+            if cost > 0:
+                await session_manager.refund(ctx.session_id, cost)
+        except Exception:
+            pass  # best-effort refund
         logger.exception(
             "mcp_tool_call_failed",
             tool=tool_name,

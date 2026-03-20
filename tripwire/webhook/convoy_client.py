@@ -423,27 +423,77 @@ async def force_resend(project_id: str, delivery_ids: list[str]) -> None:
 # ---------------------------------------------------------------------------
 
 async def retry_message(app_id: str, delivery_id: str) -> None:
-    """Retry delivery of a failed Convoy event delivery.
+    """Retry delivery of a failed Convoy event.
 
-    ``delivery_id`` is the event delivery ID (not the event ID itself).
-    In Convoy, each attempt to deliver an event to an endpoint is tracked
-    as a separate ``EventDelivery`` record with its own ID.
+    ``delivery_id`` here is actually the Convoy **event ID** as stored in
+    ``webhook_deliveries.provider_message_id``.  Because TripWire stores the
+    event ID (returned by ``send_webhook``) rather than the event-delivery ID,
+    we first look up the event deliveries for this event and then retry
+    the failed ones.
+
+    NOTE: The ``webhook_deliveries`` table stores the Convoy *event* ID in
+    ``provider_message_id``, not the Convoy *event-delivery* ID.  A future
+    migration could add a ``provider_delivery_id`` column to store the
+    event-delivery ID directly and skip this lookup.
     """
     client = _get_convoy_client()
+
+    # Step 1: Look up event deliveries for the given event ID
     try:
-        response = await client.put(
-            f"/api/v1/projects/{app_id}/eventdeliveries/{delivery_id}/resend",
+        resp = await client.get(
+            f"/api/v1/projects/{app_id}/eventdeliveries",
+            params={"event_id": delivery_id},
         )
-        response.raise_for_status()
-        logger.info(
-            "convoy_delivery_retried",
-            project_id=app_id,
-            delivery_id=delivery_id,
-        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("data", {}).get("content", [])
     except Exception:
         logger.exception(
-            "convoy_delivery_retry_failed",
+            "convoy_delivery_lookup_failed",
             project_id=app_id,
-            delivery_id=delivery_id,
+            event_id=delivery_id,
         )
         raise
+
+    # Step 2: Find failed deliveries and retry them
+    failed_ids = [
+        d["uid"] for d in content
+        if d.get("status", "").lower() in ("failure", "failed")
+    ]
+
+    if not failed_ids:
+        # Fall back: retry all deliveries for this event (Convoy will skip
+        # already-successful ones)
+        failed_ids = [d["uid"] for d in content if d.get("uid")]
+
+    if not failed_ids:
+        logger.warning(
+            "convoy_no_deliveries_for_event",
+            project_id=app_id,
+            event_id=delivery_id,
+        )
+        raise ValueError(
+            f"No Convoy event deliveries found for event {delivery_id}"
+        )
+
+    # Step 3: Retry each failed delivery
+    for ed_id in failed_ids:
+        try:
+            response = await client.put(
+                f"/api/v1/projects/{app_id}/eventdeliveries/{ed_id}/resend",
+            )
+            response.raise_for_status()
+            logger.info(
+                "convoy_delivery_retried",
+                project_id=app_id,
+                event_id=delivery_id,
+                event_delivery_id=ed_id,
+            )
+        except Exception:
+            logger.exception(
+                "convoy_delivery_retry_failed",
+                project_id=app_id,
+                event_id=delivery_id,
+                event_delivery_id=ed_id,
+            )
+            raise

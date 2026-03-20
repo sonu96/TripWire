@@ -189,6 +189,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     pre_confirmed_sweeper = None
     nonce_archiver = None
 
+    if settings.is_worker:
         pre_confirmed_sweeper = PreConfirmedSweeper(
             supabase=supabase,
             webhook_provider=webhook_provider,
