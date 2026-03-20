@@ -420,7 +420,13 @@ class TripWirePaymentHooks:
                         status_code=429,
                         detail="Rate limit exceeded: max 60 tool calls per minute",
                     )
-            except HTTPException:
+            except HTTPException as exc:
+                if exc.status_code == 429:
+                    # Clean up dedup key — caller should be able to retry after rate limit window
+                    try:
+                        await r.delete(dedup_key)
+                    except Exception:
+                        pass
                 raise
             except Exception:
                 # Redis down — fail open for rate limiting (payment already verified)
@@ -626,19 +632,30 @@ async def x402_tool_executor(
     await hooks.after_execution(pctx, tool_result, request)
 
     # 6. Settle if no error in tool result
-    if not pctx.has_error:
+    if pctx.has_error:
+        # Tool returned a handled error (e.g. NOT_FOUND, validation error).
+        # Don't settle, but DO clean up the dedup key so the caller can
+        # retry with the same payment proof.
         try:
-            await server.settle(payment_header)
-        except Exception as exc:
-            # 7a. Settlement failure
-            await hooks.on_settlement_failure(pctx, exc)
-            # Return error — do NOT return tool result (prevents free service)
-            return {
-                "error": "Payment settlement failed -- tool result withheld",
-                "code": "SETTLEMENT_FAILED",
-            }
-        # 7b. Settlement success
-        await hooks.on_settlement_success(pctx)
+            r = get_redis()
+            if r and pctx.dedup_key:
+                await r.delete(pctx.dedup_key)
+        except Exception:
+            pass  # best-effort cleanup
+        return {"result": tool_result}
+
+    try:
+        await server.settle(payment_header)
+    except Exception as exc:
+        # 7a. Settlement failure
+        await hooks.on_settlement_failure(pctx, exc)
+        # Return error — do NOT return tool result (prevents free service)
+        return {
+            "error": "Payment settlement failed -- tool result withheld",
+            "code": "SETTLEMENT_FAILED",
+        }
+    # 7b. Settlement success
+    await hooks.on_settlement_success(pctx)
 
     # 8. Return result
     return {"result": tool_result}

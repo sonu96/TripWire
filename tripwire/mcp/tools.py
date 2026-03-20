@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 import structlog
+from fastapi import HTTPException
 from nanoid import generate as nanoid
 
 from tripwire.config.settings import settings
@@ -72,6 +73,8 @@ async def _create_endpoint_core(
     Creates the endpoint row and returns a dict with endpoint_id, webhook_secret,
     mode, and url.  Returns an ``{"error": ...}`` dict on failure.
     """
+    from tripwire.api.validation import validate_endpoint_url
+
     supabase = repos["supabase"]
 
     url: str = params["url"]
@@ -79,6 +82,12 @@ async def _create_endpoint_core(
     chains: list[int] = params.get("chains", [8453])
     recipient: str = params.get("recipient", ctx.agent_address)
     policies: dict = params.get("policies", {})
+
+    # SSRF protection: block localhost, loopback, private IPs
+    try:
+        validate_endpoint_url(url)
+    except ValueError as exc:
+        return {"error": str(exc), "code": "INVALID_URL"}
 
     # Quota check before creating endpoint
     await check_endpoint_quota(supabase, ctx.agent_address)
@@ -209,75 +218,83 @@ async def register_middleware(
     # Create triggers from template slugs
     trigger_ids: list[str] = []
 
-    for slug in template_slugs:
-        # Re-check quota before each insert to tighten the race window
-        await check_trigger_quota(supabase, ctx.agent_address)
+    try:
+        for slug in template_slugs:
+            # Re-check quota before each insert to tighten the race window
+            await check_trigger_quota(supabase, ctx.agent_address)
 
-        template = template_repo.get_by_slug(slug)
-        if template is None:
-            logger.warning("mcp_template_not_found", slug=slug)
-            continue
+            template = template_repo.get_by_slug(slug)
+            if template is None:
+                logger.warning("mcp_template_not_found", slug=slug)
+                continue
 
-        trigger_id = nanoid(size=21)
-        trigger_data = {
-            "id": trigger_id,
-            "owner_address": ctx.agent_address.lower(),
-            "endpoint_id": endpoint_id,
-            "name": template.name,
-            "event_signature": template.event_signature,
-            "topic0": compute_topic0(template.event_signature),
-            "abi": template.abi,
-            "contract_address": None,
-            "chain_ids": chains or template.default_chains,
-            "filter_rules": [f.model_dump() for f in template.default_filters],
-            "webhook_event_type": template.webhook_event_type,
-            "reputation_threshold": template.reputation_threshold,
-            "active": True,
-            "created_at": now,
-            "updated_at": now,
-        }
-        trigger_repo.create(trigger_data)
-        trigger_ids.append(trigger_id)
+            trigger_id = nanoid(size=21)
+            trigger_data = {
+                "id": trigger_id,
+                "owner_address": ctx.agent_address.lower(),
+                "endpoint_id": endpoint_id,
+                "name": template.name,
+                "event_signature": template.event_signature,
+                "topic0": compute_topic0(template.event_signature),
+                "abi": template.abi,
+                "contract_address": None,
+                "chain_ids": chains or template.default_chains,
+                "filter_rules": [f.model_dump() for f in template.default_filters],
+                "webhook_event_type": template.webhook_event_type,
+                "reputation_threshold": template.reputation_threshold,
+                "active": True,
+                "created_at": now,
+                "updated_at": now,
+            }
+            trigger_repo.create(trigger_data)
+            trigger_ids.append(trigger_id)
 
-        logger.info(
-            "mcp_trigger_from_template",
-            trigger_id=trigger_id,
-            template_slug=slug,
-        )
+            logger.info(
+                "mcp_trigger_from_template",
+                trigger_id=trigger_id,
+                template_slug=slug,
+            )
 
-    # Create custom triggers
-    for ct in custom_triggers:
-        # Re-check quota before each insert to tighten the race window
-        await check_trigger_quota(supabase, ctx.agent_address)
+        # Create custom triggers
+        for ct in custom_triggers:
+            # Re-check quota before each insert to tighten the race window
+            await check_trigger_quota(supabase, ctx.agent_address)
 
-        trigger_id = nanoid(size=21)
-        trigger_data = {
-            "id": trigger_id,
-            "owner_address": ctx.agent_address.lower(),
-            "endpoint_id": endpoint_id,
-            "name": ct.get("name"),
-            "event_signature": ct["event_signature"],
-            "topic0": compute_topic0(ct["event_signature"]),
-            "abi": ct.get("abi", []),
-            "contract_address": ct.get("contract_address"),
-            "chain_ids": ct.get("chain_ids", chains),
-            "filter_rules": ct.get("filter_rules", []),
-            "webhook_event_type": ct.get(
-                "webhook_event_type", "payment.confirmed"
-            ),
-            "reputation_threshold": ct.get("reputation_threshold", 0.0),
-            "active": True,
-            "created_at": now,
-            "updated_at": now,
-        }
-        trigger_repo.create(trigger_data)
-        trigger_ids.append(trigger_id)
+            trigger_id = nanoid(size=21)
+            trigger_data = {
+                "id": trigger_id,
+                "owner_address": ctx.agent_address.lower(),
+                "endpoint_id": endpoint_id,
+                "name": ct.get("name"),
+                "event_signature": ct["event_signature"],
+                "topic0": compute_topic0(ct["event_signature"]),
+                "abi": ct.get("abi", []),
+                "contract_address": ct.get("contract_address"),
+                "chain_ids": ct.get("chain_ids", chains),
+                "filter_rules": ct.get("filter_rules", []),
+                "webhook_event_type": ct.get(
+                    "webhook_event_type", "payment.confirmed"
+                ),
+                "reputation_threshold": ct.get("reputation_threshold", 0.0),
+                "active": True,
+                "created_at": now,
+                "updated_at": now,
+            }
+            trigger_repo.create(trigger_data)
+            trigger_ids.append(trigger_id)
 
-        logger.info(
-            "mcp_custom_trigger_created",
-            trigger_id=trigger_id,
-            event_signature=ct["event_signature"],
-        )
+            logger.info(
+                "mcp_custom_trigger_created",
+                trigger_id=trigger_id,
+                event_signature=ct["event_signature"],
+            )
+    except HTTPException as exc:
+        # Clean up: delete the orphan endpoint on quota or insert failure
+        try:
+            await supabase.table("endpoints").delete().eq("id", endpoint_id).execute()
+        except Exception:
+            logger.exception("mcp_orphan_endpoint_cleanup_failed", endpoint_id=endpoint_id)
+        raise exc
 
     # Invalidate trigger cache if triggers were created
     if trigger_ids:
@@ -663,13 +680,18 @@ async def search_events(
     status_filter = params.get("status")
     chain_id_filter = params.get("chain_id")
 
+    # Fetch a larger set from the join table (pre-filter) so that
+    # status/chain_id filters applied to the events query don't drop
+    # older matching events that would otherwise be within the limit.
+    prefetch_limit = 500 if (status_filter or chain_id_filter) else limit
+
     # Get event IDs linked to the agent's endpoints via join table
     ee_result = (
         supabase.table("event_endpoints")
         .select("event_id")
         .in_("endpoint_id", endpoint_ids)
         .order("created_at", desc=True)
-        .limit(limit)
+        .limit(prefetch_limit)
         .execute()
     )
     event_ids = list({row["event_id"] for row in ee_result.data})
@@ -681,14 +703,14 @@ async def search_events(
         supabase.table("events")
         .select("*")
         .in_("id", event_ids)
-        .order("created_at", desc=True)
-        .limit(limit)
     )
 
     if status_filter:
         query = query.eq("status", status_filter)
     if chain_id_filter:
         query = query.eq("chain_id", chain_id_filter)
+
+    query = query.order("created_at", desc=True).limit(limit)
 
     events_result = query.execute()
 
