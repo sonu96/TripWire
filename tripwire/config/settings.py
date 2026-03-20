@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     ethereum_rpc_url: str = ""
     arbitrum_rpc_url: str = ""
 
+    # Block explorer API keys (for ABI fetching)
+    basescan_api_key: str = ""
+    etherscan_api_key: str = ""
+    arbiscan_api_key: str = ""
+
     # x402 Payment Gating
     x402_facilitator_url: str = "https://x402.org/facilitator"
     x402_registration_price: str = "$1.00"

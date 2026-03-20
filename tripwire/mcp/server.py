@@ -67,7 +67,7 @@ def _register(
     )
 
 
-# ── Register all 8 tools ────────────────────────────────────
+# ── Register all 11 tools ───────────────────────────────────
 
 _register(
     name="register_middleware",
@@ -285,6 +285,117 @@ _register(
     },
     handler=tool_handlers.search_events,
     auth_tier=AuthTier.SIWX,
+)
+
+_register(
+    name="fetch_abi",
+    handler=tool_handlers.fetch_abi,
+    description=(
+        "Fetch the ABI for any smart contract and list its events. "
+        "Use this to discover what events a contract emits before creating a trigger."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "contract_address": {
+                "type": "string",
+                "description": "Contract address (0x...)",
+            },
+            "chain": {
+                "type": "string",
+                "enum": ["base", "ethereum", "arbitrum"],
+                "description": "Chain name",
+            },
+        },
+        "required": ["contract_address", "chain"],
+    },
+    auth_tier=AuthTier.SIWX,
+    product="pulse",
+)
+
+_register(
+    name="list_pools",
+    handler=tool_handlers.list_pools,
+    description=(
+        "List popular pools for a DeFi protocol. Returns pool addresses and available events. "
+        "Currently supports: aerodrome, aave-v3, uniswap-v3."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "protocol": {
+                "type": "string",
+                "description": "Protocol name (aerodrome, aave-v3, uniswap-v3)",
+            },
+            "chain": {
+                "type": "string",
+                "enum": ["base", "ethereum", "arbitrum"],
+                "default": "base",
+                "description": "Chain name",
+            },
+            "limit": {
+                "type": "integer",
+                "default": 10,
+                "description": "Max pools to return",
+            },
+        },
+        "required": ["protocol"],
+    },
+    auth_tier=AuthTier.SIWX,
+    product="pulse",
+)
+
+_register(
+    name="validate_trigger",
+    handler=tool_handlers.validate_trigger,
+    description=(
+        "Validate a trigger configuration before creating it. "
+        "Checks event signature format, contract address, chain support, and filter rules."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "event_signature": {
+                "type": "string",
+                "description": "Solidity event signature, e.g. Swap(address,address,int256,int256,uint160,uint128,int24)",
+            },
+            "contract_address": {
+                "type": "string",
+                "description": "Contract address (0x...)",
+            },
+            "chain_id": {
+                "type": "integer",
+                "description": "Chain ID (8453=Base, 1=Ethereum, 42161=Arbitrum)",
+            },
+            "filter_rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "field": {"type": "string"},
+                        "op": {"type": "string"},
+                        "value": {"type": "string"},
+                    },
+                },
+                "description": "Optional filter rules to validate",
+            },
+            "event_abi": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "type": {"type": "string"},
+                        "indexed": {"type": "boolean"},
+                    },
+                },
+                "description": "Optional event ABI inputs (from fetch_abi) for field name validation",
+            },
+        },
+        "required": ["event_signature", "contract_address", "chain_id"],
+    },
+    auth_tier=AuthTier.SIWX,
+    product="pulse",
 )
 
 
