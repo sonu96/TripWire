@@ -85,6 +85,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         version=__version__,
         env=settings.app_env,
         port=settings.app_port,
+        process_role=settings.process_role,
         product_mode=settings.product_mode,
         is_pulse=settings.is_pulse,
         is_keeper=settings.is_keeper,
@@ -180,130 +181,140 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.shared_cache = RedisCache(None, prefix="tripwire", default_ttl=30)
         logger.warning("shared_cache_fallback_to_local")
 
-    # ── Event Bus: Trigger Worker Pool (Pulse-only) ─────────────
+    # ── Worker-only init (background tasks) ─────────────────────
+    # These only start when process_role is "worker" or "all".
     redis_dlq_consumer = None
-    if settings.is_pulse and settings.event_bus_enabled:
-        from tripwire.ingestion.event_bus import init_stream_keys
-        from tripwire.ingestion.trigger_worker import TriggerIndex, WorkerPool
-        from tripwire.ingestion.dlq_consumer import RedisDLQConsumer
-
-        # Populate known stream keys from Redis so MAX_STREAMS cap is accurate
-        try:
-            await init_stream_keys()
-        except Exception:
-            logger.exception("event_bus_init_stream_keys_failed")
-
-        # Build a shared TriggerIndex and inject it into the processor so
-        # _detect_event_type uses the O(1) in-memory lookup instead of the
-        # DB-backed TriggerRepository.find_by_topic with its separate 30s cache.
-        trigger_index = TriggerIndex(trigger_repo)
-        await trigger_index.refresh()
-        processor._trigger_index = trigger_index
-
-        worker_pool = WorkerPool(
-            num_workers=settings.event_bus_workers,
-            processor=app.state.processor,
-            trigger_repo=trigger_repo,
-        )
-        try:
-            await worker_pool.start()
-            app.state.worker_pool = worker_pool
-            logger.info("event_bus_workers_started", num_workers=settings.event_bus_workers)
-        except Exception:
-            logger.exception("event_bus_start_failed", msg="App will continue without event bus workers")
-
-        # Redis Streams DLQ consumer (reads permanently-failed events from tripwire:dlq)
-        try:
-            redis_dlq_consumer = RedisDLQConsumer(settings=settings)
-            await redis_dlq_consumer.start()
-            app.state.redis_dlq_consumer = redis_dlq_consumer
-            logger.info("redis_dlq_consumer_ready")
-        except Exception:
-            logger.exception("redis_dlq_consumer_start_failed")
-    elif not settings.is_pulse and settings.event_bus_enabled:
-        logger.info("event_bus_skipped", reason="product_mode does not include pulse")
-
-    # Dead Letter Queue handler (Keeper-only — background poller for failed Convoy deliveries)
     dlq_handler: DLQHandler | None = None
-    if settings.is_keeper and settings.dlq_enabled and settings.convoy_api_key.get_secret_value():
-        dlq_handler = DLQHandler(
-            endpoint_repo=endpoint_repo,
-            delivery_repo=delivery_repo,
-            settings=settings,
-        )
-        await dlq_handler.start()
-        app.state.dlq_handler = dlq_handler
-        logger.info("dlq_handler_ready")
-    elif not settings.is_keeper:
-        logger.info("dlq_handler_skipped", reason="product_mode does not include keeper")
-    else:
-        logger.info(
-            "dlq_handler_skipped",
-            dlq_enabled=settings.dlq_enabled,
-            convoy_configured=bool(settings.convoy_api_key.get_secret_value()),
-        )
-
-    # Finality poller (Keeper-only — background task for confirming pending events & reorg detection)
     finality_poller: FinalityPoller | None = None
-    if settings.is_keeper and settings.finality_poller_enabled:
-        finality_poller = FinalityPoller(
-            event_repo=event_repo,
-            endpoint_repo=endpoint_repo,
-            delivery_repo=delivery_repo,
-            webhook_provider=webhook_provider,
-            settings=settings,
-            nonce_repo=nonce_repo,
-        )
-        await finality_poller.start()
-        app.state.finality_poller = finality_poller
-        logger.info("finality_poller_ready")
-    elif not settings.is_keeper:
-        logger.info("finality_poller_skipped", reason="product_mode does not include keeper")
-    else:
-        logger.info("finality_poller_skipped", enabled=False)
-
-    # Pre-confirmed TTL sweeper (Keeper-only — expires provisional events that never land onchain)
     pre_confirmed_sweeper = None
-    if settings.is_keeper:
-        from tripwire.ingestion.ttl_sweeper import PreConfirmedSweeper
+    nonce_archiver = None
 
-        pre_confirmed_sweeper = PreConfirmedSweeper(
-            supabase=supabase,
-            webhook_dispatcher=None,  # Wire dispatcher for payment.failed webhooks if needed
-        )
-        await pre_confirmed_sweeper.start()
-        app.state.pre_confirmed_sweeper = pre_confirmed_sweeper
-        logger.info("pre_confirmed_sweeper_ready")
+    if settings.is_worker:
+        # ── Event Bus: Trigger Worker Pool (Pulse-only) ─────────────
+        if settings.is_pulse and settings.event_bus_enabled:
+            from tripwire.ingestion.event_bus import init_stream_keys
+            from tripwire.ingestion.trigger_worker import TriggerIndex, WorkerPool
+            from tripwire.ingestion.dlq_consumer import RedisDLQConsumer
+
+            # Populate known stream keys from Redis so MAX_STREAMS cap is accurate
+            try:
+                await init_stream_keys()
+            except Exception:
+                logger.exception("event_bus_init_stream_keys_failed")
+
+            # Build a shared TriggerIndex and inject it into the processor so
+            # _detect_event_type uses the O(1) in-memory lookup instead of the
+            # DB-backed TriggerRepository.find_by_topic with its separate 30s cache.
+            trigger_index = TriggerIndex(trigger_repo)
+            await trigger_index.refresh()
+            processor._trigger_index = trigger_index
+
+            worker_pool = WorkerPool(
+                num_workers=settings.event_bus_workers,
+                processor=app.state.processor,
+                trigger_repo=trigger_repo,
+            )
+            try:
+                await worker_pool.start()
+                app.state.worker_pool = worker_pool
+                logger.info("event_bus_workers_started", num_workers=settings.event_bus_workers)
+            except Exception:
+                logger.exception("event_bus_start_failed", msg="App will continue without event bus workers")
+
+            # Redis Streams DLQ consumer (reads permanently-failed events from tripwire:dlq)
+            try:
+                redis_dlq_consumer = RedisDLQConsumer(settings=settings)
+                await redis_dlq_consumer.start()
+                app.state.redis_dlq_consumer = redis_dlq_consumer
+                logger.info("redis_dlq_consumer_ready")
+            except Exception:
+                logger.exception("redis_dlq_consumer_start_failed")
+        elif not settings.is_pulse and settings.event_bus_enabled:
+            logger.info("event_bus_skipped", reason="product_mode does not include pulse")
+
+        # Dead Letter Queue handler (Keeper-only — background poller for failed Convoy deliveries)
+        if settings.is_keeper and settings.dlq_enabled and settings.convoy_api_key.get_secret_value():
+            dlq_handler = DLQHandler(
+                endpoint_repo=endpoint_repo,
+                delivery_repo=delivery_repo,
+                settings=settings,
+            )
+            await dlq_handler.start()
+            app.state.dlq_handler = dlq_handler
+            logger.info("dlq_handler_ready")
+        elif not settings.is_keeper:
+            logger.info("dlq_handler_skipped", reason="product_mode does not include keeper")
+        else:
+            logger.info(
+                "dlq_handler_skipped",
+                dlq_enabled=settings.dlq_enabled,
+                convoy_configured=bool(settings.convoy_api_key.get_secret_value()),
+            )
+
+        # Finality poller (Keeper-only — background task for confirming pending events & reorg detection)
+        if settings.is_keeper and settings.finality_poller_enabled:
+            finality_poller = FinalityPoller(
+                event_repo=event_repo,
+                endpoint_repo=endpoint_repo,
+                delivery_repo=delivery_repo,
+                webhook_provider=webhook_provider,
+                settings=settings,
+                nonce_repo=nonce_repo,
+            )
+            await finality_poller.start()
+            app.state.finality_poller = finality_poller
+            logger.info("finality_poller_ready")
+        elif not settings.is_keeper:
+            logger.info("finality_poller_skipped", reason="product_mode does not include keeper")
+        else:
+            logger.info("finality_poller_skipped", enabled=False)
+
+        # Pre-confirmed TTL sweeper (Keeper-only — expires provisional events that never land onchain)
+        if settings.is_keeper:
+            from tripwire.ingestion.ttl_sweeper import PreConfirmedSweeper
+
+            pre_confirmed_sweeper = PreConfirmedSweeper(
+                supabase=supabase,
+                webhook_dispatcher=None,  # Wire dispatcher for payment.failed webhooks if needed
+            )
+            await pre_confirmed_sweeper.start()
+            app.state.pre_confirmed_sweeper = pre_confirmed_sweeper
+            logger.info("pre_confirmed_sweeper_ready")
+        else:
+            logger.info("pre_confirmed_sweeper_skipped", reason="product_mode does not include keeper")
+
+        # Nonce archiver (Keeper-only — daily background task to move old nonces to archive)
+        from tripwire.db.archival import NonceArchiver
+
+        if settings.is_keeper:
+            try:
+                nonce_archiver = NonceArchiver(supabase)
+                await nonce_archiver.start()
+                app.state.nonce_archiver = nonce_archiver
+                logger.info("nonce_archiver_ready")
+            except Exception:
+                logger.exception("nonce_archiver_start_failed")
+        else:
+            logger.info("nonce_archiver_skipped", reason="product_mode does not include keeper")
     else:
-        logger.info("pre_confirmed_sweeper_skipped", reason="product_mode does not include keeper")
+        logger.info("worker_tasks_skipped", process_role=settings.process_role)
 
-    # Session manager (Keeper-only — Redis-backed session lifecycle)
-    if settings.is_keeper and settings.session_enabled:
-        from tripwire.session.manager import SessionManager
+    # ── API-only init (session manager needs to be available for API requests) ──
+    if settings.is_api:
+        # Session manager (Keeper-only — Redis-backed session lifecycle)
+        if settings.is_keeper and settings.session_enabled:
+            from tripwire.session.manager import SessionManager
 
-        session_manager = SessionManager(get_redis())
-        await session_manager.register_lua_scripts()
-        app.state.session_manager = session_manager
-        logger.info("session_manager_ready")
-    elif settings.is_keeper and not settings.session_enabled:
-        logger.info("session_manager_skipped", reason="session_enabled is false")
-    elif not settings.is_keeper:
-        logger.info("session_manager_skipped", reason="product_mode does not include keeper")
-
-    # Nonce archiver (Keeper-only — daily background task to move old nonces to archive)
-    from tripwire.db.archival import NonceArchiver
-
-    nonce_archiver: NonceArchiver | None = None
-    if settings.is_keeper:
-        try:
-            nonce_archiver = NonceArchiver(supabase)
-            await nonce_archiver.start()
-            app.state.nonce_archiver = nonce_archiver
-            logger.info("nonce_archiver_ready")
-        except Exception:
-            logger.exception("nonce_archiver_start_failed")
+            session_manager = SessionManager(get_redis())
+            await session_manager.register_lua_scripts()
+            app.state.session_manager = session_manager
+            logger.info("session_manager_ready")
+        elif settings.is_keeper and not settings.session_enabled:
+            logger.info("session_manager_skipped", reason="session_enabled is false")
+        elif not settings.is_keeper:
+            logger.info("session_manager_skipped", reason="product_mode does not include keeper")
     else:
-        logger.info("nonce_archiver_skipped", reason="product_mode does not include keeper")
+        logger.info("api_init_skipped", process_role=settings.process_role)
 
     # Set Prometheus build info
     tripwire_build_info.info({"version": __version__, "env": settings.app_env})
@@ -445,8 +456,8 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # x402 payment gating (Keeper-only — only enabled when treasury address is configured)
-    if settings.is_keeper and settings.tripwire_treasury_address:
+    # x402 payment gating (API-only, Keeper-only — only enabled when treasury address is configured)
+    if settings.is_api and settings.is_keeper and settings.tripwire_treasury_address:
         try:
             from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
             from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -487,6 +498,8 @@ def create_app() -> FastAPI:
                 "x402_payment_gating_unavailable",
                 reason="x402 package not installed; run: pip install x402[fastapi,evm]",
             )
+    elif not settings.is_api:
+        logger.info("x402_payment_gating_skipped", reason="process_role is worker")
     elif not settings.is_keeper:
         logger.info("x402_payment_gating_skipped", reason="product_mode does not include keeper")
     else:
@@ -510,33 +523,36 @@ def create_app() -> FastAPI:
             content={"detail": "Internal server error"},
         )
 
-    # Mount route groups — shared routes (always mounted)
-    app.include_router(auth_router)
-    app.include_router(deliveries_router, prefix="/api/v1")
-    app.include_router(endpoints_router, prefix="/api/v1")
-    app.include_router(subscriptions_router, prefix="/api/v1")
-    app.include_router(events_router, prefix="/api/v1")
-    app.include_router(ingest_router, prefix="/api/v1")
-    app.include_router(stats_router, prefix="/api/v1")
-    app.include_router(well_known_router)
+    # Mount route groups — only when serving HTTP traffic (api or all)
+    if settings.is_api:
+        app.include_router(auth_router)
+        app.include_router(deliveries_router, prefix="/api/v1")
+        app.include_router(endpoints_router, prefix="/api/v1")
+        app.include_router(subscriptions_router, prefix="/api/v1")
+        app.include_router(events_router, prefix="/api/v1")
+        app.include_router(ingest_router, prefix="/api/v1")
+        app.include_router(stats_router, prefix="/api/v1")
+        app.include_router(well_known_router)
 
-    # Keeper-only routes
-    if settings.is_keeper:
-        app.include_router(facilitator_router, prefix="/api/v1")
+        # Keeper-only routes
+        if settings.is_keeper:
+            app.include_router(facilitator_router, prefix="/api/v1")
 
-    # Session routes (Keeper-only, feature-flagged)
-    if settings.is_keeper and settings.session_enabled:
-        from tripwire.api.routes.session import router as session_router
-        app.include_router(session_router, prefix="/api/v1")
+        # Session routes (Keeper-only, feature-flagged)
+        if settings.is_keeper and settings.session_enabled:
+            from tripwire.api.routes.session import router as session_router
+            app.include_router(session_router, prefix="/api/v1")
 
-    # Pulse-only routes (placeholder — currently no Pulse-exclusive REST routes)
-    # if settings.is_pulse:
-    #     pass
+        # Pulse-only routes (placeholder — currently no Pulse-exclusive REST routes)
+        # if settings.is_pulse:
+        #     pass
 
-    # ── MCP server (Model Context Protocol for AI agents) ───────
-    mcp_sub_app = create_mcp_app()
-    mcp_sub_app.state.parent_app = app
-    app.mount("/mcp", mcp_sub_app)
+        # ── MCP server (Model Context Protocol for AI agents) ───────
+        mcp_sub_app = create_mcp_app()
+        mcp_sub_app.state.parent_app = app
+        app.mount("/mcp", mcp_sub_app)
+    else:
+        logger.info("api_routes_skipped", process_role=settings.process_role)
 
     # ── Prometheus metrics endpoint ──────────────────────────────
     from prometheus_client import make_asgi_app as _make_metrics_app

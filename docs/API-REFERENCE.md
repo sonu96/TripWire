@@ -1220,9 +1220,12 @@ Paid MCP tools require a minimum agent reputation score to invoke. This prevents
 
 | MCP Tool | Auth Tier | Minimum Reputation |
 |---|---|---|
+| `register_endpoint` | X402 | 10.0 |
 | `register_middleware` | X402 | 10.0 |
 | `create_trigger` | X402 | 10.0 |
 | `activate_template` | X402 | 10.0 |
+
+> **Note**: `register_middleware` is deprecated. Use `register_endpoint` + `create_trigger` separately.
 
 Agents with a reputation score below 10.0 (or with no registered ERC-8004 onchain identity) will receive a rejection error when calling these tools. Reputation is resolved from the ERC-8004 registry at invocation time.
 
@@ -1230,12 +1233,68 @@ Public and SIWX-tier MCP tools (e.g., `list_templates`, `list_triggers`) do not 
 
 ### MCP Resource Quotas
 
-The following MCP tools enforce per-wallet resource quotas. If the wallet has reached its quota, the tool returns an error (equivalent to HTTP 429):
+The following MCP tools enforce per-wallet resource quotas. If the wallet has reached its quota, the tool returns an error (HTTP 429 via REST, JSON-RPC `-32003` via MCP):
 
 | MCP Tool | Quota | Limit |
 |---|---|---|
 | `create_trigger` | Triggers per wallet | 50 (`MAX_TRIGGERS_PER_WALLET`) |
 | `register_middleware` | Endpoints per wallet | 20 (`MAX_ENDPOINTS_PER_WALLET`) |
+| `register_middleware` | Triggers per wallet | 50 (`MAX_TRIGGERS_PER_WALLET`) |
 | `activate_template` | Triggers per wallet | 50 (`MAX_TRIGGERS_PER_WALLET`) |
 
-Quota checks are performed server-side before the database write. The error detail indicates which quota was exceeded.
+`register_middleware` enforces **both** quotas: the endpoint quota is always checked, and the trigger quota is additionally checked when `template_slugs` or `custom_triggers` are provided in the request. Both checks run before any database writes.
+
+**Batch-creation edge case:** The trigger quota is validated against the wallet's current trigger count before the batch is created. If a wallet has 48 active triggers and a single `register_middleware` call creates 5 triggers (e.g., 3 template slugs + 2 custom triggers), the pre-check passes (48 < 50) but the wallet ends up with 53 active triggers, exceeding the limit. Callers should account for the batch size when approaching the quota ceiling.
+
+The error detail indicates which quota was exceeded.
+
+---
+
+## 16. MCP Discovery Tools
+
+The MCP server exposes 12 tools (up from 8). Four tools were added in recent releases:
+
+### register_endpoint (preferred)
+
+Creates a webhook endpoint without inline trigger creation. Returns `endpoint_id` and `webhook_secret`. Use `create_trigger` or `activate_template` separately to add triggers.
+
+- **Auth tier:** X402 ($0.003)
+- **Product:** both
+- **Parameters:** `url` (required), `mode`, `chains`, `recipient`, `policies`
+
+> `register_middleware` is deprecated. Use `register_endpoint` + `create_trigger` separately.
+
+### fetch_abi
+
+Fetches the ABI for any smart contract and lists its events. Uses block explorer APIs (Basescan, Etherscan, Arbiscan).
+
+- **Auth tier:** SIWX (free)
+- **Product:** pulse
+- **Parameters:** `contract_address` (required), `chain` (required: `"base"`, `"ethereum"`, `"arbitrum"`)
+- **Returns:** Contract events with signatures, topic0 hashes, and ABI inputs
+
+### list_pools
+
+Lists popular pools for a DeFi protocol. Returns pool addresses and available events. Currently supports: aerodrome, aave-v3, uniswap-v3.
+
+- **Auth tier:** SIWX (free)
+- **Product:** pulse
+- **Parameters:** `protocol` (required), `chain` (optional, default `"base"`), `limit` (optional, default 10)
+- **Returns:** Pool addresses, names, and event signatures
+
+### validate_trigger
+
+Validates a trigger configuration before creating it. Checks event signature format, contract address, chain support, and filter rules. Optionally validates filter rule field names against the event ABI.
+
+- **Auth tier:** SIWX (free)
+- **Product:** pulse
+- **Parameters:** `event_signature` (required), `contract_address` (required), `chain_id` (required), `filter_rules` (optional), `event_abi` (optional, from `fetch_abi`)
+- **Returns:** Validation result with `valid` boolean, computed `topic0`, and any warnings
+
+### Agent Discovery Flow
+
+```
+list_pools → fetch_abi → validate_trigger → create_trigger
+```
+
+This flow lets agents discover, inspect, validate, and create triggers -- paying only at the final `create_trigger` step (X402).

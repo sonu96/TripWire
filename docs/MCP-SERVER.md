@@ -13,11 +13,11 @@ POST /mcp
 Content-Type: application/json
 ```
 
-The server exposes 8 tools for trigger management, template browsing, and event querying. Two built-in methods (`initialize` and `tools/list`) require no authentication. Tool invocations go through a 4-tier authentication system that combines wallet signatures (SIWE), pre-funded sessions, and per-call micropayments (x402).
+The server exposes 12 tools for trigger management, template browsing, event querying, and contract discovery. Two built-in methods (`initialize` and `tools/list`) require no authentication. Tool invocations go through a 4-tier authentication system that combines wallet signatures (SIWE), pre-funded sessions, and per-call micropayments (x402).
 
 MCP is the **control plane**: agents use it to configure what events to watch and where to deliver them. **Goldsky Turbo is the data plane**: it indexes the target chains in real time and delivers matching event logs to TripWire's `/ingest` endpoint via webhook. When an agent registers triggers through MCP, no additional blockchain infrastructure is required — events flow automatically from Goldsky's indexing pipeline into TripWire's event processor, which evaluates them against registered triggers and dispatches webhooks.
 
-MCP tools map to the [TWSS-1 Skill Spec](SKILL-SPEC.md) lifecycle: `register_middleware` and `create_trigger` create skill definitions, `activate_template` instantiates skills from the Bazaar, and `search_events` returns results with the TWSS-1 [execution output contract](SKILL-SPEC.md#6-skill-output-contract) (`execution.state`, `execution.safe_to_execute`, `execution.trust_source`).
+MCP tools map to the [TWSS-1 Skill Spec](SKILL-SPEC.md) lifecycle: `register_endpoint` and `create_trigger` create skill definitions, `activate_template` instantiates skills from the Bazaar, and `search_events` returns results with the TWSS-1 [execution output contract](SKILL-SPEC.md#6-skill-output-contract) (`execution.state`, `execution.safe_to_execute`, `execution.trust_source`). Three discovery tools (`fetch_abi`, `list_pools`, `validate_trigger`) help agents explore contracts and validate trigger configurations before creation.
 
 ### Server Info
 
@@ -120,6 +120,7 @@ Payment is verified before tool execution but settled only after successful exec
 
 | Tool                | Auth Tier | Price   | Product | Networks                              | Min Reputation |
 |---------------------|-----------|---------|---------|---------------------------------------|----------------|
+| `register_endpoint`  | X402    | $0.003  | both    | eip155:8453, eip155:1, eip155:42161  | 10.0           |
 | `register_middleware` | X402    | $0.003  | keeper  | eip155:8453, eip155:1, eip155:42161  | 10.0           |
 | `create_trigger`      | X402    | $0.003  | pulse   | eip155:8453, eip155:1, eip155:42161  | 10.0           |
 | `activate_template`   | X402    | $0.001  | pulse   | eip155:8453, eip155:1, eip155:42161  | 10.0           |
@@ -128,6 +129,9 @@ Payment is verified before tool execution but settled only after successful exec
 | `list_templates`      | SIWX    | free    | pulse   | --                                    | 0              |
 | `get_trigger_status`  | SIWX    | free    | pulse   | --                                    | 0              |
 | `search_events`       | SIWX    | free    | both    | --                                    | 0              |
+| `fetch_abi`           | SIWX    | free    | pulse   | --                                    | 0              |
+| `list_pools`          | SIWX    | free    | pulse   | --                                    | 0              |
+| `validate_trigger`    | SIWX    | free    | pulse   | --                                    | 0              |
 
 x402 payments are supported on multiple chains (Base, Ethereum, Arbitrum) via `x402_networks` configuration, and paid to the treasury address configured in `TRIPWIRE_TREASURY_ADDRESS`.
 
@@ -141,14 +145,12 @@ x402 payments are supported on multiple chains (Base, Ethereum, Arbitrum) via `x
 
 ## Tool Reference
 
-### 1. register_middleware
+### 1. register_endpoint (preferred)
 
-Creates an endpoint and optionally creates triggers from template slugs or custom definitions. This is the primary onboarding tool for agents.
+Creates a webhook endpoint. Returns `endpoint_id` and `webhook_secret`. Use `create_trigger` or `activate_template` separately to add event triggers. This is the preferred endpoint creation tool, replacing `register_middleware`.
 
 - **Auth tier:** X402 ($0.003)
-- **Ownership:** The authenticated agent becomes the `owner_address` of the created endpoint and all triggers.
-
-Once registered, new triggers are automatically picked up by the event processor. Events arrive from Goldsky Turbo's real-time indexing pipeline — no additional infrastructure setup required.
+- **Ownership:** The authenticated agent becomes the `owner_address` of the created endpoint.
 
 **Input schema:**
 
@@ -156,6 +158,69 @@ Once registered, new triggers are automatically picked up by the event processor
 |-------------------|------------|----------|-------------|------------------------------------------------------|
 | `url`             | string     | yes      | --          | Webhook/callback URL                                 |
 | `mode`            | string     | no       | `"execute"` | `"notify"` (Supabase Realtime) or `"execute"` (POST) |
+| `chains`          | int[]      | no       | `[8453]`    | Chain IDs to monitor                                 |
+| `recipient`       | string     | no       | agent address | Recipient address to watch                         |
+| `policies`        | object     | no       | `{}`        | Endpoint policies (see EndpointPolicies)             |
+
+**Example request:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "register_endpoint",
+    "arguments": {
+      "url": "https://myagent.example.com/webhook",
+      "mode": "notify",
+      "chains": [8453]
+    }
+  }
+}
+```
+
+**Example response:**
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"endpoint_id\": \"abc123...\", \"webhook_secret\": \"deadbeef...\", \"mode\": \"notify\", \"url\": \"https://myagent.example.com/webhook\"}"
+      }
+    ],
+    "isError": false
+  }
+}
+```
+
+### 1b. register_middleware (deprecated)
+
+> **Deprecated** -- use `register_endpoint` + `create_trigger` separately. This tool is still functional but will be removed in a future release.
+
+Creates an endpoint and optionally creates triggers from template slugs or custom definitions. This was the primary onboarding tool for agents.
+
+- **Auth tier:** X402 ($0.003)
+- **Ownership:** The authenticated agent becomes the `owner_address` of the created endpoint and all triggers.
+
+Once registered, new triggers are automatically picked up by the event processor. Events arrive from Goldsky Turbo's real-time indexing pipeline — no additional infrastructure setup required.
+
+> **⚠️ Execute mode limitation:** MCP-created endpoints with `mode="execute"` are **not provisioned in Convoy**. The `register_middleware` handler inserts the endpoint into the database and returns a `webhook_secret`, but it never calls Convoy's endpoint provisioning API. As a result, Convoy will not deliver webhooks (or HMAC-sign them) for MCP-created endpoints — the dispatcher skips endpoints without a `convoy_project_id`. The returned `webhook_secret` is effectively non-functional.
+>
+> **Notify mode (`mode="notify"`) is the currently working path for MCP-registered endpoints.** In notify mode, events are pushed via Supabase Realtime subscriptions and do not depend on Convoy.
+>
+> See [docs/SECURITY.md, Section 7.4](SECURITY.md) for the full known-issues writeup on this bug.
+
+**Input schema:**
+
+| Parameter         | Type       | Required | Default     | Description                                          |
+|-------------------|------------|----------|-------------|------------------------------------------------------|
+| `url`             | string     | yes      | --          | Webhook/callback URL                                 |
+| `mode`            | string     | no       | `"execute"` | `"notify"` (Supabase Realtime) or `"execute"` (POST) — see warning above |
 | `chains`          | int[]      | no       | `[8453]`    | Chain IDs to monitor                                 |
 | `recipient`       | string     | no       | agent address | Recipient address to watch                         |
 | `policies`        | object     | no       | `{}`        | Endpoint policies (see EndpointPolicies)             |
@@ -176,7 +241,7 @@ Once registered, new triggers are automatically picked up by the event processor
 
 Available `webhook_event_type` values: `payment.confirmed`, `payment.pending`, `payment.pre_confirmed`, `payment.failed`, `payment.reorged`, `payment.finalized`.
 
-**Example request:**
+**Example request (notify mode — recommended):**
 
 ```json
 {
@@ -187,7 +252,7 @@ Available `webhook_event_type` values: `payment.confirmed`, `payment.pending`, `
     "name": "register_middleware",
     "arguments": {
       "url": "https://myagent.example.com/webhook",
-      "mode": "execute",
+      "mode": "notify",
       "chains": [8453],
       "template_slugs": ["x402-usdc-payment"],
       "custom_triggers": [
@@ -212,13 +277,15 @@ Available `webhook_event_type` values: `payment.confirmed`, `payment.pending`, `
     "content": [
       {
         "type": "text",
-        "text": "{\"endpoint_id\": \"abc123...\", \"webhook_secret\": \"deadbeef...\", \"trigger_ids\": [\"trig1\", \"trig2\"], \"mode\": \"execute\", \"url\": \"https://myagent.example.com/webhook\"}"
+        "text": "{\"endpoint_id\": \"abc123...\", \"webhook_secret\": \"deadbeef...\", \"trigger_ids\": [\"trig1\", \"trig2\"], \"mode\": \"notify\", \"url\": \"https://myagent.example.com/webhook\"}"
       }
     ],
     "isError": false
   }
 }
 ```
+
+> **Note on `webhook_secret`:** The response always includes a `webhook_secret`, but for MCP-created endpoints this secret is **not registered with Convoy** and cannot be used to verify HMAC signatures on incoming webhooks. This is a known limitation — see the warning at the top of this section.
 
 ### 2. create_trigger
 
@@ -495,6 +562,113 @@ Each event in the response now includes three execution metadata fields:
 
 These fields follow the same derivation rules documented in the [Webhook Payload Shape](#webhook-payload-shape) section. Agents should gate irreversible side-effects on `safe_to_execute == true`.
 
+### 9. fetch_abi
+
+Fetches the ABI for any smart contract and lists its events. Use this to discover what events a contract emits before creating a trigger. Uses block explorer APIs (Basescan, Etherscan, Arbiscan).
+
+- **Auth tier:** SIWX (free)
+
+**Input schema:**
+
+| Parameter          | Type   | Required | Description                                |
+|--------------------|--------|----------|--------------------------------------------|
+| `contract_address` | string | yes      | Contract address (0x...)                   |
+| `chain`            | string | yes      | Chain name: `"base"`, `"ethereum"`, or `"arbitrum"` |
+
+**Example response (content.text parsed):**
+
+```json
+{
+  "contract_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  "chain": "base",
+  "events": [
+    {
+      "name": "Transfer",
+      "signature": "Transfer(address,address,uint256)",
+      "topic0": "0xddf252ad...",
+      "inputs": [
+        {"name": "from", "type": "address", "indexed": true},
+        {"name": "to", "type": "address", "indexed": true},
+        {"name": "value", "type": "uint256", "indexed": false}
+      ]
+    }
+  ]
+}
+```
+
+### 10. list_pools
+
+Lists popular pools for a DeFi protocol. Returns pool addresses and available events. Currently supports: aerodrome, aave-v3, uniswap-v3. Pool data is sourced from `tripwire/mcp/protocols.py`.
+
+- **Auth tier:** SIWX (free)
+
+**Input schema:**
+
+| Parameter  | Type    | Required | Default  | Description                                      |
+|------------|---------|----------|----------|--------------------------------------------------|
+| `protocol` | string  | yes      | --       | Protocol name (`"aerodrome"`, `"aave-v3"`, `"uniswap-v3"`) |
+| `chain`    | string  | no       | `"base"` | Chain name: `"base"`, `"ethereum"`, or `"arbitrum"` |
+| `limit`    | integer | no       | `10`     | Max pools to return                              |
+
+**Example response (content.text parsed):**
+
+```json
+{
+  "protocol": "aerodrome",
+  "chain": "base",
+  "pools": [
+    {
+      "address": "0x...",
+      "name": "USDC/WETH",
+      "events": ["Swap(address,address,int256,int256,uint160,uint128,int24)"]
+    }
+  ],
+  "hint": "Use fetch_abi with the pool address to get the full event ABI, then create_trigger to set up a webhook."
+}
+```
+
+### 11. validate_trigger
+
+Validates a trigger configuration before creating it. Checks event signature format, contract address validity, chain support, and filter rule syntax. Optionally validates filter rule field names against the event ABI (pass `event_abi` from `fetch_abi` output).
+
+- **Auth tier:** SIWX (free)
+
+**Input schema:**
+
+| Parameter         | Type     | Required | Description                                          |
+|-------------------|----------|----------|------------------------------------------------------|
+| `event_signature` | string   | yes      | Solidity event signature                             |
+| `contract_address`| string   | yes      | Contract address (0x...)                             |
+| `chain_id`        | integer  | yes      | Chain ID (8453=Base, 1=Ethereum, 42161=Arbitrum)     |
+| `filter_rules`    | object[] | no       | Filter rules to validate                             |
+| `event_abi`       | object[] | no       | Event ABI inputs (from `fetch_abi`) for field name validation |
+
+**Example response (content.text parsed):**
+
+```json
+{
+  "valid": true,
+  "event_signature": "Swap(address,address,int256,int256,uint160,uint128,int24)",
+  "topic0": "0xc42079f9...",
+  "contract_address": "0x...",
+  "chain_id": 8453,
+  "warnings": []
+}
+```
+
+### Agent Discovery Flow
+
+The three discovery tools support a structured workflow for agents exploring unfamiliar contracts:
+
+```
+1. list_pools("aerodrome")        → discover pool addresses and event names
+2. fetch_abi("0xPoolAddress")     → get full ABI with event signatures and inputs
+3. validate_trigger(sig, addr, chain) → validate before committing payment
+4. create_trigger(...)            → create the trigger (X402 paid)
+```
+
+This flow lets agents discover, inspect, validate, and create triggers with confidence -- paying only at the final step.
+
 ---
 
 ## Webhook Payload Shape
@@ -693,7 +867,7 @@ Every `tools/call` invocation is logged to the `audit_log` table, regardless of 
 
 ## Known Issues
 
-1. **Unused webhook_secret in register_middleware.** The handler generates a `webhook_secret` via `secrets.token_hex(32)` and returns it in the response, but it is never stored in the endpoint row or passed to Convoy. The secret is effectively useless -- Convoy is never configured to use it for HMAC signing on endpoints created through MCP.
+1. **Unused webhook_secret in register_middleware.** The handler generates a `webhook_secret` via `secrets.token_hex(32)` and returns it in the response, but it is never stored in the endpoint row or passed to Convoy. The secret is effectively useless — Convoy is never configured to use it for HMAC signing on endpoints created through MCP. **This also means execute mode (`mode="execute"`) does not work for MCP-created endpoints** — Convoy will not deliver webhooks for endpoints without a `convoy_project_id`. Use `mode="notify"` instead. See [docs/SECURITY.md, Section 7.4](SECURITY.md) for the full analysis.
 
 2. **No validation on filter_rules operators.** The `TriggerFilter` model accepts any string for the `op` field. Invalid operators (e.g., `"banana"`) are accepted silently and stored in the database. They will fail at event evaluation time with no feedback to the caller at creation time.
 

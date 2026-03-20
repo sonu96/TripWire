@@ -46,10 +46,13 @@ Budget-based execution sessions for Keeper mode, gated by `SESSION_ENABLED` (def
 - `tripwire/session/` — Session management package: `SessionManager` (manager.py) with Redis-backed session lifecycle, atomic Lua budget decrement, TTL enforcement
 - `tripwire/cache.py` — Redis-backed shared cache with in-memory fallback (fail-open)
 - `tripwire/db/` — Supabase client, repositories, SQL migrations
+- `tripwire/db/postgres.py` — Direct asyncpg connection pool for coordination primitives (advisory locks, leader election). Supabase PostgREST cannot hold session-level locks due to PgBouncer connection pooling; this module provides a dedicated connection for lock holders. All CRUD continues via Supabase/PostgREST.
 - `tripwire/db/repositories/quotas.py` — Per-wallet resource quota enforcement
 - `tripwire/types/` — Shared Pydantic models (includes `ProductMode` enum, `OnchainEvent`/`PaymentEvent`/`TriggerEvent` hierarchy)
 - `tripwire/config/` — Settings via pydantic-settings
-- `tripwire/mcp/` — MCP server, tool handlers, agent middleware registration
+- `tripwire/mcp/` — MCP server (12 tools), tool handlers, agent middleware registration
+- `tripwire/mcp/protocols.py` — Pre-configured DeFi protocol pool data for the `list_pools` MCP tool
+- `tripwire/worker.py` — Worker process entry point (in progress — runs background tasks without the API server when `PROCESS_ROLE=worker`)
 - `sdk/` — tripwire-sdk Python package
 - `tests/` — Unit and integration tests
 
@@ -63,6 +66,7 @@ Budget-based execution sessions for Keeper mode, gated by `SESSION_ENABLED` (def
 - **`ExecutionBlock`** (`tripwire/types/models.py`): Nested execution metadata — `state` (ExecutionState), `safe_to_execute` (bool), `trust_source` (TrustSource), `finality` (FinalityData | None). Used as the `execution` field on `WebhookPayload`.
 - **`derive_execution_metadata()`** returns `ExecutionBlock` (not a tuple). Derives execution state from event type and finality data.
 - **`check_finality_generic()`** (`tripwire/ingestion/finality.py`): Finality check using raw values (chain_id, block_number, tx_hash) — no `ERC3009Transfer` required. `check_finality()` delegates to it.
+- **`CoordinationLockNotAcquired`** (`tripwire/db/postgres.py`): Exception raised when `pg_try_advisory_lock` returns false (another session holds the lock). Used by `advisory_lock()` context manager.
 - **Trigger** has `required_agent_class` (str | None) and `version` (str, default "1.0.0"). Migration 025.
 - **TriggerTemplate** has `version` (str, default "1.0.0"). Migration 025.
 - **Finality field**: `required_confirmations` (not `required`) on `FinalityData`.
@@ -120,8 +124,10 @@ Budget-based execution sessions for Keeper mode, gated by `SESSION_ENABLED` (def
 - structlog for structured JSON logging
 - No web3.py — use httpx for raw JSON-RPC + eth-abi for decoding
 - Multi-chain: x402 payment networks configurable via `x402_networks` list setting (CAIP-2 format, default: Base)
-- MCP tools follow the Model Context Protocol spec — mounted at /mcp; MCP payment auth uses `TripWirePaymentHooks` pattern (not manual verify/settle)
+- MCP tools follow the Model Context Protocol spec — mounted at /mcp; MCP payment auth uses `TripWirePaymentHooks` pattern (not manual verify/settle). 12 tools total: `register_endpoint` (preferred), `register_middleware` (deprecated), `create_trigger`, `list_triggers`, `delete_trigger`, `list_templates`, `activate_template`, `get_trigger_status`, `search_events`, `fetch_abi`, `list_pools`, `validate_trigger`
 - `PRODUCT_MODE` setting controls active product ("pulse", "keeper", or "both"; default "both"). Access via `settings.is_pulse` / `settings.is_keeper`
 - `SESSION_ENABLED` setting (bool, default false) gates Keeper session system. When true, `POST/GET/DELETE /auth/session` routes are active and MCP server checks `X-TripWire-Session` header before X402/SIWX
 - `MAX_TRIGGERS_PER_WALLET` and `MAX_ENDPOINTS_PER_WALLET` settings enforce per-wallet resource quotas (HTTP 429 / JSON-RPC -32003 when exceeded)
-- **Multi-instance coordination**: Finality poller and PreConfirmedSweeper use Postgres advisory locks for leader election — only one instance runs each background task at a time. The event state machine is closed: every event reaches a terminal state (finalized, failed, or reorged)
+- **Multi-instance coordination**: Finality poller and PreConfirmedSweeper use asyncpg session-level advisory locks (`tripwire/db/postgres.py`) for leader election — only one instance runs each background task at a time. asyncpg is used instead of Supabase RPC because PostgREST connection pooling (PgBouncer) releases locks immediately. All CRUD operations continue via Supabase/PostgREST. The event state machine is closed: every event reaches a terminal state (finalized, failed, or reorged)
+- `database_url` setting (direct Postgres connection string for asyncpg coordination pool). Required when running background tasks in production
+- `process_role` setting (in progress): Controls which components start — `api` (API server only), `worker` (background tasks only), or `all` (default, both). Enables separate deployment of API and worker processes

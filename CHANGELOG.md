@@ -2,6 +2,31 @@
 
 All notable changes to TripWire are documented in this file.
 
+## [Unreleased] - 2026-03-19
+
+### Added (11cfd56 — MCP Discovery Tools)
+- **`fetch_abi` MCP tool** — Fetch the ABI for any smart contract and list its events. Uses block explorer APIs (Basescan, Etherscan, Arbiscan). Auth tier: SIWX (free). Product: pulse.
+- **`list_pools` MCP tool** — List popular pools for a DeFi protocol (aerodrome, aave-v3, uniswap-v3). Returns pool addresses and available events. Auth tier: SIWX (free). Product: pulse.
+- **`validate_trigger` MCP tool** — Validate a trigger configuration before creating it. Checks event signature format, contract address, chain support, and filter rules. Auth tier: SIWX (free). Product: pulse.
+- **`tripwire/mcp/protocols.py`** — Pre-configured DeFi protocol pool data for the `list_pools` tool.
+- **MCP tool count now 12** (was 8 before `register_endpoint` and discovery tools).
+
+### Added (d0b243e — asyncpg Coordination + register_endpoint + Migration 028)
+- **`tripwire/db/postgres.py`** — Direct asyncpg connection pool for coordination primitives. Advisory locks acquired via Supabase RPC (PostgREST) were broken because PgBouncer connection pooling releases locks immediately. This module holds a dedicated connection for the lock holder's entire session.
+- **`register_endpoint` MCP tool** — Simplified endpoint creation (no inline trigger creation). Preferred over `register_middleware`. Auth tier: X402 ($0.003). Product: both.
+- **`register_middleware` deprecated** — Still functional but marked deprecated. Agents should use `register_endpoint` + `create_trigger` separately.
+- **`CoordinationLockNotAcquired` exception** — Raised when `pg_try_advisory_lock` returns false (another session holds it).
+- **Migration 028** (`028_drop_advisory_lock_rpcs.sql`) — Drops the `try_acquire_leader_lock` and `release_leader_lock` Supabase RPC functions that were unreliable due to PostgREST connection pooling.
+- **`database_url` setting** — Direct Postgres connection string for the asyncpg coordination pool.
+- **TriggerIndex now used in hot path** — When available, provides O(1) in-memory trigger lookups during event processing.
+
+### Changed (d0b243e — asyncpg Coordination)
+- **Advisory locks use asyncpg** — Finality poller and PreConfirmedSweeper now acquire session-level advisory locks via direct asyncpg connections instead of Supabase RPC. Locks are held for the entire background task cycle on the same connection.
+
+### In Progress (Process Split)
+- **`process_role` setting** — `PROCESS_ROLE=api|worker|all` (default `all`). Controls which components start: `api` runs only the FastAPI server, `worker` runs only background tasks, `all` runs both.
+- **`tripwire/worker.py`** — Worker process entry point for running background tasks without the API server.
+
 ## [Unreleased] - 2026-03-18
 
 ### Added (a396e73 — Trigger/Endpoint Quotas + Redis Shared Caches)

@@ -46,6 +46,8 @@ The dev server starts on port **3402** by default (`http://localhost:3402`). It 
 | `MAX_TRIGGERS_PER_WALLET` | 50 | Maximum triggers a single wallet can create |
 | `MAX_ENDPOINTS_PER_WALLET` | 20 | Maximum endpoints a single wallet can register |
 
+**Process split (in progress):** Set `PROCESS_ROLE` to control which components start: `api` (FastAPI only), `worker` (background tasks only), or `all` (default, both). When running as `worker`, the entry point is `tripwire/worker.py`.
+
 Minimum `.env` for local dev (Supabase required):
 
 ```
@@ -54,6 +56,12 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your_anon_key
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
 REDIS_URL=redis://localhost:6379
+```
+
+For background task coordination (advisory locks), add a direct Postgres URL:
+
+```
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
 ```
 
 Goldsky-related env vars (both are optional in dev):
@@ -74,7 +82,8 @@ tripwire/
   api/             FastAPI routes, auth middleware, rate limiting
   config/          Settings via pydantic-settings (.env loading)
   db/              Supabase client, repositories, SQL migrations
-    migrations/    Numbered SQL migration files (001..027)
+    postgres.py    Direct asyncpg pool for coordination (advisory locks)
+    migrations/    Numbered SQL migration files (001..028)
     repositories/  Data access: endpoints, events, nonces, triggers, webhooks, quotas
       quotas.py    Resource quota enforcement (per-wallet trigger/endpoint limits)
   identity/        ERC-8004 identity resolution
@@ -90,20 +99,22 @@ tripwire/
       trigger.py   Pulse (dynamic trigger) handler + unified processing loop + C3 payment gating
     pipeline.py    Goldsky Turbo pipeline config builder and CLI management
                    (deploy_pipeline, start_pipeline, stop_pipeline, get_pipeline_status)
-  mcp/             MCP server, tool handlers, 3-tier auth (PUBLIC/SIWX/X402)
+  mcp/             MCP server (12 tools), tool handlers, 4-tier auth (PUBLIC/SIWX/SESSION/X402)
+    protocols.py   Pre-configured DeFi protocol pool data for list_pools tool
   notify/          Supabase Realtime notifier (notify-mode delivery)
   observability/   Tracing (OTel), metrics (Prometheus), audit logging, Sentry
   session/         Keeper session system (Redis-backed, feature-flagged)
     manager.py     SessionManager: create, get, validate_and_decrement, refund, close
                    Atomic budget decrement via Lua script; SessionData dataclass;
                    SessionError/SessionNotFound/SessionExpired/InsufficientBudget exceptions
-  cache.py         Redis-backed shared cache (cross-instance state: leader election, quotas)
+  cache.py         Redis-backed shared cache (cross-instance state: endpoints, triggers)
   rpc.py           Goldsky Edge RPC client: eth_call, eth_blockNumber, lazy singleton
                    httpx.AsyncClient; used by finality poller and identity resolver
   types/           Shared Pydantic v2 models
   utils/           Helpers: keccak256 topic computation, etc.
   webhook/         Convoy integration (with circuit breaker), direct httpx fast path, DLQ handler
   main.py          App factory, lifespan, middleware stack, route mounting
+  worker.py        Worker process entry point (in progress — PROCESS_ROLE=worker)
 
 sdk/
   tripwire_sdk/    Python SDK package for API consumers
@@ -335,6 +346,7 @@ There is no automated migration runner. Run them in order against your Supabase 
 | 025 | `025_skill_spec_alignment.sql` | Add `version`, `status`/lifecycle, `required_agent_class` columns to triggers and `version` to trigger_templates |
 | 026 | `026_event_neutral_schema.sql` | Make events table event-neutral for Pulse/Keeper product split: adds `event_type`, `decoded_fields`, `source`, `trigger_id`, `product_source` columns |
 | 027 | `027_advisory_lock_functions.sql` | Postgres advisory lock functions for preventing duplicate webhook dispatch in multi-instance deployments |
+| 028 | `028_drop_advisory_lock_rpcs.sql` | Drops `try_acquire_leader_lock` and `release_leader_lock` Supabase RPC functions — replaced by direct asyncpg connections in `tripwire/db/postgres.py` (PostgREST connection pooling made these unreliable) |
 
 ---
 
@@ -502,7 +514,7 @@ Every handler receives:
 
 ### Step 2: Register in server.py
 
-Add a `_register()` call in `tripwire/mcp/server.py` alongside the existing 8 tools:
+Add a `_register()` call in `tripwire/mcp/server.py` alongside the existing 12 tools:
 
 ```python
 _register(
@@ -554,7 +566,7 @@ The `EventProcessor` iterates over registered handlers and delegates to the firs
 
 ### Note: PreConfirmedSweeper Background Task (Keeper Only)
 
-The `PreConfirmedSweeper` is a Keeper-only background task that runs on a configurable interval (`PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS`, default 60s). It queries for `pre_confirmed` events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800s / 30 minutes) and expires them, preventing indefinite provisional state when the corresponding onchain transaction never arrives via Goldsky. The sweeper is started during app lifespan and only runs on the leader instance (via Redis-based leader election).
+The `PreConfirmedSweeper` is a Keeper-only background task that runs on a configurable interval (`PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS`, default 300s / 5 minutes). It queries for `pre_confirmed` events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800s / 30 minutes) and expires them, preventing indefinite provisional state when the corresponding onchain transaction never arrives via Goldsky. The sweeper is started during app lifespan and only runs on the leader instance (via Postgres advisory locks).
 
 ### Note: Redis Streams DLQ Is Now Consumed
 

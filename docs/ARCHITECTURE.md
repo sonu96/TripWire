@@ -15,7 +15,7 @@ contract: lifecycle states (provisional/confirmed/finalized/reorged),
 three-layer gating (can_pay/can_trust/is_safe), and the two-phase execution
 model (prepare/commit). Machine-readable at `/.well-known/tripwire-skill-spec.json`.
 
-Last updated: 2026-03-18
+Last updated: 2026-03-19
 
 ---
 
@@ -25,7 +25,7 @@ TripWire is organized into six architecture layers spanning two planes:
 
 ```
 ─── CONTROL PLANE (MCP + API) ────────────────────────────────────────────
-L5  MCP            AI agent interface (8 tools, 4-tier auth, x402 Bazaar)
+L5  MCP            AI agent interface (12 tools, 4-tier auth, x402 Bazaar)
 L4  Application    Developer's API (receives structured webhook, executes logic)
 L3  Delivery       Convoy (execute mode) + Supabase Realtime (notify mode)
 L2  Middleware      TripWire FastAPI (decode, dedup, finality, identity, policy)
@@ -184,7 +184,7 @@ recording, delivery recording).
                                  |
                         +--------+--------+
                         |   MCP Server    |  POST /mcp (JSON-RPC 2.0)
-                        |  8 tools        |  4-tier auth: PUBLIC / SIWX / SESSION / X402
+                        |  12 tools       |  4-tier auth: PUBLIC / SIWX / SESSION / X402
                         +--------+--------+
                                  |
    +-----------------------------+-----------------------------+
@@ -752,11 +752,16 @@ to be processed as a new event when it reappears in a different block.
 - **Pre-confirmed events are swept after TTL.** The `PreConfirmedSweeper`
   marks stale `pre_confirmed` events as `payment.failed` after
   `PRE_CONFIRMED_TTL_SECONDS` (default 30 minutes). See Section 16b.
-- **30s cache TTL means new triggers are invisible for up to 30 seconds.**
-  The endpoint cache (`processor.py`), trigger topic cache
-  (`triggers.py`), and TriggerIndex (`trigger_worker.py`) all use
-  in-process TTL caches. A newly created trigger will not be evaluated
-  against incoming events until the cache refreshes.
+- **Cache layers have different staleness characteristics.**
+  The endpoint cache (`processor.py`) and trigger topic cache
+  (`triggers.py`, 30s TTL) use time-bounded in-process caches. However,
+  `TriggerRepository.list_active()` — which feeds the TriggerIndex — uses
+  indefinite in-process memoization with no TTL. On the instance that
+  creates or deactivates a trigger, `invalidate_trigger_cache()` clears
+  this cache immediately. On other instances, the `list_active()` cache
+  persists until the process restarts. A newly created trigger is visible
+  to the mutating instance on the next TriggerIndex refresh (up to 10s),
+  but may not propagate to other instances until they are restarted.
 
 **"Goldsky tells you what happened. TripWire decides if it's safe to act. Convoy makes sure you hear about it."**
 
@@ -990,9 +995,18 @@ only). Invalid topics are routed to `tripwire:events:unknown`.
     +-- Stream discovery loop (every 30s, scans for new streams)
 ```
 
-**TriggerIndex**: In-memory dict mapping `topic0 -> [Trigger]`. Rebuilt
-from the database every 10 seconds. Uses an asyncio lock with double-check
-to prevent concurrent refreshes.
+**TriggerIndex**: In-memory dict mapping `topic0 -> [Trigger]`. Now used in
+the hot path for event processing when available (not just by event bus
+workers). The refresh loop runs every 10 seconds, but it reads from
+`TriggerRepository.list_active()`,
+which uses indefinite in-process memoization (no TTL). On the instance that
+handles a trigger create/deactivate, `invalidate_trigger_cache()` clears the
+repository cache immediately, so the next refresh picks up the change. On other
+instances, `list_active()` continues to return its cached result until the
+process restarts or the cache is explicitly invalidated. The TriggerIndex also
+writes each topic's triggers to `RedisCache` (10s TTL) for cross-instance
+lookups, but `refresh()` itself reads from the repository, not from Redis.
+Uses an asyncio lock with double-check to prevent concurrent refreshes.
 
 **TriggerWorker**: Each worker runs an XREADGROUP consumer loop:
 
@@ -1142,8 +1156,12 @@ INSERT/UPDATE/DELETE trigger function (migration 015).
 ```
 
 The TriggerIndex (used by event bus workers) maintains an in-memory dict
-rebuilt from the database every 10 seconds. Uses the precomputed `topic0`
-column (keccak256 hash), added in migration 017.
+with a 10-second refresh loop. However, the refresh reads from
+`TriggerRepository.list_active()`, which has indefinite in-process
+memoization — so the refresh only sees new data if the repository cache
+has been invalidated (by a local mutation) or the process has restarted.
+Uses the precomputed `topic0` column (keccak256 hash), added in migration
+017.
 
 ### 9.3 Decoder Abstraction (Phase C1)
 
@@ -1618,11 +1636,12 @@ logged but not retried.
 `ttl_seconds + 60` (slightly beyond the session's logical expiry) to
 ensure automatic cleanup even if the agent never calls `DELETE`.
 
-### 11.2 Tool Registry
+### 11.2 Tool Registry (12 tools)
 
 | Tool               | Auth Tier | Price   | Product | Description                           |
 |--------------------|-----------|---------|---------|---------------------------------------|
-| register_middleware| X402      | $0.003  | keeper  | Create endpoint + triggers in one call|
+| register_endpoint  | X402      | $0.003  | both    | Create endpoint (preferred). Use create_trigger separately for triggers |
+| register_middleware| X402      | $0.003  | keeper  | **(Deprecated)** Create endpoint + triggers in one call. Use register_endpoint instead |
 | create_trigger     | X402      | $0.003  | pulse   | Create custom trigger for endpoint    |
 | list_triggers      | SIWX      | free    | pulse   | List caller's active triggers         |
 | delete_trigger     | SIWX      | free    | pulse   | Soft-delete a trigger                 |
@@ -1630,6 +1649,9 @@ ensure automatic cleanup even if the agent never calls `DELETE`.
 | activate_template  | X402      | $0.001  | pulse   | Instantiate template for endpoint     |
 | get_trigger_status | SIWX      | free    | pulse   | Check trigger health + event count    |
 | search_events      | SIWX      | free    | both    | Query recent events                   |
+| fetch_abi          | SIWX      | free    | pulse   | Fetch contract ABI and list events    |
+| list_pools         | SIWX      | free    | pulse   | List popular DeFi protocol pools      |
+| validate_trigger   | SIWX      | free    | pulse   | Validate trigger config before creation |
 
 The `product` tag on each tool (`ToolDef.product`) controls visibility
 based on `PRODUCT_MODE`. Tools tagged `"pulse"` are hidden in Keeper-only
@@ -1798,10 +1820,14 @@ The `PreConfirmedSweeper` background task marks stale `pre_confirmed`
 events as `payment.failed` after `PRE_CONFIRMED_TTL_SECONDS` (default
 30 minutes). See Section 16b.
 
-**P3. ~~In-process caches are not shared across instances.~~ RESOLVED.**
+**P3. ~~In-process caches are not shared across instances.~~ PARTIALLY RESOLVED.**
 `tripwire/cache.py` `RedisCache` provides shared Redis-backed caches for
-endpoints and triggers with in-memory fallback. Cache invalidation on
-mutation ensures near-instant visibility. See Section 16d.
+endpoints and triggers with in-memory fallback. However,
+`TriggerRepository.list_active()` retains an indefinite in-process cache
+that is only invalidated locally on mutation — other instances serve stale
+data until process restart. The Redis-backed cache layer (Section 16d)
+provides cross-instance visibility for direct topic lookups but does not
+bypass the repository-level memoization in the TriggerIndex refresh path.
 
 **P4. ~~No per-wallet trigger cap.~~ RESOLVED.**
 Per-wallet quotas enforce `MAX_TRIGGERS_PER_WALLET` (default 50) and
@@ -1821,7 +1847,7 @@ instances.
 |-------|-------------------------------------------------|----------------------|
 | P1    | Finality poller has no distributed lock          | Migration 027 (advisory lock leader election, lock 839201) |
 | P2    | Stranded pre_confirmed events                   | PreConfirmedSweeper (30 min TTL, advisory lock 839202) |
-| P3    | In-process caches not shared across instances   | `tripwire/cache.py` RedisCache with in-memory fallback |
+| P3    | In-process caches not shared across instances   | Partially resolved: RedisCache for topic lookups, but `list_active()` memoization remains per-instance |
 | P4    | No per-wallet trigger cap                       | Resource quotas: 50 triggers, 20 endpoints per wallet |
 | #7    | events.endpoint_id only records first match     | Migration 014 (event_endpoints join table) |
 | #8    | DB breach exposes webhook signing secrets        | Migration 016 (dropped webhook_secret; Convoy is sole HMAC signer) |
@@ -1850,6 +1876,8 @@ or `.env` file. See `tripwire/config/settings.py`.
 | LOG_LEVEL                     | info                   | Logging level                        |
 | SUPABASE_URL                  | (required in prod)     | Supabase project URL                 |
 | SUPABASE_SERVICE_ROLE_KEY     | (required in prod)     | Supabase service role key            |
+| DATABASE_URL                  |                        | Direct Postgres DSN for asyncpg coordination pool (advisory locks) |
+| PROCESS_ROLE                  | all                    | Process role: api, worker, or all (in progress) |
 | CONVOY_API_KEY                | (required in prod)     | Convoy API key                       |
 | CONVOY_URL                    | http://localhost:5005  | Convoy server URL                    |
 | GOLDSKY_WEBHOOK_SECRET        |                        | Validates inbound Goldsky Turbo webhooks |
@@ -1916,12 +1944,19 @@ Background tasks that must run as singletons (finality poller, TTL sweeper)
 use Postgres advisory locks for leader election. This replaces the previous
 requirement to manually disable tasks on all-but-one instance.
 
-**Mechanism**: `pg_try_advisory_lock(lock_id)` via Supabase RPC wrappers
-`try_acquire_leader_lock(lock_id)` and `release_leader_lock(lock_id)` (migration
-027). The lock is non-blocking: if another instance already holds the lock,
-`pg_try_advisory_lock` returns `false` and the losing instance skips the
-cycle silently. Locks are session-scoped and automatically released on
-disconnect.
+**Mechanism**: `pg_try_advisory_lock(lock_id)` via direct asyncpg connections
+(`tripwire/db/postgres.py`). The lock is non-blocking: if another instance
+already holds the lock, `pg_try_advisory_lock` returns `false` and the losing
+instance raises `CoordinationLockNotAcquired`, causing it to skip the cycle
+silently. Locks are session-scoped and automatically released on disconnect.
+
+**Why asyncpg instead of Supabase RPC**: The original implementation
+(migration 027) wrapped `pg_try_advisory_lock` in SQL functions called via
+Supabase RPC (PostgREST). This was broken because PostgREST uses PgBouncer
+connection pooling -- advisory locks are released as soon as the HTTP request
+completes, making leader election unreliable. Migration 028 drops those RPC
+functions. The asyncpg pool holds a dedicated connection for the entire lock
+duration, ensuring the lock persists across the full background task cycle.
 
 **Lock IDs**:
 
@@ -1930,21 +1965,28 @@ disconnect.
 | 839201  | FinalityPoller     | Finality confirmation poll cycle     |
 | 839202  | PreConfirmedSweeper| TTL sweep for stale pre_confirmed events |
 
-**Behavior**: At the start of each poll/sweep cycle, the task calls
-`try_acquire_leader_lock`. If it returns `true`, the task proceeds normally
-and releases the lock at the end of the cycle. If it returns `false`, the
-task sleeps until the next interval. This means exactly one instance
-processes per cycle, even in a multi-instance deployment.
+**Behavior**: At the start of each poll/sweep cycle, the task enters an
+`async with advisory_lock(lock_id)` context manager. If the lock is acquired,
+the task proceeds normally; the lock is released when the context exits.
+If `CoordinationLockNotAcquired` is raised, the task sleeps until the next
+interval. This means exactly one instance processes per cycle, even in a
+multi-instance deployment.
 
-**SQL functions** (migration 027):
+**`tripwire/db/postgres.py`**:
 
-```sql
--- try_acquire_leader_lock(lock_id bigint) -> boolean
--- release_leader_lock(lock_id bigint) -> void
+```python
+@asynccontextmanager
+async def advisory_lock(lock_id: int) -> AsyncIterator[Any]:
+    # Acquires via pg_try_advisory_lock, yields the connection,
+    # releases via pg_advisory_unlock on exit.
+    # Raises CoordinationLockNotAcquired if lock is held.
 ```
 
-These are thin wrappers around `pg_try_advisory_lock` / `pg_advisory_unlock`
-exposed as Supabase RPC functions so they can be called via supabase-py.
+Requires `DATABASE_URL` to be set. The asyncpg pool is initialized during
+app lifespan (`init_pool(settings.database_url)`) and closed on shutdown
+(`close_pool()`). Helper queries (`fetch_pending_events`,
+`fetch_stale_preconfirmed`, `update_event_status`, etc.) run on the
+lock-holder's connection to ensure they execute within the same session.
 
 ---
 
@@ -1972,8 +2014,8 @@ events as `payment.failed` after the configurable TTL
 The sweeper:
 - Runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes)
 - Queries events with `status = 'pre_confirmed'` and `created_at < now() - TTL`
-- Updates status to `failed`
-- Dispatches `payment.failed` webhooks to linked endpoints
+- Updates status to `payment.failed` in the database
+- **Does not currently dispatch `payment.failed` webhooks** — the sweeper is wired with `webhook_dispatcher=None` in production (`tripwire/main.py`). Only the database status is updated.
 - Protected by advisory lock 839202 (Keeper-only, single-instance execution)
 
 ---
@@ -2020,12 +2062,41 @@ across instances.
 | TriggerIndex     | `cache:triggers:{topic0}`  | 10s  | Trigger lookup by topic0       |
 
 **Cache invalidation**: Mutations (endpoint create/update/delete, trigger
-create/update/delete) invalidate the relevant cache key immediately after
-the database write. This ensures that new triggers and endpoints are visible
-to all instances within seconds, rather than waiting for TTL expiry.
+create/update/delete) invalidate the relevant Redis cache key immediately
+after the database write. However, `TriggerRepository.list_active()` — which
+feeds `TriggerIndex.refresh()` — maintains a separate indefinite in-process
+cache that is only cleared locally by `invalidate_trigger_cache()`. This
+means a trigger created on instance A is visible to A's TriggerIndex on the
+next 10s refresh, but instance B's `list_active()` cache still holds stale
+data until B's process restarts. The Redis-backed TriggerIndex cache (10s
+TTL) provides cross-instance visibility for direct topic lookups, but the
+repository-level memoization limits freshness for the bulk refresh path.
 
 **Redis key prefix**: All cache keys use the `cache:` prefix to avoid
 collisions with other Redis consumers (event bus, sessions, rate limiting).
+
+---
+
+## 16e. Process Split (In Progress)
+
+TripWire is being split into separate API and worker processes, controlled
+by the `PROCESS_ROLE` setting (`api`, `worker`, or `all`; default `all`).
+
+| Role | Components | Entry Point |
+|------|-----------|-------------|
+| `api` | FastAPI server, MCP server, REST routes, health checks, metrics | `tripwire/main.py` |
+| `worker` | FinalityPoller, PreConfirmedSweeper, WorkerPool, DLQ handlers, NonceArchiver | `tripwire/worker.py` |
+| `all` | Both (current default, backward-compatible) | `tripwire/main.py` |
+
+**Motivation**: Separating API and worker processes allows independent
+scaling and deployment. API instances can be load-balanced without
+duplicate background task execution, while worker instances focus on
+event processing and finality polling.
+
+**`tripwire/worker.py`**: Standalone entry point that starts only the
+background task subsystem (asyncpg pool, event bus workers, finality
+poller, sweeper, DLQ handlers). Does not mount FastAPI routes or the
+MCP server.
 
 ---
 

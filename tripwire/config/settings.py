@@ -14,6 +14,27 @@ class Settings(BaseSettings):
     log_level: str = "info"
     cors_allowed_origins: list[str] = ["http://localhost:3000", "http://localhost:3402"]
 
+    # Process role: "all" (monolith), "api" (HTTP only), "worker" (background tasks only)
+    process_role: str = "all"
+
+    @field_validator("process_role", mode="after")
+    @classmethod
+    def _validate_process_role(cls, v: str) -> str:
+        allowed = {"all", "api", "worker"}
+        if v not in allowed:
+            raise ValueError(f"process_role must be one of {allowed}, got {v!r}")
+        return v
+
+    @property
+    def is_api(self) -> bool:
+        """True when this process should serve HTTP traffic."""
+        return self.process_role in ("all", "api")
+
+    @property
+    def is_worker(self) -> bool:
+        """True when this process should run background tasks."""
+        return self.process_role in ("all", "worker")
+
     # Product mode: "pulse" (generic triggers), "keeper" (x402 payments), or "both"
     product_mode: ProductMode = ProductMode.BOTH
 

@@ -23,7 +23,8 @@ Deploy as Pulse-only, Keeper-only, or both (default) via the `PRODUCT_MODE` envi
 - **Keeper sessions.** Pre-authorized spending limits stored in Redis with atomic Lua-script budget decrements. Agents open a session once, then make multiple MCP tool calls using the `X-TripWire-Session` header instead of per-call x402 payments. Feature-flagged via `SESSION_ENABLED`.
 - **Delivers signed webhooks via Convoy** with at-least-once guarantees. HMAC-signed payloads, exponential backoff retries (10 attempts), and a dead-letter queue ensure nothing is silently dropped.
 - **Resource quotas.** Per-wallet caps on triggers and endpoints (`MAX_TRIGGERS_PER_WALLET`, `MAX_ENDPOINTS_PER_WALLET`) prevent runaway resource creation.
-- **Multi-instance coordination.** Postgres advisory locks provide leader election for the finality poller and TTL sweeper, so multiple TripWire instances can run safely without duplicate background work.
+- **Multi-instance coordination.** Postgres advisory locks (via asyncpg) provide leader election for the finality poller and TTL sweeper, so multiple TripWire instances can run safely without duplicate background work.
+- **Process split (in progress).** Separate API and worker processes via `PROCESS_ROLE=api|worker|all` for independent scaling. API instances serve HTTP requests; worker instances run background tasks (finality polling, event bus, sweeper).
 
 ---
 
@@ -57,7 +58,7 @@ L3  Convoy Delivery   HMAC-signed webhooks, 10x retries, backoff, DLQ
      |
 L4  Your App          Receives verified payload, executes business logic
      |
-L5  MCP Server        AI agent interface -- 8 tools for trigger CRUD via JSON-RPC
+L5  MCP Server        AI agent interface -- 12 tools for trigger CRUD + discovery via JSON-RPC
 ```
 
 Two ingestion paths feed the same pipeline:
@@ -105,21 +106,23 @@ APP_ENV=production python -m tripwire.main
 
 ## MCP Server
 
-TripWire exposes 8 tools via the [Model Context Protocol](https://modelcontextprotocol.io/) at `/mcp`, enabling AI agents to manage triggers programmatically over JSON-RPC 2.0.
+TripWire exposes 12 tools via the [Model Context Protocol](https://modelcontextprotocol.io/) at `/mcp`, enabling AI agents to manage triggers programmatically over JSON-RPC 2.0.
 
-### 3-Tier Authentication
+### 4-Tier Authentication
 
 | Tier     | Mechanism              | Tools                                                                          |
 |----------|------------------------|--------------------------------------------------------------------------------|
 | PUBLIC   | None                   | `initialize`, `tools/list`                                                     |
-| SIWX     | Wallet signature       | `list_triggers`, `delete_trigger`, `list_templates`, `get_trigger_status`, `search_events` |
-| X402     | Per-call micropayment  | `register_middleware` ($0.003), `create_trigger` ($0.003), `activate_template` ($0.001) |
+| SIWX     | Wallet signature       | `list_triggers`, `delete_trigger`, `list_templates`, `get_trigger_status`, `search_events`, `fetch_abi`, `list_pools`, `validate_trigger` |
+| SESSION  | Pre-funded budget      | Any X402 tool (bypasses per-call payment)                                      |
+| X402     | Per-call micropayment  | `register_endpoint` ($0.003), `register_middleware` ($0.003, deprecated), `create_trigger` ($0.003), `activate_template` ($0.001) |
 
-### All 8 Tools
+### All 12 Tools
 
 | Tool                  | Auth | Description                                                       |
 |-----------------------|------|-------------------------------------------------------------------|
-| `register_middleware` | X402 | Register TripWire as middleware. Creates endpoint + triggers.     |
+| `register_endpoint`   | X402 | Create a webhook endpoint. Use create_trigger separately for triggers. |
+| `register_middleware` | X402 | **(Deprecated)** Creates endpoint + triggers. Use register_endpoint instead. |
 | `create_trigger`      | X402 | Create a custom trigger for any event signature.                  |
 | `list_triggers`       | SIWX | List your active triggers.                                        |
 | `delete_trigger`      | SIWX | Deactivate a trigger (soft delete).                               |
@@ -127,8 +130,11 @@ TripWire exposes 8 tools via the [Model Context Protocol](https://modelcontextpr
 | `activate_template`   | X402 | Instantiate a Bazaar template with custom params.                 |
 | `get_trigger_status`  | SIWX | Check trigger health and recent event count.                      |
 | `search_events`       | SIWX | Query recent events for your endpoints.                           |
+| `fetch_abi`           | SIWX | Fetch contract ABI and list its events.                           |
+| `list_pools`          | SIWX | List popular DeFi protocol pools (aerodrome, aave-v3, uniswap-v3). |
+| `validate_trigger`    | SIWX | Validate a trigger configuration before creating it.              |
 
-### Example: Register Middleware
+### Example: Register Middleware (deprecated -- use register_endpoint)
 
 ```json
 {

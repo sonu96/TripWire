@@ -1,6 +1,6 @@
 # TripWire Security Model
 
-> Last updated: 2026-03-18
+> Last updated: 2026-03-19
 
 This document describes TripWire's authentication, authorization, and secret management as implemented in the codebase. It is intended as an honest reference for auditors and contributors. Known bugs and gaps are called out explicitly.
 
@@ -314,6 +314,7 @@ But this secret is **never passed to Convoy**. The handler inserts the endpoint 
 | Secret | Storage | Type | Used By |
 |---|---|---|---|
 | `SUPABASE_SERVICE_ROLE_KEY` | Environment / `.env` | `SecretStr` | Supabase client authentication |
+| `DATABASE_URL` | Environment / `.env` | `str` | Direct Postgres connection for asyncpg advisory lock pool. Grants full DB access -- treat as secret. |
 | `CONVOY_API_KEY` | Environment / `.env` | `SecretStr` | Convoy REST API Bearer token |
 | `GOLDSKY_WEBHOOK_SECRET` | Environment / `.env` | `SecretStr` | Validates inbound Goldsky webhooks |
 | `GOLDSKY_EDGE_API_KEY` | Environment / `.env` | `SecretStr` | Goldsky Edge managed RPC auth |
@@ -528,7 +529,13 @@ This prevents a single wallet from monopolizing database resources or inflating 
 
 ## 14. Advisory Locks
 
-Postgres advisory locks are used to prevent duplicate webhook dispatch in multi-instance deployments. When the event processor prepares to dispatch a webhook for a given event, it acquires an advisory lock keyed on the event ID. This ensures that only one TripWire instance dispatches the webhook even when multiple instances process the same event concurrently (e.g., during leader failover or event bus redelivery). The lock functions are defined in migration `027_advisory_lock_functions.sql`.
+Postgres advisory locks are used to prevent duplicate webhook dispatch in multi-instance deployments. When the event processor prepares to dispatch a webhook for a given event, it acquires an advisory lock keyed on the event ID. This ensures that only one TripWire instance dispatches the webhook even when multiple instances process the same event concurrently (e.g., during leader failover or event bus redelivery).
+
+**Implementation**: Advisory locks are acquired via direct asyncpg connections (`tripwire/db/postgres.py`), NOT via Supabase RPC. The original approach (migration 027) defined `try_acquire_leader_lock` and `release_leader_lock` as PostgreSQL functions called via PostgREST. This was broken because PostgREST uses PgBouncer connection pooling, which returns the connection to the pool as soon as the HTTP request completes -- releasing the advisory lock immediately. Migration 028 drops those RPC functions.
+
+The `advisory_lock()` context manager in `tripwire/db/postgres.py` acquires a dedicated asyncpg connection, calls `pg_try_advisory_lock(lock_id)` on it, and holds both the connection and the lock for the entire duration of the `async with` block. On exit, it explicitly calls `pg_advisory_unlock` and returns the connection to the pool. If the lock is already held by another session, `CoordinationLockNotAcquired` is raised.
+
+Requires `DATABASE_URL` to be set. This is a sensitive credential (direct Postgres connection string) and should be treated with the same care as `SUPABASE_SERVICE_ROLE_KEY`.
 
 ---
 

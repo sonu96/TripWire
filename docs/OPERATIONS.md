@@ -22,6 +22,18 @@ All configuration is loaded from environment variables (or a `.env` file) via py
 | `SUPABASE_ANON_KEY` | str | `""` | No | Public anon key (safe to expose client-side). |
 | `SUPABASE_SERVICE_ROLE_KEY` | SecretStr | `""` | Yes | Service role key. Bypasses RLS. Never expose. |
 
+### Direct Postgres (asyncpg)
+
+| Variable | Type | Default | Required in prod | Description |
+|---|---|---|---|---|
+| `DATABASE_URL` | str | `""` | Yes (for background tasks) | Direct PostgreSQL connection string (`postgresql://...`). Used by the asyncpg pool for advisory lock coordination. Required for finality poller and TTL sweeper leader election. Not needed if running API-only (`PROCESS_ROLE=api`). |
+
+### Process Role
+
+| Variable | Type | Default | Required in prod | Description |
+|---|---|---|---|---|
+| `PROCESS_ROLE` | str | `all` | No | Controls which components start: `api` (FastAPI server only), `worker` (background tasks only), or `all` (both). Enables separate deployment of API and worker processes. |
+
 ### Convoy / Webhooks
 
 | Variable | Type | Default | Required in prod | Description |
@@ -156,6 +168,7 @@ The FastAPI lifespan manager (`tripwire/main.py`) runs the following steps in or
 2. **structlog configuration** (before lifespan) -- `setup_logging()` is called before any logger is created.
 3. **OpenTelemetry tracing** -- If `OTEL_ENABLED=true`, tracing is set up early so all spans are captured.
 4. **Supabase client** -- Connects to the Supabase PostgreSQL database.
+4b. **asyncpg pool** (if `DATABASE_URL` is set) -- Creates a direct asyncpg connection pool for advisory lock coordination. Used by the finality poller and TTL sweeper for leader election.
 5. **Audit logger** -- Fire-and-forget writes to the `audit_log` table.
 6. **Webhook provider** -- Creates `ConvoyProvider` (production) or `LogOnlyProvider` (dev without key).
 7. **Goldsky webhook secret check** -- Warns if missing in non-development environments.
@@ -180,8 +193,9 @@ The FastAPI lifespan manager (`tripwire/main.py`) runs the following steps in or
 4. Stop PreConfirmedSweeper
 5. Stop nonce archiver
 6. Stop DLQ handler
-7. Close shared RPC HTTP client
-8. Flush and shut down OpenTelemetry tracing
+7. Close asyncpg coordination pool (if initialized)
+8. Close shared RPC HTTP client
+9. Flush and shut down OpenTelemetry tracing
 
 ---
 
@@ -206,7 +220,7 @@ Middleware is applied in reverse declaration order (outermost runs first). The e
 
 ### Finality Poller
 
-**Leader-elected**: Uses Postgres advisory lock 839201 via `try_acquire_leader_lock()`. Safe for multi-instance deployment -- only one instance polls per cycle.
+**Leader-elected**: Uses Postgres advisory lock 839201 via `advisory_lock()` (asyncpg session-level lock in `tripwire/db/postgres.py`). Safe for multi-instance deployment -- only one instance polls per cycle. Requires `DATABASE_URL` to be set.
 
 Spawns one asyncio task per supported chain. Each chain polls on its own cadence because finality semantics differ:
 
@@ -236,11 +250,11 @@ Runs daily (every 86400 seconds). Calls the `archive_old_nonces` database functi
 
 ### PreConfirmedSweeper
 
-Background task that marks stale `pre_confirmed` events as `payment.failed`. Runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes). Events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800 = 30 minutes) are swept. Dispatches `payment.failed` webhooks to linked endpoints.
+Background task that marks stale `pre_confirmed` events as `payment.failed` in the database. Runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes). Events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800 = 30 minutes) are swept. **Known gap**: the sweeper is wired with `webhook_dispatcher=None` in production (`tripwire/main.py`), so `payment.failed` webhooks are **not** currently dispatched for TTL-expired events. The database status is updated but no outbound webhook is sent.
 
 **Keeper-only**: Only active when `PRODUCT_MODE` includes Keeper (`keeper` or `both`).
 
-**Leader-elected**: Uses Postgres advisory lock 839202 via `try_acquire_leader_lock()`. Safe for multi-instance deployment -- only one instance sweeps per cycle. Non-leaders skip silently.
+**Leader-elected**: Uses Postgres advisory lock 839202 via `advisory_lock()` (asyncpg session-level lock in `tripwire/db/postgres.py`). Safe for multi-instance deployment -- only one instance sweeps per cycle. Non-leaders skip silently. Requires `DATABASE_URL` to be set.
 
 **Config knobs**: `PRE_CONFIRMED_TTL_SECONDS` (default 1800), `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300).
 
@@ -418,7 +432,8 @@ All migrations live in `tripwire/db/migrations/` and are numbered sequentially. 
 | `024_trigger_payment_gating.sql` | Adds `require_payment`, `payment_token`, `min_payment_amount` to triggers for per-trigger payment gating. |
 | `025_skill_spec_alignment.sql` | Adds `version`, `status`/lifecycle, `required_agent_class` to triggers and templates. |
 | `026_event_neutral_schema.sql` | Makes events table event-neutral for Pulse/Keeper split: adds `event_type`, `decoded_fields`, `source`, `trigger_id`, `product_source` columns. |
-| `027_advisory_locks.sql` | Creates `try_acquire_leader_lock(bigint)` and `release_leader_lock(bigint)` SQL functions wrapping `pg_try_advisory_lock` / `pg_advisory_unlock`. Used for leader election by FinalityPoller (lock 839201) and PreConfirmedSweeper (lock 839202). |
+| `027_advisory_locks.sql` | Creates `try_acquire_leader_lock(bigint)` and `release_leader_lock(bigint)` SQL functions wrapping `pg_try_advisory_lock` / `pg_advisory_unlock`. Used for leader election by FinalityPoller (lock 839201) and PreConfirmedSweeper (lock 839202). **(Superseded by migration 028.)** |
+| `028_drop_advisory_lock_rpcs.sql` | Drops `try_acquire_leader_lock` and `release_leader_lock` Supabase RPC functions. Advisory locks now use direct asyncpg connections (`tripwire/db/postgres.py`) because PostgREST connection pooling (PgBouncer) released locks prematurely. |
 
 ### How to Run
 
@@ -546,7 +561,7 @@ Used for five purposes:
 2. Rate limiting via SlowAPI
 3. Event bus streams (only when `EVENT_BUS_ENABLED=true`)
 4. Session storage (only when `SESSION_ENABLED=true`) -- each session is a Redis hash at `session:{session_id}` with fields for wallet address, budget, TTL, identity data. Budget decrements use an atomic Lua script (`EVALSHA`). Sessions have a Redis-level TTL of `ttl_seconds + 60` for automatic cleanup.
-5. Shared caches for endpoints and triggers (`tripwire/cache.py` `RedisCache`). Keys use the `cache:` prefix. Cache invalidation on mutation ensures near-instant cross-instance visibility.
+5. Shared caches for endpoints and triggers (`tripwire/cache.py` `RedisCache`). Keys use the `cache:` prefix. Cache invalidation on mutation provides cross-instance visibility for direct topic lookups. Note: `TriggerRepository.list_active()` maintains a separate indefinite in-process cache that is only invalidated locally — see Caches section below.
 
 **Fail-open**: The shared caches degrade gracefully -- if Redis is unavailable, the app falls back to per-instance in-memory caches. All other functionality (auth, rate limiting, event bus, sessions) continues to require Redis when enabled.
 
@@ -615,7 +630,7 @@ TripWire resolves onchain AI agent identities via the ERC-8004 registries deploy
 
 ### Multi-Instance Deployment
 
-Postgres advisory locks (migration 027) make the following background tasks safe for multi-instance deployment without manual configuration:
+Postgres advisory locks (via asyncpg, `tripwire/db/postgres.py`) make the following background tasks safe for multi-instance deployment without manual configuration:
 
 - **Finality poller** (lock 839201) -- Only one instance polls per cycle. Losing instances skip silently.
 - **PreConfirmedSweeper** (lock 839202) -- Only one instance sweeps per cycle.
@@ -624,6 +639,26 @@ The following components do NOT have advisory locks and still require manual sin
 
 - **DLQ handler** -- Multiple instances will retry the same failed deliveries. Use `DLQ_ENABLED=false` on extra instances.
 - **Nonce archiver** -- Multiple instances will attempt concurrent archival (not harmful but wasteful, uses `FOR UPDATE SKIP LOCKED` at the DB level).
+
+### Process Split Deployment (In Progress)
+
+For production deployments, API and worker processes can be deployed separately using `PROCESS_ROLE`:
+
+```bash
+# API service (handles HTTP requests, MCP, health checks)
+PROCESS_ROLE=api python -m tripwire.main
+
+# Worker service (runs background tasks: finality poller, sweeper, event bus)
+PROCESS_ROLE=worker python -m tripwire.worker
+```
+
+| Service | PROCESS_ROLE | DATABASE_URL | Notes |
+|---------|-------------|-------------|-------|
+| API | `api` | Optional | No background tasks run. Can scale horizontally without coordination concerns. |
+| Worker | `worker` | Required | Runs finality poller, sweeper, event bus workers. Advisory locks prevent duplicate work across multiple worker instances. |
+| Combined | `all` (default) | Required for bg tasks | Current behavior -- runs everything in one process. |
+
+**Worker process monitoring**: The worker process exposes health status via structured logs. Monitor for `advisory_lock_acquired` and `advisory_lock_not_acquired` log events to verify leader election is functioning. If no worker instance acquires a lock for an extended period, check that `DATABASE_URL` is correctly configured and the asyncpg pool is healthy.
 
 ---
 
@@ -635,20 +670,21 @@ The finality poller uses a Postgres advisory lock (lock ID 839201, migration 027
 
 ### Caches
 
-**Shared (Redis-backed)**: Endpoint and trigger caches are now backed by `tripwire/cache.py` `RedisCache`. Cache keys are invalidated on mutation (create/update/delete), so new triggers and endpoints are visible across instances within seconds.
+**Shared (Redis-backed)**: Endpoint and trigger caches are backed by `tripwire/cache.py` `RedisCache`. Redis cache keys are invalidated on mutation (create/update/delete). However, `TriggerRepository.list_active()` — which feeds `TriggerIndex.refresh()` — uses indefinite in-process memoization that is only cleared locally by `invalidate_trigger_cache()` on the instance that performs the mutation. On other instances, `list_active()` continues to return stale data until process restart. Endpoint caches and per-topic trigger lookups via RedisCache work as expected across instances.
 
 **Still in-process** (not shared across instances):
 
+- **`TriggerRepository.list_active()` cache** -- Indefinite in-process memoization (no TTL). Cleared by `invalidate_trigger_cache()` on local mutations only. On non-mutating instances, stale until process restart. This is the primary data source for `TriggerIndex.refresh()`.
 - **Event bus consumer group cache** (`_known_groups`) -- Tracks which streams have consumer groups created. Invalidated on NOGROUP errors.
 - **Event bus stream key cache** (`_known_stream_keys`) -- Tracks distinct stream keys for MAX_STREAMS enforcement. Populated from Redis on startup.
 - **TriggerWorker failure counts** -- Per-message failure counts for DLQ routing. Lost on restart; messages may be retried from zero.
 - **Identity resolver cache** -- TTL-based cache (`IDENTITY_CACHE_TTL=300s`). Each instance has independent cache state.
 
-The identity resolver cache remains per-instance. Identity updates propagate only via TTL expiry (up to 300s staleness).
+The identity resolver cache remains per-instance. Identity updates propagate only via TTL expiry (up to 300s staleness). The `list_active()` cache is more impactful: trigger changes made on one instance are invisible to other instances indefinitely (until restart).
 
 ### Advisory Lock Coordination
 
-Postgres advisory locks (migration 027) coordinate the finality poller (lock 839201) and PreConfirmedSweeper (lock 839202) across instances. Other background tasks (DLQ handler, nonce archiver) do not have advisory locks and must be coordinated at the deployment level.
+Postgres advisory locks coordinate the finality poller (lock 839201) and PreConfirmedSweeper (lock 839202) across instances via direct asyncpg connections (`tripwire/db/postgres.py`). The original Supabase RPC approach (migration 027) was broken because PostgREST connection pooling (PgBouncer) released locks immediately after the HTTP request completed. Migration 028 drops those RPC functions. Other background tasks (DLQ handler, nonce archiver) do not have advisory locks and must be coordinated at the deployment level.
 
 ### Event Bus Stream Cap
 
@@ -660,7 +696,7 @@ The `/ingest` endpoint rejects payloads with more than 1000 logs (HTTP 400). If 
 
 ### Pre-Confirmed Event TTL
 
-Events that reach `pre_confirmed` status (e.g., from the x402 facilitator) but never receive a corresponding Goldsky confirmation are now swept by the `PreConfirmedSweeper` background task. Events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800 = 30 minutes) are marked as `payment.failed` and `payment.failed` webhooks are dispatched to linked endpoints. The sweeper runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes) and is protected by advisory lock 839202.
+Events that reach `pre_confirmed` status (e.g., from the x402 facilitator) but never receive a corresponding Goldsky confirmation are now swept by the `PreConfirmedSweeper` background task. Events older than `PRE_CONFIRMED_TTL_SECONDS` (default 1800 = 30 minutes) are marked as `payment.failed` in the database. **Note**: the sweeper is wired with `webhook_dispatcher=None` in production, so `payment.failed` webhooks are not currently dispatched — only the database status is updated. The sweeper runs every `PRE_CONFIRMED_SWEEP_INTERVAL_SECONDS` (default 300 = 5 minutes) and is protected by advisory lock 839202.
 
 ### Nonce Archival Timing
 
