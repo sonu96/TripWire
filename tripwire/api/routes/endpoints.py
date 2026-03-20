@@ -155,6 +155,16 @@ async def register_endpoint(
             )
         except Exception:
             logger.exception("webhook_provider_setup_failed", endpoint_id=endpoint_id)
+            # Convoy setup failed — delete the endpoint row so we don't leave
+            # a broken endpoint that silently drops webhooks.
+            try:
+                sb.table("endpoints").delete().eq("id", endpoint_id).execute()
+            except Exception:
+                logger.exception("endpoint_cleanup_failed", endpoint_id=endpoint_id)
+            raise HTTPException(
+                status_code=502,
+                detail="Webhook provider setup failed. Endpoint was not created.",
+            )
 
     # Invalidate endpoint cache
     try:

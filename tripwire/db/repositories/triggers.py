@@ -13,16 +13,19 @@ logger = structlog.get_logger(__name__)
 # ── Module-level caches ──────────────────────────────────────
 
 _active_triggers_cache: list[Trigger] | None = None
+_active_triggers_cache_expires_at: float = 0.0
 _topic_cache: dict[str, tuple[float, list[Trigger]]] = {}
 _public_templates_cache: list[TriggerTemplate] | None = None
 
 _TOPIC_CACHE_TTL = 30  # seconds
+_ACTIVE_CACHE_TTL = 10  # seconds
 
 
 def invalidate_trigger_cache() -> None:
     """Clear all module-level trigger caches."""
-    global _active_triggers_cache, _topic_cache, _public_templates_cache
+    global _active_triggers_cache, _active_triggers_cache_expires_at, _topic_cache, _public_templates_cache
     _active_triggers_cache = None
+    _active_triggers_cache_expires_at = 0.0
     _topic_cache = {}
     _public_templates_cache = None
     logger.info("trigger_cache_invalidated")
@@ -42,9 +45,10 @@ class TriggerRepository:
         return Trigger(**result.data[0])
 
     def list_active(self) -> list[Trigger]:
-        """Return all active triggers (cached)."""
-        global _active_triggers_cache
-        if _active_triggers_cache is not None:
+        """Return all active triggers (cached with TTL)."""
+        global _active_triggers_cache, _active_triggers_cache_expires_at
+        now = time.monotonic()
+        if _active_triggers_cache is not None and now < _active_triggers_cache_expires_at:
             return _active_triggers_cache
         result = (
             self._sb.table("triggers")
@@ -54,6 +58,7 @@ class TriggerRepository:
             .execute()
         )
         _active_triggers_cache = [Trigger(**row) for row in result.data]
+        _active_triggers_cache_expires_at = now + _ACTIVE_CACHE_TTL
         return _active_triggers_cache
 
     def find_by_topic(self, topic: str) -> list[Trigger]:

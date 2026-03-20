@@ -583,6 +583,7 @@ def create_mcp_app() -> FastAPI:
                 "trigger_repo": TriggerRepository(supabase),
                 "template_repo": TriggerTemplateRepository(supabase),
                 "event_repo": EventRepository(supabase),
+                "webhook_provider": parent_app.state.webhook_provider,
             }
 
             # ── SESSION path: pre-funded session budget ──────────

@@ -18,7 +18,9 @@ from typing import Any
 import structlog
 
 from tripwire.config.settings import settings
+from tripwire.db.repositories.endpoints import EndpointRepository
 from tripwire.observability.health import health_registry
+from tripwire.webhook.provider import WebhookProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -32,10 +34,12 @@ class PreConfirmedSweeper:
     def __init__(
         self,
         supabase: Any,
-        webhook_dispatcher: Any | None = None,
+        webhook_provider: WebhookProvider | None = None,
+        endpoint_repo: EndpointRepository | None = None,
     ) -> None:
         self._supabase = supabase
-        self._dispatcher = webhook_dispatcher
+        self._webhook_provider = webhook_provider
+        self._endpoint_repo = endpoint_repo
         self._running = False
         self._task: asyncio.Task[None] | None = None
 
@@ -198,23 +202,86 @@ class PreConfirmedSweeper:
             )
 
             # Dispatch payment.failed webhook to matched endpoints
-            if self._dispatcher:
-                endpoint_ids = self._get_endpoint_ids(event_id)
-                for ep_id in endpoint_ids:
-                    try:
-                        await self._dispatcher.dispatch_failure_notification(
-                            event, ep_id
-                        )
-                    except Exception:
-                        logger.exception(
-                            "sweep_dispatch_failed",
-                            event_id=event_id,
-                            endpoint_id=ep_id,
-                        )
+            if self._webhook_provider and self._endpoint_repo:
+                await self._dispatch_failure_webhook(event)
 
         except Exception:
             logger.exception(
                 "pre_confirmed_expire_failed", event_id=event_id
+            )
+
+    async def _dispatch_failure_webhook(self, event: dict[str, Any]) -> None:
+        """Fetch matched endpoints for the expired event and dispatch payment.failed."""
+        from tripwire.types.models import (
+            ChainId,
+            ERC3009Transfer,
+            WebhookEventType,
+        )
+        from tripwire.webhook.dispatcher import dispatch_event
+
+        event_id = event.get("id")
+        endpoint_ids = self._get_endpoint_ids(event_id)
+        if not endpoint_ids:
+            return
+
+        endpoints = []
+        for ep_id in endpoint_ids:
+            try:
+                ep = self._endpoint_repo.get_by_id(ep_id)  # type: ignore[union-attr]
+                if ep is not None:
+                    endpoints.append(ep)
+            except Exception:
+                logger.exception(
+                    "sweep_endpoint_fetch_failed",
+                    event_id=event_id,
+                    endpoint_id=ep_id,
+                )
+
+        if not endpoints:
+            return
+
+        # Reconstruct a minimal ERC3009Transfer from the stored event row
+        try:
+            transfer = ERC3009Transfer(
+                chain_id=ChainId(event["chain_id"]),
+                tx_hash=event.get("tx_hash", ""),
+                block_number=event.get("block_number", 0),
+                block_hash=event.get("block_hash", ""),
+                log_index=event.get("log_index", 0),
+                from_address=event.get("from_address", ""),
+                to_address=event.get("to_address", ""),
+                value=str(event.get("amount", "0")),
+                authorizer=event.get("authorizer", event.get("from_address", "")),
+                valid_after=0,
+                valid_before=0,
+                nonce=event.get("nonce", ""),
+                token=event.get("token", ""),
+                timestamp=0,
+            )
+        except Exception:
+            logger.exception(
+                "sweep_transfer_reconstruct_failed",
+                event_id=event_id,
+            )
+            return
+
+        try:
+            message_ids = await dispatch_event(
+                transfer=transfer,
+                matched_endpoints=endpoints,
+                provider=self._webhook_provider,  # type: ignore[arg-type]
+                event_type=WebhookEventType.PAYMENT_FAILED,
+            )
+            logger.info(
+                "sweep_failure_webhook_dispatched",
+                event_id=event_id,
+                webhooks_sent=len(message_ids),
+                endpoints_count=len(endpoints),
+            )
+        except Exception:
+            logger.exception(
+                "sweep_dispatch_failed",
+                event_id=event_id,
             )
 
     def _get_endpoint_ids(self, event_id: str | None) -> list[str]:

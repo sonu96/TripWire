@@ -111,69 +111,59 @@ async def _create_endpoint_core(
         mode=mode,
     )
 
-    # Invalidate endpoint cache
-    try:
-        cache = _get_shared_cache("tripwire:cache")
-        await cache.invalidate_pattern("endpoints:*")
-    except Exception:
-        logger.debug("mcp_cache_invalidation_failed")
-
-    return {
-        "endpoint_id": endpoint_id,
-        "webhook_secret": webhook_secret,
-        "mode": mode,
-        "url": url,
-    }
-
-
-# ── 1a. register_endpoint (preferred) ───────────────────────
-
-
-async def register_endpoint(
-    params: dict, ctx: MCPAuthContext, repos: dict
-) -> dict:
-    """Create a webhook endpoint.
-
-    Returns endpoint_id and webhook_secret. Use create_trigger or
-    activate_template separately to add event triggers.
-    """
-    return await _create_endpoint_core(params, ctx, repos)
-
-
-# ── 1b. register_middleware (deprecated) ─────────────────────
-
-
-async def register_middleware(
-    params: dict, ctx: MCPAuthContext, repos: dict
-) -> dict:
-    """Register TripWire as middleware for an agent's API endpoint.
-
-    **Deprecated** -- use register_endpoint + create_trigger separately.
-
-    Creates an endpoint and optionally creates triggers from template slugs
-    or custom trigger definitions.
-    """
-    endpoint_repo, trigger_repo, template_repo, _ = _repos(repos)
-    supabase = repos["supabase"]
-
-    template_slugs: list[str] = params.get("template_slugs", [])
-    custom_triggers: list[dict] = params.get("custom_triggers", [])
-    chains: list[int] = params.get("chains", [8453])
-
-    # Quota check for triggers (endpoint quota is checked in _create_endpoint_core)
-    if template_slugs or custom_triggers:
-        await check_trigger_quota(supabase, ctx.agent_address)
-
-    # Delegate endpoint creation to the shared core logic
-    core_result = await _create_endpoint_core(params, ctx, repos)
-    endpoint_id = core_result["endpoint_id"]
-
-    now = _now_iso()
+    # Wire up webhook provider (Convoy) for execute-mode endpoints
+    convoy_project_id = None
+    convoy_endpoint_id = None
+    if mode == "execute":
+        provider = repos.get("webhook_provider")
+        if provider is not None:
+            try:
+                convoy_project_id = await provider.create_app(
+                    developer_id=endpoint_id,
+                    name=f"tripwire-{endpoint_id}",
+                )
+                convoy_endpoint_id = await provider.create_endpoint(
+                    app_id=convoy_project_id,
+                    url=url,
+                    description=f"TripWire endpoint for {recipient}",
+                    secret=webhook_secret,
+                )
+                # Persist the provider IDs back to the endpoint row
+                supabase.table("endpoints").update({
+                    "convoy_project_id": convoy_project_id,
+                    "convoy_endpoint_id": convoy_endpoint_id,
+                }).eq("id", endpoint_id).execute()
+                logger.info(
+                    "mcp_webhook_provider_wired",
+                    endpoint_id=endpoint_id,
+                    convoy_project_id=convoy_project_id,
+                    convoy_endpoint_id=convoy_endpoint_id,
+                )
+            except Exception:
+                logger.exception(
+                    "mcp_webhook_provider_setup_failed",
+                    endpoint_id=endpoint_id,
+                )
+                # Clean up the endpoint row — can't deliver webhooks without Convoy
+                supabase.table("endpoints").delete().eq("id", endpoint_id).execute()
+                return {
+                    "error": "Webhook provider setup failed. Endpoint was not created.",
+                    "code": "WEBHOOK_SETUP_FAILED",
+                }
+        else:
+            logger.warning(
+                "mcp_no_webhook_provider",
+                endpoint_id=endpoint_id,
+                mode=mode,
+            )
 
     # Create triggers from template slugs
     trigger_ids: list[str] = []
 
     for slug in template_slugs:
+        # Re-check quota before each insert to tighten the race window (Bug #7)
+        await check_trigger_quota(supabase, ctx.agent_address)
+
         template = template_repo.get_by_slug(slug)
         if template is None:
             logger.warning("mcp_template_not_found", slug=slug)
@@ -208,6 +198,9 @@ async def register_middleware(
 
     # Create custom triggers
     for ct in custom_triggers:
+        # Re-check quota before each insert to tighten the race window (Bug #7)
+        await check_trigger_quota(supabase, ctx.agent_address)
+
         trigger_id = nanoid(size=21)
         trigger_data = {
             "id": trigger_id,

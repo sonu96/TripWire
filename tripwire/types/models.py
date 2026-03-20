@@ -286,6 +286,7 @@ def execution_state_from_status(
         "confirmed": (ExecutionState.CONFIRMED, False, TrustSource.ONCHAIN),
         "finalized": (ExecutionState.FINALIZED, True, TrustSource.ONCHAIN),
         "reorged": (ExecutionState.REORGED, False, TrustSource.ONCHAIN),
+        "payment.failed": (ExecutionState.REORGED, False, TrustSource.ONCHAIN),
     }
     return _STATUS_MAP.get(
         status,
