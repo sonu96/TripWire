@@ -81,7 +81,18 @@ async def list_events(
     if not endpoint_ids:
         return EventListResponse(data=[], cursor=None, has_more=False)
 
-    query = sb.table("events").select("*").in_("endpoint_id", endpoint_ids).order("created_at", desc=True).limit(limit + 1)
+    # Query via event_endpoints join table (supports multi-endpoint dispatch)
+    linked = (
+        sb.table("event_endpoints")
+        .select("event_id")
+        .in_("endpoint_id", endpoint_ids)
+        .execute()
+    )
+    event_ids = list({r["event_id"] for r in (linked.data or [])})
+    if not event_ids:
+        return EventListResponse(data=[], cursor=None, has_more=False)
+
+    query = sb.table("events").select("*").in_("id", event_ids).order("created_at", desc=True).limit(limit + 1)
 
     if cursor:
         # Fetch the cursor event's created_at for keyset pagination
@@ -93,7 +104,7 @@ async def list_events(
         query = query.eq("type", event_type.value)
 
     if chain_id:
-        query = query.eq("data->>chain_id", str(chain_id))
+        query = query.eq("chain_id", chain_id)
 
     result = query.execute()
     rows = result.data
@@ -125,14 +136,25 @@ async def get_event(
 
     event = result.data[0]
 
-    # Verify ownership through the parent endpoint
-    if event.get("endpoint_id"):
-        ep = sb.table("endpoints").select("*").eq("id", event["endpoint_id"]).execute()
-        if not ep.data:
-            raise HTTPException(status_code=404, detail="Parent endpoint not found")
-        _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
-    else:
-        # Events without an endpoint_id cannot be verified — deny access
+    # Verify ownership through event_endpoints join table
+    linked = (
+        sb.table("event_endpoints")
+        .select("endpoint_id")
+        .eq("event_id", event_id)
+        .execute()
+    )
+    linked_endpoint_ids = [r["endpoint_id"] for r in (linked.data or [])]
+
+    # Fall back to legacy endpoint_id column if no join table entries
+    if not linked_endpoint_ids and event.get("endpoint_id"):
+        linked_endpoint_ids = [event["endpoint_id"]]
+
+    if not linked_endpoint_ids:
+        raise HTTPException(status_code=403, detail="Not authorized to access this event")
+
+    # Check if any linked endpoint belongs to the authenticated wallet
+    wallet_endpoints = _get_wallet_endpoint_ids(sb, wallet_auth.wallet_address)
+    if not set(linked_endpoint_ids) & set(wallet_endpoints):
         raise HTTPException(status_code=403, detail="Not authorized to access this event")
 
     return EventResponse(**_enrich_event(event))
@@ -156,10 +178,21 @@ async def list_endpoint_events(
         raise HTTPException(status_code=404, detail="Endpoint not found")
     _verify_endpoint_ownership(ep.data[0], wallet_auth.wallet_address)
 
+    # Query via event_endpoints join table (supports multi-endpoint dispatch)
+    linked = (
+        sb.table("event_endpoints")
+        .select("event_id")
+        .eq("endpoint_id", endpoint_id)
+        .execute()
+    )
+    event_ids = [r["event_id"] for r in (linked.data or [])]
+    if not event_ids:
+        return EventListResponse(data=[], cursor=None, has_more=False)
+
     query = (
         sb.table("events")
         .select("*")
-        .eq("endpoint_id", endpoint_id)
+        .in_("id", event_ids)
         .order("created_at", desc=True)
         .limit(limit + 1)
     )

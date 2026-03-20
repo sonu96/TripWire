@@ -123,7 +123,7 @@ class Settings(BaseSettings):
     event_bus_workers: int = 3  # Number of trigger worker processes for event bus
 
     # Unified processor (C2) — single code path for ERC-3009 and dynamic triggers
-    unified_processor: bool = False
+    unified_processor: bool = True
 
     # Finality poller
     finality_poller_enabled: bool = True

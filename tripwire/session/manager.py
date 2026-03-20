@@ -121,13 +121,19 @@ class SessionManager:
         """
         session_id = secrets.token_urlsafe(24)
 
-        effective_budget = min(
-            budget if budget is not None else settings.session_default_budget_usdc,
-            settings.session_max_budget_usdc,
+        effective_budget = max(
+            1,
+            min(
+                budget if budget is not None else settings.session_default_budget_usdc,
+                settings.session_max_budget_usdc,
+            ),
         )
-        effective_ttl = min(
-            ttl_seconds if ttl_seconds is not None else settings.session_default_ttl_seconds,
-            settings.session_max_ttl_seconds,
+        effective_ttl = max(
+            60,
+            min(
+                ttl_seconds if ttl_seconds is not None else settings.session_default_ttl_seconds,
+                settings.session_max_ttl_seconds,
+            ),
         )
         effective_chain_id = chain_id if chain_id is not None else settings.siwe_chain_id
 

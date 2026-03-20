@@ -58,25 +58,36 @@ async def get_stats(
         else len(active_endpoints_result.data)
     )
 
-    # Total events count (only for wallet's endpoints)
-    total_result = (
-        sb.table("events")
-        .select("id", count="exact")
+    # Get event IDs linked to wallet's endpoints via join table
+    linked = (
+        sb.table("event_endpoints")
+        .select("event_id")
         .in_("endpoint_id", endpoint_ids)
         .execute()
     )
-    total_events = (
-        total_result.count
-        if hasattr(total_result, "count") and total_result.count is not None
-        else len(total_result.data)
-    )
+    event_ids = list({r["event_id"] for r in (linked.data or [])})
 
-    # Events in last hour (only for wallet's endpoints)
+    if not event_ids:
+        return {
+            "total_events": 0,
+            "events_last_hour": 0,
+            "active_endpoints": active_endpoints,
+            "last_event_at": None,
+            "execution_state_breakdown": {},
+            "product_mode": settings.product_mode,
+            "pulse_active": settings.is_pulse,
+            "keeper_active": settings.is_keeper,
+        }
+
+    # Total events count (via event_endpoints join table)
+    total_events = len(event_ids)
+
+    # Events in last hour (only for wallet's endpoints via join table)
     one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     recent_result = (
         sb.table("events")
         .select("id", count="exact")
-        .in_("endpoint_id", endpoint_ids)
+        .in_("id", event_ids)
         .gte("created_at", one_hour_ago)
         .execute()
     )
@@ -86,11 +97,11 @@ async def get_stats(
         else len(recent_result.data)
     )
 
-    # Last event timestamp (only for wallet's endpoints)
+    # Last event timestamp (via join table)
     last_event_result = (
         sb.table("events")
         .select("created_at")
-        .in_("endpoint_id", endpoint_ids)
+        .in_("id", event_ids)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -107,7 +118,7 @@ async def get_stats(
         status_result = (
             sb.table("events")
             .select("status")
-            .in_("endpoint_id", endpoint_ids)
+            .in_("id", event_ids)
             .execute()
         )
         for row in status_result.data:
