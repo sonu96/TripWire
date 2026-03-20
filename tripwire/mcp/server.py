@@ -67,11 +67,55 @@ def _register(
     )
 
 
-# ── Register all 11 tools ───────────────────────────────────
+# ── Register all 12 tools ───────────────────────────────────
+
+_register(
+    name="register_endpoint",
+    handler=tool_handlers.register_endpoint,
+    description=(
+        "Create a webhook endpoint. Returns endpoint_id and webhook_secret. "
+        "Use create_trigger or activate_template separately to add event triggers."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Your webhook/callback URL",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["notify", "execute"],
+                "description": "Delivery mode: notify (Supabase Realtime) or execute (webhook POST)",
+                "default": "execute",
+            },
+            "chains": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Chain IDs to monitor (default: [8453] for Base)",
+                "default": [8453],
+            },
+            "recipient": {
+                "type": "string",
+                "description": "Recipient address to watch (defaults to your agent address)",
+            },
+            "policies": {
+                "type": "object",
+                "description": "Endpoint policies (min_amount, max_amount, allowed_senders, etc.)",
+            },
+        },
+        "required": ["url"],
+    },
+    auth_tier=AuthTier.X402,
+    price="$0.003",
+    min_reputation=10.0,
+    product="both",
+)
 
 _register(
     name="register_middleware",
     description=(
+        "(Deprecated -- use register_endpoint instead) "
         "Register TripWire as middleware for your API. Creates an endpoint "
         "and triggers from template slugs or custom definitions."
     ),

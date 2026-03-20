@@ -120,6 +120,7 @@ class EventProcessor:
         supabase_client: Any | None = None,
         trigger_repo: TriggerRepository | None = None,
         handlers: list[EventHandler] | None = None,
+        trigger_index: Any | None = None,
     ) -> None:
         self._endpoint_repo = endpoint_repo
         self._event_repo = event_repo
@@ -132,6 +133,8 @@ class EventProcessor:
         self._sb = supabase_client or getattr(endpoint_repo, "_sb", None)
         self._trigger_repo = trigger_repo
         self._handlers = handlers if handlers is not None else list(_DEFAULT_HANDLERS)
+        # Optional TriggerIndex for O(1) topic0 lookup (used by worker pool path)
+        self._trigger_index = trigger_index
         # Redis-backed shared cache for multi-instance endpoint lookups
         try:
             self._endpoint_cache = RedisCache(get_redis(), prefix="tripwire:cache", default_ttl=30)
@@ -290,10 +293,15 @@ class EventProcessor:
             return hardcoded
 
         # Fallback: check dynamic trigger registry
-        if self._trigger_repo is not None:
+        # Prefer TriggerIndex (O(1) in-memory lookup, refreshed every 10s)
+        # over TriggerRepository.find_by_topic (DB query with 30s cache).
+        if self._trigger_index is not None or self._trigger_repo is not None:
             chain_id = raw_log.get("chain_id")
             contract = raw_log.get("address", "").lower() or None
-            triggers = self._trigger_repo.find_by_topic(topic0)
+            if self._trigger_index is not None:
+                triggers = self._trigger_index.match(topic0)
+            else:
+                triggers = self._trigger_repo.find_by_topic(topic0)
             # Filter by chain_id and contract_address locally
             matched = []
             for t in triggers:

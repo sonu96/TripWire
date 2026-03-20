@@ -99,70 +99,95 @@ class PreConfirmedSweeper:
     async def _sweep_once(self) -> None:
         """Find and expire stale pre_confirmed events.
 
-        Acquires a Postgres advisory lock first so only one instance
-        performs the sweep when multiple replicas are running.
+        Acquires a Postgres advisory lock via asyncpg so only one instance
+        performs the sweep when multiple replicas are running.  The lock is
+        held on a dedicated connection for the entire sweep cycle.
+
+        When DATABASE_URL is not configured (dev environments), the lock
+        is skipped and the sweep runs unconditionally.
         """
-        # --- Leader election via advisory lock ---
+        from tripwire.db.postgres import (
+            advisory_lock,
+            CoordinationLockNotAcquired,
+            fetch_stale_preconfirmed,
+            update_event_status,
+            get_pool,
+        )
+
+        cutoff_iso = _timestamp_to_iso(
+            int(time.time()) - settings.pre_confirmed_ttl_seconds
+        )
+
+        # Check if asyncpg pool is available
         try:
-            lock_result = self._supabase.rpc(
-                "try_acquire_leader_lock",
-                {"lock_id": _SWEEPER_LOCK_ID},
-            ).execute()
-            if not lock_result.data:
-                logger.debug(
-                    "sweeper_lock_skipped",
-                    reason="another instance holds the lock",
-                )
-                return
-        except Exception:
-            logger.debug("sweeper_lock_unavailable")
+            get_pool()
+        except RuntimeError:
+            # No asyncpg pool — run without lock (dev mode / Supabase fallback)
+            await self._sweep_once_fallback(cutoff_iso)
             return
 
         try:
-            cutoff_iso = _timestamp_to_iso(
-                int(time.time()) - settings.pre_confirmed_ttl_seconds
+            async with advisory_lock(_SWEEPER_LOCK_ID) as conn:
+                stale_events = await fetch_stale_preconfirmed(conn, cutoff_iso)
+
+                if not stale_events:
+                    return
+
+                logger.info("pre_confirmed_sweep_found", count=len(stale_events))
+
+                for event in stale_events:
+                    await self._expire_event(event, conn=conn)
+        except CoordinationLockNotAcquired:
+            logger.debug(
+                "sweeper_lock_skipped",
+                reason="another instance holds the lock",
             )
+        except Exception:
+            logger.exception("pre_confirmed_sweep_lock_error")
 
-            # Query events with status 'pre_confirmed' created before cutoff
-            result = (
-                self._supabase.table("events")
-                .select("*")
-                .eq("status", "pre_confirmed")
-                .lt("created_at", cutoff_iso)
-                .limit(100)
-                .execute()
-            )
+    async def _sweep_once_fallback(self, cutoff_iso: str) -> None:
+        """Sweep without advisory lock — used when DATABASE_URL is not set."""
+        result = (
+            self._supabase.table("events")
+            .select("*")
+            .eq("status", "pre_confirmed")
+            .lt("created_at", cutoff_iso)
+            .limit(100)
+            .execute()
+        )
 
-            stale_events: list[dict[str, Any]] = result.data or []
+        stale_events: list[dict[str, Any]] = result.data or []
 
-            if not stale_events:
-                return
+        if not stale_events:
+            return
 
-            logger.info("pre_confirmed_sweep_found", count=len(stale_events))
+        logger.info("pre_confirmed_sweep_found", count=len(stale_events))
 
-            for event in stale_events:
-                await self._expire_event(event)
-        finally:
-            # Always release the lock
-            try:
-                self._supabase.rpc(
-                    "release_leader_lock",
-                    {"lock_id": _SWEEPER_LOCK_ID},
-                ).execute()
-            except Exception:
-                logger.debug("sweeper_lock_release_failed")
+        for event in stale_events:
+            await self._expire_event(event)
 
     # ------------------------------------------------------------------
     # Per-event expiration
     # ------------------------------------------------------------------
 
-    async def _expire_event(self, event: dict[str, Any]) -> None:
-        """Mark a single pre_confirmed event as payment.failed."""
+    async def _expire_event(
+        self, event: dict[str, Any], *, conn: Any | None = None
+    ) -> None:
+        """Mark a single pre_confirmed event as payment.failed.
+
+        When *conn* is provided (asyncpg connection holding the advisory
+        lock), the status update runs via that connection.  Otherwise
+        falls back to Supabase.
+        """
         event_id = event.get("id")
         try:
-            self._supabase.table("events").update(
-                {"status": "payment.failed"}
-            ).eq("id", event_id).execute()
+            if conn is not None:
+                from tripwire.db.postgres import update_event_status
+                await update_event_status(conn, event_id, "payment.failed")
+            else:
+                self._supabase.table("events").update(
+                    {"status": "payment.failed"}
+                ).eq("id", event_id).execute()
 
             created_at = event.get("created_at", "")
             age = int(time.time()) - _iso_to_timestamp(created_at)

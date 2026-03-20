@@ -83,6 +83,8 @@ class FinalityPoller:
         self._settings = settings
         self._nonce_repo = nonce_repo
         self._tasks: list[asyncio.Task[None]] = []
+        # Set during poll cycle when asyncpg coordination pool is available
+        self._pg_conn: Any | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -153,48 +155,84 @@ class FinalityPoller:
     async def _poll_chain(self, chain_id: ChainId) -> None:
         """Fetch pending events for *chain_id* and process each one.
 
-        Acquires a Postgres advisory lock first so only one instance polls
-        when multiple TripWire replicas are running.
+        Acquires a Postgres advisory lock via asyncpg so only one instance
+        polls when multiple TripWire replicas are running.  The lock is held
+        on a dedicated connection for the entire poll cycle (not via
+        PostgREST which uses connection pooling and would release it
+        immediately).
+
+        When DATABASE_URL is not configured (dev environments), the lock
+        is skipped and the poll runs unconditionally.
         """
-        # --- Leader election via advisory lock ---
+        from tripwire.db.postgres import (
+            advisory_lock,
+            CoordinationLockNotAcquired,
+            fetch_pending_events,
+            get_pool,
+        )
+
+        # Check if asyncpg pool is available
         try:
-            lock_result = await asyncio.to_thread(
-                lambda: self._event_repo._sb.rpc(
-                    "try_acquire_leader_lock",
-                    {"lock_id": _FINALITY_POLLER_LOCK_ID},
-                ).execute()
-            )
-            if not lock_result.data:
-                logger.debug(
-                    "finality_poll_skipped",
-                    reason="another instance holds lock",
-                    chain=chain_id.name,
-                )
-                return
-        except Exception:
-            logger.debug("finality_lock_unavailable", chain=chain_id.name)
+            get_pool()
+        except RuntimeError:
+            # No asyncpg pool — run without lock (dev mode)
+            await self._poll_chain_inner(chain_id)
             return
 
         try:
-            await self._poll_chain_inner(chain_id)
-        finally:
-            # Always release the advisory lock
-            try:
-                await asyncio.to_thread(
-                    lambda: self._event_repo._sb.rpc(
-                        "release_leader_lock",
-                        {"lock_id": _FINALITY_POLLER_LOCK_ID},
-                    ).execute()
-                )
-            except Exception:
-                logger.debug("finality_lock_release_failed", chain=chain_id.name)
+            async with advisory_lock(_FINALITY_POLLER_LOCK_ID) as conn:
+                await self._poll_chain_inner(chain_id, conn=conn)
+        except CoordinationLockNotAcquired:
+            logger.debug(
+                "finality_poll_skipped",
+                reason="another instance holds lock",
+                chain=chain_id.name,
+            )
+        except Exception:
+            logger.exception("finality_poll_error", chain=chain_id.name)
 
-    async def _poll_chain_inner(self, chain_id: ChainId) -> None:
-        """Core poll logic — called only after advisory lock is acquired."""
-        # Query events table for status="pending" on this chain
-        pending_events = await asyncio.to_thread(
-            self._fetch_pending_events, chain_id
+    async def _poll_chain_inner(
+        self, chain_id: ChainId, *, conn: Any | None = None
+    ) -> None:
+        """Core poll logic — called only after advisory lock is acquired.
+
+        When *conn* is provided (asyncpg connection holding the advisory
+        lock), pending events are fetched and updated via that connection.
+        When *conn* is None (dev fallback), Supabase is used instead.
+        """
+        from tripwire.db.postgres import (
+            fetch_pending_events,
+            update_event_finality,
+            update_event_status,
+            fetch_event_endpoint_ids,
         )
+
+        # Store conn for downstream methods to use during this poll cycle
+        self._pg_conn = conn
+
+        try:
+            await self._poll_chain_inner_body(chain_id, conn)
+        finally:
+            self._pg_conn = None
+
+    async def _poll_chain_inner_body(
+        self, chain_id: ChainId, conn: Any | None
+    ) -> None:
+        """Actual poll logic body, separated for clean _pg_conn lifecycle."""
+        from tripwire.db.postgres import (
+            fetch_pending_events,
+            update_event_finality,
+            update_event_status,
+            fetch_event_endpoint_ids,
+        )
+
+        # Query events table for status="pending" on this chain
+        if conn is not None:
+            pending_events = await fetch_pending_events(conn, chain_id.value)
+        else:
+            pending_events = await asyncio.to_thread(
+                self._fetch_pending_events, chain_id
+            )
 
         if not pending_events:
             return
@@ -257,6 +295,37 @@ class FinalityPoller:
     # Per-event processing
     # ------------------------------------------------------------------
 
+    async def _update_finality(self, event_id: str, depth: int) -> None:
+        """Update finality depth via asyncpg conn if available, else Supabase."""
+        if self._pg_conn is not None:
+            from tripwire.db.postgres import update_event_finality
+            await update_event_finality(self._pg_conn, event_id, depth)
+        else:
+            await asyncio.to_thread(
+                self._event_repo.update_finality, event_id, depth
+            )
+
+    async def _update_status(
+        self, event_id: str, new_status: str, confirmed_at: datetime | None = None
+    ) -> None:
+        """Update event status via asyncpg conn if available, else Supabase."""
+        if self._pg_conn is not None:
+            from tripwire.db.postgres import update_event_status
+            await update_event_status(self._pg_conn, event_id, new_status, confirmed_at)
+        else:
+            await asyncio.to_thread(
+                self._event_repo.update_status, event_id, new_status, confirmed_at
+            )
+
+    async def _get_endpoint_ids(self, event_id: str) -> list[str]:
+        """Fetch endpoint IDs via asyncpg conn if available, else Supabase."""
+        if self._pg_conn is not None:
+            from tripwire.db.postgres import fetch_event_endpoint_ids
+            return await fetch_event_endpoint_ids(self._pg_conn, event_id)
+        return await asyncio.to_thread(
+            self._event_repo.get_endpoint_ids, event_id
+        )
+
     async def _process_event(
         self,
         event: dict[str, Any],
@@ -279,9 +348,7 @@ class FinalityPoller:
         # ── Finality promotion ───────────────────────────────────────
         if confirmations >= required:
             # Update finality depth before status transition
-            await asyncio.to_thread(
-                self._event_repo.update_finality, event_id, confirmations
-            )
+            await self._update_finality(event_id, confirmations)
 
             if current_status == "pending":
                 # pending → confirmed: first finality threshold crossed
@@ -307,9 +374,7 @@ class FinalityPoller:
                 )
         else:
             # Update depth even if not yet final (useful for dashboards)
-            await asyncio.to_thread(
-                self._event_repo.update_finality, event_id, confirmations
-            )
+            await self._update_finality(event_id, confirmations)
             logger.debug(
                 "event_still_waiting",
                 event_id=event_id,
@@ -331,15 +396,10 @@ class FinalityPoller:
         """Update event status in the database and fire the appropriate webhook."""
         event_id: str = event["id"]
 
-        # 1. Update status in the DB
+        # 1. Update status in the DB (uses asyncpg conn if available)
         confirmed_at = datetime.now(timezone.utc) if new_status == "confirmed" else None
         try:
-            await asyncio.to_thread(
-                self._event_repo.update_status,
-                event_id,
-                new_status,
-                confirmed_at,
-            )
+            await self._update_status(event_id, new_status, confirmed_at)
         except Exception:
             logger.exception(
                 "finality_poll_status_update_failed",
@@ -350,9 +410,7 @@ class FinalityPoller:
 
         # 2. Dispatch webhook to ALL matched endpoints via join table (#7)
         try:
-            endpoint_ids = await asyncio.to_thread(
-                self._event_repo.get_endpoint_ids, event_id
-            )
+            endpoint_ids = await self._get_endpoint_ids(event_id)
         except Exception:
             logger.exception(
                 "finality_poll_endpoint_ids_fetch_failed",
@@ -470,11 +528,9 @@ class FinalityPoller:
             stored_hash=event.get("block_hash"),
         )
 
-        # 1. Update event status to reorged
+        # 1. Update event status to reorged (uses asyncpg conn if available)
         try:
-            await asyncio.to_thread(
-                self._event_repo.update_status, event_id, "reorged"
-            )
+            await self._update_status(event_id, "reorged")
         except Exception:
             logger.exception("reorg_status_update_failed", event_id=event_id)
             return
@@ -490,9 +546,7 @@ class FinalityPoller:
 
         # 3. Dispatch payment.reorged to all linked endpoints
         try:
-            endpoint_ids = await asyncio.to_thread(
-                self._event_repo.get_endpoint_ids, event_id
-            )
+            endpoint_ids = await self._get_endpoint_ids(event_id)
         except Exception:
             logger.exception("reorg_endpoint_ids_fetch_failed", event_id=event_id)
             endpoint_ids = []
@@ -588,4 +642,3 @@ class FinalityPoller:
             .execute()
         )
         return result.data
-

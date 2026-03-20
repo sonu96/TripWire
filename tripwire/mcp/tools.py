@@ -61,18 +61,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── 1. register_middleware ───────────────────────────────────
+# ── Shared endpoint-creation logic ───────────────────────────
 
 
-async def register_middleware(
+async def _create_endpoint_core(
     params: dict, ctx: MCPAuthContext, repos: dict
 ) -> dict:
-    """Register TripWire as middleware for an agent's API endpoint.
+    """Core endpoint-creation logic shared by register_endpoint and register_middleware.
 
-    Creates an endpoint and optionally creates triggers from template slugs
-    or custom trigger definitions.
+    Creates the endpoint row and returns a dict with endpoint_id, webhook_secret,
+    mode, and url.
     """
-    endpoint_repo, trigger_repo, template_repo, _ = _repos(repos)
     supabase = repos["supabase"]
 
     url: str = params["url"]
@@ -80,13 +79,9 @@ async def register_middleware(
     chains: list[int] = params.get("chains", [8453])
     recipient: str = params.get("recipient", ctx.agent_address)
     policies: dict = params.get("policies", {})
-    template_slugs: list[str] = params.get("template_slugs", [])
-    custom_triggers: list[dict] = params.get("custom_triggers", [])
 
-    # Quota checks before creating resources
+    # Quota check before creating endpoint
     await check_endpoint_quota(supabase, ctx.agent_address)
-    if template_slugs or custom_triggers:
-        await check_trigger_quota(supabase, ctx.agent_address)
 
     # Create the endpoint
     now = _now_iso()
@@ -115,6 +110,65 @@ async def register_middleware(
         agent=ctx.agent_address,
         mode=mode,
     )
+
+    # Invalidate endpoint cache
+    try:
+        cache = _get_shared_cache("tripwire:cache")
+        await cache.invalidate_pattern("endpoints:*")
+    except Exception:
+        logger.debug("mcp_cache_invalidation_failed")
+
+    return {
+        "endpoint_id": endpoint_id,
+        "webhook_secret": webhook_secret,
+        "mode": mode,
+        "url": url,
+    }
+
+
+# ── 1a. register_endpoint (preferred) ───────────────────────
+
+
+async def register_endpoint(
+    params: dict, ctx: MCPAuthContext, repos: dict
+) -> dict:
+    """Create a webhook endpoint.
+
+    Returns endpoint_id and webhook_secret. Use create_trigger or
+    activate_template separately to add event triggers.
+    """
+    return await _create_endpoint_core(params, ctx, repos)
+
+
+# ── 1b. register_middleware (deprecated) ─────────────────────
+
+
+async def register_middleware(
+    params: dict, ctx: MCPAuthContext, repos: dict
+) -> dict:
+    """Register TripWire as middleware for an agent's API endpoint.
+
+    **Deprecated** -- use register_endpoint + create_trigger separately.
+
+    Creates an endpoint and optionally creates triggers from template slugs
+    or custom trigger definitions.
+    """
+    endpoint_repo, trigger_repo, template_repo, _ = _repos(repos)
+    supabase = repos["supabase"]
+
+    template_slugs: list[str] = params.get("template_slugs", [])
+    custom_triggers: list[dict] = params.get("custom_triggers", [])
+    chains: list[int] = params.get("chains", [8453])
+
+    # Quota check for triggers (endpoint quota is checked in _create_endpoint_core)
+    if template_slugs or custom_triggers:
+        await check_trigger_quota(supabase, ctx.agent_address)
+
+    # Delegate endpoint creation to the shared core logic
+    core_result = await _create_endpoint_core(params, ctx, repos)
+    endpoint_id = core_result["endpoint_id"]
+
+    now = _now_iso()
 
     # Create triggers from template slugs
     trigger_ids: list[str] = []
@@ -183,22 +237,22 @@ async def register_middleware(
             event_signature=ct["event_signature"],
         )
 
-    # Invalidate shared caches after creating endpoint and triggers
-    try:
-        cache = _get_shared_cache("tripwire:cache")
-        await cache.invalidate_pattern("endpoints:*")
-        if trigger_ids:
+    # Invalidate trigger cache if triggers were created
+    if trigger_ids:
+        try:
             trigger_cache = _get_shared_cache("tripwire:triggers")
             await trigger_cache.invalidate_pattern("topic:*")
-    except Exception:
-        logger.debug("mcp_cache_invalidation_failed")
+        except Exception:
+            logger.debug("mcp_cache_invalidation_failed")
 
     return {
         "endpoint_id": endpoint_id,
-        "webhook_secret": webhook_secret,
+        "webhook_secret": core_result["webhook_secret"],
         "trigger_ids": trigger_ids,
-        "mode": mode,
-        "url": url,
+        "mode": core_result["mode"],
+        "url": core_result["url"],
+        "_deprecated": True,
+        "migration_hint": "Use register_endpoint + create_trigger separately",
     }
 
 

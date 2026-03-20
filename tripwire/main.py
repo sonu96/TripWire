@@ -104,6 +104,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.supabase = supabase
     logger.info("supabase_ready")
 
+    # Direct Postgres pool (asyncpg — coordination: advisory locks for background tasks)
+    from tripwire.db.postgres import init_pool, close_pool
+    pg_pool = None
+    if settings.database_url:
+        try:
+            pg_pool = await init_pool(settings.database_url)
+            logger.info("asyncpg_pool_ready")
+        except Exception:
+            logger.exception("asyncpg_pool_init_failed")
+    else:
+        logger.info("asyncpg_pool_skipped", reason="DATABASE_URL not set")
+
     # Audit logger (fire-and-forget writes to audit_log table)
     audit_logger = AuditLogger(supabase)
     app.state.audit_logger = audit_logger
@@ -172,7 +184,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     redis_dlq_consumer = None
     if settings.is_pulse and settings.event_bus_enabled:
         from tripwire.ingestion.event_bus import init_stream_keys
-        from tripwire.ingestion.trigger_worker import WorkerPool
+        from tripwire.ingestion.trigger_worker import TriggerIndex, WorkerPool
         from tripwire.ingestion.dlq_consumer import RedisDLQConsumer
 
         # Populate known stream keys from Redis so MAX_STREAMS cap is accurate
@@ -180,6 +192,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await init_stream_keys()
         except Exception:
             logger.exception("event_bus_init_stream_keys_failed")
+
+        # Build a shared TriggerIndex and inject it into the processor so
+        # _detect_event_type uses the O(1) in-memory lookup instead of the
+        # DB-backed TriggerRepository.find_by_topic with its separate 30s cache.
+        trigger_index = TriggerIndex(trigger_repo)
+        await trigger_index.refresh()
+        processor._trigger_index = trigger_index
 
         worker_pool = WorkerPool(
             num_workers=settings.event_bus_workers,
@@ -322,6 +341,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Stop DLQ handler if running
     if dlq_handler is not None:
         await dlq_handler.stop()
+
+    # Close asyncpg coordination pool
+    if pg_pool:
+        await close_pool()
 
     # Close shared RPC HTTP client
     from tripwire.rpc import close_rpc_client

@@ -21,6 +21,7 @@ dependencies = [
     "x402[fastapi,evm]>=2.3.0",
     "prometheus-client>=0.20.0",
     "jmespath>=0.10.0",
+    "asyncpg>=0.29.0",
 ]
 
 [project.optional-dependencies]

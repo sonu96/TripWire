@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     supabase_anon_key: str = ""  # Unused — kept for .env compat; may be removed in future
     supabase_service_role_key: SecretStr = SecretStr("")
 
+    # Direct Postgres (asyncpg — used for advisory locks / coordination only)
+    database_url: str = ""
+
     # Convoy (Webhook Delivery)
     convoy_api_key: SecretStr = SecretStr("")
     convoy_url: str = "http://localhost:5005"
